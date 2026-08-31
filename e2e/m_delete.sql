@@ -1,0 +1,1 @@
+DELETE FROM t_mut WHERE id = 500;

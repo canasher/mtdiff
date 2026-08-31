@@ -1,0 +1,2 @@
+[mysqld]
+system_time_zone = Asia/Shanghai

@@ -1,0 +1,3 @@
+/bin/
+*.out
+e2e/.mysql-data/

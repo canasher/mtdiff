@@ -1,0 +1,30 @@
+# Plain MySQL 8.0 containers. "Different time zones" are simulated at seed
+# time with session-level SET time_zone (see seed_src.sql / seed_dst.sql)
+# instead of the server's system_time_zone, which the entrypoint's
+# initialization phase rejects.
+services:
+  mysql-src:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpw
+      MYSQL_DATABASE: srcdb
+    ports:
+      - "13306:3306"
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -uroot -prootpw --silent"]
+      interval: 2s
+      timeout: 3s
+      retries: 120
+
+  mysql-dst:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpw
+      MYSQL_DATABASE: dstdb
+    ports:
+      - "13307:3306"
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -uroot -prootpw --silent"]
+      interval: 2s
+      timeout: 3s
+      retries: 120
