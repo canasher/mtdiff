@@ -107,7 +107,8 @@ options:
 ## 测试
 
 - 单测：`make test`（normalizer / 切块 / 指纹为重点，覆盖全部陷阱对）
-- E2E：`make e2e`（docker 双实例，`Asia/Shanghai` vs `America/New_York` 时区，20+ 场景断言退出码）
+- E2E：`make e2e`（docker 双 MySQL 8.0 实例；"不同时区"由种子在会话级 `SET time_zone`（+08:00 vs -04:00）模拟，而非服务端 `system_time_zone`，见 `e2e/docker-compose.yml` 头注释；40+ 场景断言退出码 / JSON 报告 / 并行指纹确定性）
+- 验证状态（2026-08）：单测（含 `-race`）与全套 e2e 在 **MySQL 8.0** 上通过；TiDB / PolarDB-X / MySQL 5.7 按兼容性设计支持（应用层哈希、无 MySQL 专属函数），但尚未实测
 
 ```sh
 # CI（GitHub Actions 参考）
