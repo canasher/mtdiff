@@ -46,6 +46,26 @@ WITH RECURSIVE seq(n) AS (
 )
 SELECT n, CONCAT('c', n) FROM seq;
 
+-- t_chunkc: 30001 rows, composite PK (a, b), a = 1..30001. At --chunk-size
+-- 10000 the chunk count is 4 and the span (30000) is divisible by it: the
+-- regression shape for arithmetic split of a composite key on its integer
+-- lead column (P3-#15) — the max lead row must land in the last chunk.
+DROP TABLE IF EXISTS t_chunkc;
+CREATE TABLE t_chunkc (
+  a   BIGINT NOT NULL,
+  b   BIGINT NOT NULL,
+  val VARCHAR(32),
+  PRIMARY KEY (a, b)
+) ENGINE=InnoDB;
+
+INSERT INTO t_chunkc (a, b, val)
+WITH RECURSIVE seq(n) AS (
+  SELECT 1
+  UNION ALL
+  SELECT n + 1 FROM seq WHERE n < 30001
+)
+SELECT n, n * 2, CONCAT('cc', n) FROM seq;
+
 -- t_nullkey: no PK, unique-but-NULLABLE key column a (auto key selection
 -- must reject it and fall back to keyless multiset semantics), plus rows
 -- with NULL key values that chunk predicates must not drop.

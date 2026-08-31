@@ -22,12 +22,21 @@ sql() {
   # MYSQL_PWD keeps the password off the command line (no client warning) and
   # keeps us out of a grep pipeline (grep -v exits 1 on empty output, which
   # pipefail would treat as failure for silent DDL seeds).
-  local out
-  if ! out=$($COMPOSE -f e2e/docker-compose.yml exec -T -e MYSQL_PWD=rootpw "mysql-$1" mysql -uroot -D "$2" < "e2e/$3" 2>&1); then
-    echo "FAIL: mysql script $3 on $1 ($2) failed:"
-    echo "$out"
-    exit 1
-  fi
+  # The first exec right after container start can hit a transient
+  # socket-down window even after the readiness probe passed, so retry
+  # before failing (seeds are idempotent: DROP TABLE IF EXISTS + reseed).
+  local out attempt
+  for attempt in 1 2 3; do
+    if out=$($COMPOSE -f e2e/docker-compose.yml exec -T -e MYSQL_PWD=rootpw "mysql-$1" mysql -uroot -D "$2" < "e2e/$3" 2>&1); then
+      break
+    fi
+    if [ "$attempt" = 3 ]; then
+      echo "FAIL: mysql script $3 on $1 ($2) failed:"
+      echo "$out"
+      exit 1
+    fi
+    sleep 5
+  done
   if [ -n "$out" ]; then
     echo "$out"
   fi
@@ -115,6 +124,12 @@ say "P1 review regressions"
 expect 0 "identical divisible-span table" --src "$SRC" --dst "$DST" --tables t_chunk --chunk-size 10000
 sql dst dstdb m_chunk_max.sql
 expect 1 "divisible span: max-id row changed" --src "$SRC" --dst "$DST" --tables t_chunk --chunk-size 10000
+# t_chunkc: composite PK (a, b), 30001 rows; the span is divisible by the
+# chunk count at --chunk-size 10000 — regression shape for arithmetic
+# split on the integer lead column (P3-#15).
+expect 0 "identical composite lead-int key table" --src "$SRC" --dst "$DST" --tables t_chunkc --chunk-size 10000
+sql dst dstdb m_chunkc_change.sql
+expect 1 "composite lead-int: max lead row changed" --src "$SRC" --dst "$DST" --tables t_chunkc --chunk-size 10000
 # t_nullkey: no PK, UNIQUE-but-NULLABLE key column. Auto key selection must
 # reject it (keyless multiset); the old code chunked on it and the NULL-key
 # row fell out of every predicate, so a change to it was missed.
