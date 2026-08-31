@@ -4,6 +4,7 @@ package compare
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"golang.org/x/sync/errgroup"
@@ -111,6 +112,16 @@ func (c *Comparer) compareTable(ctx context.Context, src, dst *conn.Side, name s
 	}
 	res.SrcRows, res.DstRows = srcTotal, dstTotal
 
+	if skipRowScan(srcTotal, dstTotal, c.opts.Drill) {
+		// Row counts differ, so the table is definitively DIFFERENT:
+		// skip planning and the row scans (which on a large table means
+		// streaming both sides in full). Fingerprints and chunk-level
+		// detail are uninformative here. With --drill the operator paid
+		// for row-level detail, so scan as before.
+		res.Status = "DIFFERENT"
+		return res
+	}
+
 	var chunks []chunk.Chunk
 	if srcTotal > 0 || dstTotal > 0 {
 		p := chunk.Planner{
@@ -130,13 +141,24 @@ func (c *Comparer) compareTable(ctx context.Context, src, dst *conn.Side, name s
 	sc := chunk.NewScanner(srcNorm, ordered)
 	dc := chunk.NewScanner(dstNorm, ordered)
 
-	srcDigests, err := c.scanSide(ctx, src, sc, srcSchema, chunks, name)
-	if err != nil {
-		return fail("src scan: %v", err)
-	}
-	dstDigests, err := c.scanSide(ctx, dst, dc, dstSchema, chunks, name)
-	if err != nil {
-		return fail("dst scan: %v", err)
+	// Both sides have independent pools, scanners and schemas, so scan
+	// them concurrently: wall time is max(src, dst) instead of src+dst.
+	var (
+		srcDigests, dstDigests map[int]mhash.ChunkDigest
+		srcErr, dstErr         error
+	)
+	g, gctx := errgroup.WithContext(ctx)
+	g.Go(func() error {
+		srcDigests, srcErr = c.scanSide(gctx, src, sc, srcSchema, chunks, name)
+		return srcErr
+	})
+	g.Go(func() error {
+		dstDigests, dstErr = c.scanSide(gctx, dst, dc, dstSchema, chunks, name)
+		return dstErr
+	})
+	_ = g.Wait()
+	if err := pickScanError(srcErr, dstErr); err != nil {
+		return fail("%v", err)
 	}
 
 	byID := foldDigests(&res, chunks, srcDigests, dstDigests, srcTotal, dstTotal, ordered, c.opts.Secure)
@@ -237,6 +259,32 @@ func (c *Comparer) scanSide(ctx context.Context, side *conn.Side, sc *chunk.Scan
 		return nil, err
 	}
 	return out, nil
+}
+
+// skipRowScan reports whether a table whose row counts differ may skip
+// planning and the row scans entirely: the count difference already makes
+// the table DIFFERENT, and without --drill no row-level detail is asked
+// for. With --drill the operator paid for row-level detail, so scan.
+func skipRowScan(srcTotal, dstTotal int64, drill bool) bool {
+	return srcTotal != dstTotal && !drill
+}
+
+// pickScanError attributes a failure of the concurrent two-side scan to a
+// side. A side whose scan merely reported context cancellation (because the
+// other side failed first) is not blamed: prefer a side with a real error.
+func pickScanError(srcErr, dstErr error) error {
+	alive := func(e error) bool { return e != nil && !errors.Is(e, context.Canceled) }
+	switch {
+	case alive(srcErr):
+		return fmt.Errorf("src scan: %w", srcErr)
+	case alive(dstErr):
+		return fmt.Errorf("dst scan: %w", dstErr)
+	case srcErr != nil:
+		return fmt.Errorf("src scan: %w", srcErr)
+	case dstErr != nil:
+		return fmt.Errorf("dst scan: %w", dstErr)
+	}
+	return nil
 }
 
 func (c *Comparer) count(ctx context.Context, side *conn.Side, table string) (int64, error) {

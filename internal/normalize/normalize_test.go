@@ -2,7 +2,6 @@ package normalize
 
 import (
 	"bytes"
-	"database/sql/driver"
 	"testing"
 	"time"
 
@@ -39,7 +38,7 @@ func TestNormalizeDecimal(t *testing.T) {
 func TestTLVLayout(t *testing.T) {
 	n := NewNormalizer([]conn.Column{col("a", conn.FamINT), col("b", conn.FamSTR)}, DefaultOptions())
 	// NULL int + string "ab"
-	got, err := n.Normalize([]driver.Value{nil, "ab"}, nil)
+	got, err := n.Normalize([]any{nil, "ab"}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,14 +47,14 @@ func TestTLVLayout(t *testing.T) {
 		t.Errorf("NULL+string row = % x, want % x", got, want)
 	}
 	// int 42
-	got, _ = n.Normalize([]driver.Value{int64(42), "x"}, nil)
+	got, _ = n.Normalize([]any{int64(42), "x"}, nil)
 	want = []byte{tagINT, 0x00, 0x02, '4', '2', tagSTR, 0x00, 0x01, 'x'}
 	if !bytes.Equal(got, want) {
 		t.Errorf("int row = % x, want % x", got, want)
 	}
 	// BLOB containing NUL must not be confused with NULL
 	blob := NewNormalizer([]conn.Column{col("b", conn.FamBYTES)}, DefaultOptions())
-	got, _ = blob.Normalize([]driver.Value{[]byte{0x00, 0x01}}, nil)
+	got, _ = blob.Normalize([]any{[]byte{0x00, 0x01}}, nil)
 	want = []byte{tagBYTES, 0x00, 0x02, 0x00, 0x01}
 	if !bytes.Equal(got, want) {
 		t.Errorf("blob row = % x, want % x", got, want)
@@ -64,9 +63,9 @@ func TestTLVLayout(t *testing.T) {
 
 func TestNULLVsEmptyVsZero(t *testing.T) {
 	n := NewNormalizer([]conn.Column{col("s", conn.FamSTR), col("i", conn.FamINT)}, DefaultOptions())
-	r1, _ := n.Normalize([]driver.Value{"", int64(0)}, nil)
-	r2, _ := n.Normalize([]driver.Value{nil, int64(0)}, nil)
-	r3, _ := n.Normalize([]driver.Value{"  ", int64(0)}, nil) // trailing spaces trimmed by default
+	r1, _ := n.Normalize([]any{"", int64(0)}, nil)
+	r2, _ := n.Normalize([]any{nil, int64(0)}, nil)
+	r3, _ := n.Normalize([]any{"  ", int64(0)}, nil) // trailing spaces trimmed by default
 	if bytes.Equal(r1, r2) {
 		t.Error("empty string must differ from NULL")
 	}
@@ -74,7 +73,7 @@ func TestNULLVsEmptyVsZero(t *testing.T) {
 		t.Error("default trim: '  ' must equal ''")
 	}
 	noTrim := NewNormalizer([]conn.Column{col("s", conn.FamSTR), col("i", conn.FamINT)}, Options{})
-	r4, _ := noTrim.Normalize([]driver.Value{"  ", int64(0)}, nil)
+	r4, _ := noTrim.Normalize([]any{"  ", int64(0)}, nil)
 	if bytes.Equal(r1, r4) {
 		t.Error("no-trim: '  ' must differ from ''")
 	}
@@ -191,14 +190,14 @@ func TestNormalizeJSON(t *testing.T) {
 
 func TestStringOptions(t *testing.T) {
 	fold := NewNormalizer([]conn.Column{col("s", conn.FamSTR)}, Options{TrimTrailing: true, FoldCase: true})
-	a, _ := fold.Normalize([]driver.Value{"AbC   "}, nil)
-	b, _ := fold.Normalize([]driver.Value{"abc"}, nil)
+	a, _ := fold.Normalize([]any{"AbC   "}, nil)
+	b, _ := fold.Normalize([]any{"abc"}, nil)
 	if !bytes.Equal(a, b) {
 		t.Errorf("trim+fold mismatch: % x vs % x", a, b)
 	}
 	strict := NewNormalizer([]conn.Column{col("s", conn.FamSTR)}, Options{})
-	c, _ := strict.Normalize([]driver.Value{"AbC"}, nil)
-	d, _ := strict.Normalize([]driver.Value{"abc"}, nil)
+	c, _ := strict.Normalize([]any{"AbC"}, nil)
+	d, _ := strict.Normalize([]any{"abc"}, nil)
 	if bytes.Equal(c, d) {
 		t.Error("default must be case-sensitive")
 	}
@@ -210,7 +209,7 @@ func TestRowValueTypes(t *testing.T) {
 		col("f", conn.FamFLOAT), col("dt", conn.FamDATETIME), col("j", conn.FamJSON),
 	}
 	n := NewNormalizer(cols, DefaultOptions())
-	_, err := n.Normalize([]driver.Value{
+	_, err := n.Normalize([]any{
 		int64(1), uint64(2), []byte("3.40"), float32(1.5),
 		mkTime(2024, 1, 2, 3, 4, 5), []byte(`{"x":1}`),
 	}, nil)
@@ -218,7 +217,7 @@ func TestRowValueTypes(t *testing.T) {
 		t.Fatalf("valid row rejected: %v", err)
 	}
 	// wrong concrete type must surface
-	_, err = n.Normalize([]driver.Value{
+	_, err = n.Normalize([]any{
 		"not-an-int", uint64(2), []byte("3.4"), float32(1.5),
 		mkTime(2024, 1, 2, 3, 4, 5), []byte(`{"x":1}`),
 	}, nil)

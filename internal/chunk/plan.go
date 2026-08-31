@@ -40,7 +40,7 @@ func (p *Planner) Plan(ctx context.Context, db *sql.DB, total int64) ([]Chunk, e
 	if n < 1 {
 		n = 1
 	}
-	if n > 1 && p.integerSingleKey() {
+	if n > 1 && p.integerLeadKey() {
 		chunks, ok := p.planInt(minV, maxV, n)
 		if ok {
 			return chunks, nil
@@ -49,8 +49,11 @@ func (p *Planner) Plan(ctx context.Context, db *sql.DB, total int64) ([]Chunk, e
 	return p.planSample(ctx, db, minV, maxV, n)
 }
 
-func (p *Planner) integerSingleKey() bool {
-	return len(p.KeyCols) == 1 &&
+// integerLeadKey reports whether the key's leading column is integer, which
+// is enough for arithmetic chunking: a (possibly composite) key partitions
+// exactly on the lead column's value, so the trailing columns need no terms.
+func (p *Planner) integerLeadKey() bool {
+	return len(p.KeyCols) > 0 &&
 		(p.KeyFamilies[0] == conn.FamINT || p.KeyFamilies[0] == conn.FamUINT)
 }
 
@@ -77,11 +80,25 @@ func (p *Planner) extremes(ctx context.Context, db *sql.DB) ([]driver.Value, []d
 	return lo, hi, nil
 }
 
+// keyOrder renders the ORDER BY list for extremes: the direction is
+// repeated on every key column, because a bare trailing direction binds to
+// the last column only — "a, b DESC" sorts b descending but a ascending,
+// so the "last" row returned is the minimum a (with its maximum b), not
+// the maximum key.
+func keyOrder(idents []string, dir string) string {
+	parts := make([]string, len(idents))
+	for i, id := range idents {
+		parts[i] = id + " " + dir
+	}
+	return strings.Join(parts, ", ")
+}
+
 func (p *Planner) keyRow(ctx context.Context, db *sql.DB, dir, where string) ([]driver.Value, error) {
+	idents := p.keyIdents()
 	var vals []driver.Value
 	err := db.QueryRowContext(ctx,
-		fmt.Sprintf("SELECT %s FROM %s%s ORDER BY %s %s LIMIT 1",
-			strings.Join(p.keyIdents(), ", "), ident(p.Table), where, strings.Join(p.keyIdents(), ", "), dir)).
+		fmt.Sprintf("SELECT %s FROM %s%s ORDER BY %s LIMIT 1",
+			strings.Join(idents, ", "), ident(p.Table), where, keyOrder(idents, dir))).
 		Scan(p.scanDest(&vals)...)
 	return vals, err
 }
@@ -110,9 +127,13 @@ func (p *Planner) whereClause() string {
 	return " WHERE (" + p.Where + ")"
 }
 
-// planInt splits an integer key arithmetically: exact, zero extra queries.
-// Returns ok=false when the values do not fit int64 (huge uint64 keys); the
-// caller falls back to sampling.
+// planInt splits a key arithmetically on its integer lead column: exact,
+// zero extra queries. A composite key qualifies through its lead column:
+// every row has exactly one lead value, so contiguous lead ranges form an
+// exact partition and the bound applies to the lead column only (prefix
+// bounds, not lexicographic). Returns ok=false when the lead values are
+// NULL or do not fit int64 (huge uint64 keys); the caller falls back to
+// sampling (which also handles NULL leads).
 func (p *Planner) planInt(minV, maxV []driver.Value, n int64) ([]Chunk, bool) {
 	var lo, hi int64
 	var ok bool
@@ -129,7 +150,7 @@ func (p *Planner) planInt(minV, maxV []driver.Value, n int64) ([]Chunk, bool) {
 	if !ok {
 		return nil, false
 	}
-	return intBoundaries(lo, hi, n), true
+	return intBoundaries(lo, hi, n, len(p.KeyCols) > 1), true
 }
 
 // intBoundaries splits [lo, hi] into at most n contiguous, non-overlapping
@@ -139,12 +160,21 @@ func (p *Planner) planInt(minV, maxV []driver.Value, n int64) ([]Chunk, bool) {
 // ceil((hi-lo)/n) (the tempting formula) is one short whenever (hi-lo) is
 // divisible by n, leaving the maximum key value in no chunk — both sides
 // then miss the same rows and an inconsistent table reports "identical".
-func intBoundaries(lo, hi int64, n int64) []Chunk {
+//
+// leadPrefix marks the ranges as lead-column-only bounds (composite key
+// split on its integer lead): the boundary vectors hold just the lead
+// value and carry LoPrefix/HiPrefix so the predicate renders plain column
+// comparisons instead of lexicographic expansion.
+func intBoundaries(lo, hi int64, n int64, leadPrefix bool) []Chunk {
+	prefix := 0
+	if leadPrefix {
+		prefix = 1
+	}
 	if n < 1 {
 		n = 1
 	}
 	if hi == lo {
-		return []Chunk{{ID: 0, Lo: []driver.Value{lo}, LoIncl: true, Hi: []driver.Value{hi}}}
+		return []Chunk{{ID: 0, Lo: []driver.Value{lo}, LoIncl: true, Hi: []driver.Value{hi}, LoPrefix: prefix, HiPrefix: prefix}}
 	}
 	step := (hi - lo + n) / n
 	chunks := make([]Chunk, 0, n)
@@ -157,7 +187,7 @@ func intBoundaries(lo, hi int64, n int64) []Chunk {
 		if hiV > hi {
 			hiV = hi
 		}
-		c := Chunk{ID: len(chunks), Hi: []driver.Value{hiV}}
+		c := Chunk{ID: len(chunks), Hi: []driver.Value{hiV}, LoPrefix: prefix, HiPrefix: prefix}
 		if i == 0 {
 			c.Lo, c.LoIncl = []driver.Value{loV}, true
 		} else {
@@ -259,7 +289,8 @@ func (s *Scanner) Scan(ctx context.Context, c *sql.Conn, schema *conn.Schema, ch
 	cols := schema.Cols
 	// Scan into []any, not []driver.Value: database/sql cannot store a NULL
 	// (nil) into a *driver.Value destination ("unsupported Scan"). The
-	// values are driver values either way; copy them across below.
+	// values are driver values either way, so the buffer goes straight to
+	// Normalize (no per-row copy).
 	vals := make([]any, len(cols))
 	ptrs := make([]any, len(cols))
 	for i := range vals {
@@ -271,11 +302,7 @@ func (s *Scanner) Scan(ctx context.Context, c *sql.Conn, schema *conn.Schema, ch
 		if err := rows.Scan(ptrs...); err != nil {
 			return hash.ChunkDigest{}, fmt.Errorf("scan %s chunk %d: %w", schema.Table, ch.ID, err)
 		}
-		row := make([]driver.Value, len(vals))
-		for i, v := range vals {
-			row[i] = v
-		}
-		canon, err := s.norm.Normalize(row, buf)
+		canon, err := s.norm.Normalize(vals, buf)
 		if err != nil {
 			return hash.ChunkDigest{}, fmt.Errorf("normalize %s chunk %d: %w", schema.Table, ch.ID, err)
 		}

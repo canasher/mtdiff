@@ -69,9 +69,12 @@ func NewNormalizer(cols []conn.Column, opts Options) *Normalizer {
 }
 
 // Normalize encodes one row (driver values, same order as the constructor's
-// columns) into canonical bytes. buf may be reused across calls; the
-// returned slice is valid until the next call on this normalizer.
-func (n *Normalizer) Normalize(row []driver.Value, buf []byte) ([]byte, error) {
+// columns) into canonical bytes. The row is []any because database/sql
+// cannot Scan NULLs into []driver.Value destinations; the elements are
+// driver values either way, so the caller's scan buffer can be passed
+// straight through without a per-row copy. buf may be reused across calls;
+// the returned slice is valid until the next call on this normalizer.
+func (n *Normalizer) Normalize(row []any, buf []byte) ([]byte, error) {
 	if len(row) != len(n.cols) {
 		return nil, fmt.Errorf("row has %d values, expected %d", len(row), len(n.cols))
 	}

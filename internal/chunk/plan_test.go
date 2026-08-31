@@ -6,7 +6,7 @@ import (
 )
 
 func TestIntBoundaries(t *testing.T) {
-	cs := intBoundaries(0, 99, 10)
+	cs := intBoundaries(0, 99, 10, false)
 	if len(cs) != 10 {
 		t.Fatalf("got %d chunks, want 10", len(cs))
 	}
@@ -27,13 +27,13 @@ func TestIntBoundaries(t *testing.T) {
 	}
 
 	// single value
-	cs = intBoundaries(5, 5, 10)
+	cs = intBoundaries(5, 5, 10, false)
 	if len(cs) != 1 || cs[0].Lo[0] != int64(5) || cs[0].Hi[0] != int64(5) || !cs[0].LoIncl {
 		t.Errorf("single value: %+v", cs)
 	}
 
 	// range not divisible by n: step = ceil(10/4) = 3 -> [0,2] (2,5] (5,8] (8,9]
-	cs = intBoundaries(0, 9, 4)
+	cs = intBoundaries(0, 9, 4, false)
 	if len(cs) != 4 {
 		t.Fatalf("got %d chunks, want 4", len(cs))
 	}
@@ -42,7 +42,7 @@ func TestIntBoundaries(t *testing.T) {
 	}
 
 	// n larger than range: no empty chunks
-	cs = intBoundaries(10, 12, 100)
+	cs = intBoundaries(10, 12, 100, false)
 	if len(cs) != 3 {
 		t.Errorf("expected 3 non-empty chunks, got %d", len(cs))
 	}
@@ -77,7 +77,7 @@ func assertCover(t *testing.T, lo, hi, n int64, cs []Chunk) {
 // ceil((hi-lo)/n) step left the maximum key value out of every chunk.
 func TestIntBoundariesDivisible(t *testing.T) {
 	// 7 values in 3 chunks (hi-lo=6, 6%3==0): old formula gave [1,2] (2,4] (4,6]
-	cs := intBoundaries(1, 7, 3)
+	cs := intBoundaries(1, 7, 3, false)
 	assertCover(t, 1, 7, 3, cs)
 	if len(cs) != 3 {
 		t.Fatalf("want 3 chunks, got %d: %+v", len(cs), cs)
@@ -87,7 +87,7 @@ func TestIntBoundariesDivisible(t *testing.T) {
 	}
 
 	// 100 values (0..99) in 11 chunks (span 99 = 9x11): old formula ended at 98
-	cs = intBoundaries(0, 99, 11)
+	cs = intBoundaries(0, 99, 11, false)
 	assertCover(t, 0, 99, 11, cs)
 	if len(cs) != 10 {
 		t.Fatalf("want 10 non-empty chunks, got %d: %+v", len(cs), cs)
@@ -95,13 +95,86 @@ func TestIntBoundariesDivisible(t *testing.T) {
 
 	// 90001 values (1..90001) in 10 chunks (span 90000 = 9000x10):
 	// the plan's reproduction shape; row 90001 used to be unscanned.
-	cs = intBoundaries(1, 90001, 10)
+	cs = intBoundaries(1, 90001, 10, false)
 	assertCover(t, 1, 90001, 10, cs)
 	if len(cs) != 10 {
 		t.Fatalf("want 10 chunks, got %d", len(cs))
 	}
 	if cs[0].Hi[0] != int64(9001) {
 		t.Errorf("first chunk must end at 9001, got %d", cs[0].Hi[0])
+	}
+}
+
+// TestIntBoundariesLeadPrefix covers the P3-#15 case: a composite key
+// arithmetically split on its integer lead column. The span 30000 (1..30001)
+// is divisible by the chunk count (4): the exact shape where an off-by-one
+// step would strand the maximum lead value, and every bound must carry the
+// lead-column-only prefix markers.
+func TestIntBoundariesLeadPrefix(t *testing.T) {
+	cs := intBoundaries(1, 30001, 4, true)
+	assertCover(t, 1, 30001, 4, cs)
+	if len(cs) != 4 {
+		t.Fatalf("want 4 chunks, got %d: %+v", len(cs), cs)
+	}
+	for i, c := range cs {
+		if c.LoPrefix != 1 || c.HiPrefix != 1 {
+			t.Errorf("chunk %d must be lead-column-only (prefix 1): %+v", i, c)
+		}
+		// lead bounds hold exactly one value (the lead), not a key vector
+		if len(c.Lo) != 1 || len(c.Hi) != 1 {
+			t.Errorf("chunk %d bounds must be single lead values: %+v", i, c)
+		}
+	}
+	if cs[0].Hi[0] != int64(7501) {
+		t.Errorf("first chunk must end at 7501, got %d", cs[0].Hi[0])
+	}
+	if last := cs[3].Hi[0]; last != int64(30001) {
+		t.Errorf("last chunk must end at 30001, got %d (max lead unscanned)", last)
+	}
+}
+
+// TestPredicateLeadPrefix covers the P3-#15 rendering: a lead-column-only
+// bound is a plain column comparison on the lead column (no lexicographic
+// expansion), and the bound display shows just the lead value.
+func TestPredicateLeadPrefix(t *testing.T) {
+	c := Chunk{
+		ID: 1,
+		Lo: []driver.Value{int64(7501)}, LoIncl: false, LoPrefix: 1,
+		Hi: []driver.Value{int64(15002)}, HiPrefix: 1,
+	}
+	if got := c.Predicate([]string{"a", "b"}, ""); got != "`a` > 7501 AND `a` <= 15002" {
+		t.Errorf("lead-prefix predicate = %q", got)
+	}
+	c.Lo, c.LoIncl = []driver.Value{int64(1)}, true
+	if got := c.Predicate([]string{"a", "b"}, ""); got != "`a` >= 1 AND `a` <= 15002" {
+		t.Errorf("inclusive lead-prefix predicate = %q", got)
+	}
+	if got, want := c.RenderBound(true), "1"; got != want {
+		t.Errorf("bound display must show the lead value only: %q, want %q", got, want)
+	}
+	// a prefix equal to the key width is not a prefix: full lexicographic
+	c2 := Chunk{
+		Lo: []driver.Value{int64(1), int64(2)}, LoIncl: true, LoPrefix: 2,
+	}
+	if got, want := c2.Predicate([]string{"a", "b"}, ""), "(`a` > 1 OR (`a` = 1 AND `b` >= 2))"; got != want {
+		t.Errorf("full-width prefix must stay lexicographic: %q, want %q", got, want)
+	}
+}
+
+// TestKeyOrder covers the latent composite-extremes bug: the sort
+// direction must be repeated on every key column. A bare trailing "DESC"
+// binds to the last column only, so "a, b DESC" returns the minimum a
+// (with its maximum b) as the "last" row — collapsing a composite key's
+// whole range to a single row on both sides (silent false "identical").
+func TestKeyOrder(t *testing.T) {
+	if got, want := keyOrder([]string{"`a`"}, "DESC"), "`a` DESC"; got != want {
+		t.Errorf("single column: %q, want %q", got, want)
+	}
+	if got, want := keyOrder([]string{"`a`", "`b`"}, "DESC"), "`a` DESC, `b` DESC"; got != want {
+		t.Errorf("composite must repeat DESC on every column: %q, want %q", got, want)
+	}
+	if got, want := keyOrder([]string{"`a`", "`b`", "`c`"}, "ASC"), "`a` ASC, `b` ASC, `c` ASC"; got != want {
+		t.Errorf("composite ASC: %q, want %q", got, want)
 	}
 }
 

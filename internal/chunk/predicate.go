@@ -17,11 +17,19 @@ import (
 // "no upper bound" (last chunk / whole table). Composite bounds are expanded
 // into OR/AND terms (no row-constructor comparisons, for compatibility with
 // MySQL 5.7 and compatible layers).
+//
+// LoPrefix/HiPrefix: when set to a count in (0, len(keyCols)), the bound
+// constrains only the first that many key columns as plain column
+// comparisons (no lexicographic expansion). Used for composite keys split
+// arithmetically on an integer lead column, where each row's lead value
+// pins it to exactly one chunk, so the trailing columns need no terms.
 type Chunk struct {
-	ID     int
-	Lo     []driver.Value
-	LoIncl bool
-	Hi     []driver.Value
+	ID       int
+	Lo       []driver.Value
+	LoIncl   bool
+	Hi       []driver.Value
+	LoPrefix int
+	HiPrefix int
 }
 
 // RenderBound renders one key boundary for display: "-" when unbounded,
@@ -73,18 +81,31 @@ func (c Chunk) Predicate(keyCols []string, extraWhere string) string {
 			if c.LoIncl {
 				op = ">="
 			}
-			if len(keyCols) == 1 {
+			switch {
+			case c.LoPrefix > 0 && c.LoPrefix < len(keyCols):
+				// Lead-column-only bound (composite key split on its
+				// integer lead): plain column comparisons, each lead
+				// column independently, no lexicographic expansion.
+				for i := 0; i < c.LoPrefix; i++ {
+					parts = append(parts, fmt.Sprintf("%s %s %s", ident(keyCols[i]), op, literal(c.Lo[i])))
+				}
+			case len(keyCols) == 1:
 				parts = append(parts, fmt.Sprintf("%s %s %s", ident(keyCols[0]), op, literal(c.Lo[0])))
-			} else {
+			default:
 				parts = append(parts, "("+rowCompare(keyCols, c.Lo, op)+")")
 			}
 		}
 		if c.Hi != nil {
-			if len(keyCols) == 1 && c.Hi[0] == nil {
+			switch {
+			case c.HiPrefix > 0 && c.HiPrefix < len(keyCols):
+				for i := 0; i < c.HiPrefix; i++ {
+					parts = append(parts, fmt.Sprintf("%s <= %s", ident(keyCols[i]), literal(c.Hi[i])))
+				}
+			case len(keyCols) == 1 && c.Hi[0] == nil:
 				// All keys NULL: no effective upper bound.
-			} else if len(keyCols) == 1 {
+			case len(keyCols) == 1:
 				parts = append(parts, fmt.Sprintf("%s <= %s", ident(keyCols[0]), literal(c.Hi[0])))
-			} else {
+			default:
 				parts = append(parts, "("+rowCompare(keyCols, c.Hi, "<=")+")")
 			}
 		}

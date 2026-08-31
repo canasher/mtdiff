@@ -21,6 +21,9 @@ const (
 	RowChanged      RowKind = "CHANGED"
 	RowMissingInDst RowKind = "MISSING_IN_DST"
 	RowMissingInSrc RowKind = "MISSING_IN_SRC"
+	// RowCountDiff marks a keyless row present on both sides with differing
+	// multiplicity (neither side is "missing" the row itself).
+	RowCountDiff RowKind = "COUNT_DIFF"
 )
 
 // RowDiff is one example row-level difference.
@@ -33,7 +36,8 @@ type RowDiff struct {
 
 // DrillDown produces example rows for differing chunks. For keyed tables it
 // is a key-set difference (CHANGED / MISSING_IN_*); for keyless tables it
-// is a multiset difference (different row multiplicities).
+// is a multiset difference (COUNT_DIFF, or MISSING_IN_* when a row exists
+// on only one side).
 type DrillDown struct{}
 
 type rowRec struct {
@@ -102,13 +106,13 @@ func (d *DrillDown) scanRows(ctx context.Context, side *conn.Side, schema *conn.
 
 	keyN, colN := len(schema.Key), len(schema.Cols)
 	// Scan into []any (NULLs cannot be stored into *driver.Value
-	// destinations), then hand copies to the buffer.
+	// destinations); the buffer is handed to the row map as-is, no copy.
 	vals := make([]any, keyN+colN)
 	ptrs := make([]any, keyN+colN)
 	for i := range vals {
 		ptrs[i] = &vals[i]
 	}
-	next := func() (row []driver.Value, ok bool) {
+	next := func() (row []any, ok bool) {
 		if !rows.Next() {
 			return nil, false
 		}
@@ -118,11 +122,7 @@ func (d *DrillDown) scanRows(ctx context.Context, side *conn.Side, schema *conn.
 		if err := rows.Scan(ptrs...); err != nil {
 			return nil, false // rows.Err() below carries the failure
 		}
-		out := make([]driver.Value, len(vals))
-		for i, v := range vals {
-			out[i] = v
-		}
-		return out, true
+		return vals, true
 	}
 	out, truncated, err := d.bufferRows(keyN > 0, keyN, colN, norm, next)
 	if err != nil {
@@ -138,7 +138,7 @@ func (d *DrillDown) scanRows(ctx context.Context, side *conn.Side, schema *conn.
 // builds the row map, buffering at most drillMaxRows rows. Each row is keyN
 // key values followed by colN compared values. Past the cap it keeps
 // draining the iterator without buffering and reports truncated=true.
-func (d *DrillDown) bufferRows(keyed bool, keyN, colN int, norm *normalize.Normalizer, next func() ([]driver.Value, bool)) (map[string]*rowRec, bool, error) {
+func (d *DrillDown) bufferRows(keyed bool, keyN, colN int, norm *normalize.Normalizer, next func() ([]any, bool)) (map[string]*rowRec, bool, error) {
 	out := make(map[string]*rowRec, 1024)
 	buf := make([]byte, 0, 4096)
 	truncated := false
@@ -151,8 +151,8 @@ func (d *DrillDown) bufferRows(keyed bool, keyN, colN int, norm *normalize.Norma
 			truncated = true
 			continue
 		}
-		keyVals := make([]driver.Value, keyN)
-		colVals := make([]driver.Value, colN)
+		keyVals := make([]any, keyN)
+		colVals := make([]any, colN)
 		for i, v := range vals {
 			if i < keyN {
 				keyVals[i] = v
@@ -166,7 +166,7 @@ func (d *DrillDown) bufferRows(keyed bool, keyN, colN int, norm *normalize.Norma
 		}
 		lookup := string(canon)
 		if keyed {
-			lookup = renderValues(keyVals)
+			lookup = lookupKey(keyVals)
 		}
 		rec, ok := out[lookup]
 		if !ok {
@@ -176,7 +176,7 @@ func (d *DrillDown) bufferRows(keyed bool, keyN, colN int, norm *normalize.Norma
 				n:     1,
 			}
 			if keyed {
-				rec.keys = lookup
+				rec.keys = renderValues(keyVals)
 			}
 			out[lookup] = rec
 		} else {
@@ -184,6 +184,35 @@ func (d *DrillDown) bufferRows(keyed bool, keyN, colN int, norm *normalize.Norma
 		}
 	}
 	return out, truncated, nil
+}
+
+// lookupKey renders a key vector as its map identity: string/byte
+// components are quoted (%q) before the " | " join, so a value containing
+// the separator cannot collide across component boundaries — e.g.
+// ("a", "b | c") and ("a | b", "c") must stay two distinct keys. Long
+// values are shortened first so the key stays bounded. Display uses
+// renderValues (unquoted); this is identity only.
+func lookupKey(vals []any) string {
+	parts := make([]string, len(vals))
+	for i, v := range vals {
+		switch t := v.(type) {
+		case string:
+			parts[i] = strconv.Quote(shorten(t))
+		case []byte:
+			parts[i] = strconv.Quote(shorten(string(t)))
+		default:
+			parts[i] = renderValue(v)
+		}
+	}
+	return strings.Join(parts, " | ")
+}
+
+// shorten caps a string component for display/identity purposes.
+func shorten(s string) string {
+	if len(s) > 80 {
+		return s[:77] + "..."
+	}
+	return s
 }
 
 func (d *DrillDown) keyedDiff(srcRows, dstRows map[string]*rowRec, limit int) []RowDiff {
@@ -245,9 +274,14 @@ func (d *DrillDown) multisetDiff(srcRows, dstRows map[string]*rowRec, limit int)
 		if s != nil && d != nil && s.n == d.n {
 			continue
 		}
-		r := RowDiff{Kind: RowMissingInDst}
-		if s == nil {
+		// Present on only one side: missing there. Present on both with
+		// different multiplicity: a count difference, not a "missing" row.
+		r := RowDiff{Kind: RowCountDiff}
+		switch {
+		case s == nil:
 			r.Kind = RowMissingInSrc
+		case d == nil:
+			r.Kind = RowMissingInDst
 		}
 		if s != nil {
 			r.SrcVals = s.vals + " x" + strconv.Itoa(s.n)
@@ -261,7 +295,7 @@ func (d *DrillDown) multisetDiff(srcRows, dstRows map[string]*rowRec, limit int)
 }
 
 // renderValues renders raw driver values for display (truncating long blobs).
-func renderValues(vals []driver.Value) string {
+func renderValues(vals []any) string {
 	parts := make([]string, len(vals))
 	for i, v := range vals {
 		parts[i] = renderValue(v)
@@ -284,14 +318,11 @@ func renderValue(v driver.Value) string {
 	case bool:
 		return strconv.FormatBool(t)
 	case string:
-		if len(t) > 80 {
-			return t[:77] + "..."
-		}
-		return t
+		return shorten(t)
 	case []byte:
-		s := string(t)
-		if len(s) > 80 {
-			return fmt.Sprintf("%q... (%d bytes)", s[:32], len(t))
+		s := shorten(string(t))
+		if len(t) > 80 {
+			return fmt.Sprintf("%q... (%d bytes)", s, len(t))
 		}
 		return fmt.Sprintf("%q", s)
 	case time.Time:

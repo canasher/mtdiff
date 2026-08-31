@@ -1,7 +1,8 @@
 package compare
 
 import (
-	"database/sql/driver"
+	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -96,12 +97,12 @@ func TestDrillDownRowCap(t *testing.T) {
 	d := &DrillDown{}
 
 	drained := 0
-	next := func() ([]driver.Value, bool) {
+	next := func() ([]any, bool) {
 		if drained >= drillMaxRows+5 {
 			return nil, false
 		}
 		drained++
-		return []driver.Value{int64(drained)}, true
+		return []any{int64(drained)}, true
 	}
 	out, truncated, err := d.bufferRows(false, 0, 1, norm, next)
 	if err != nil {
@@ -119,12 +120,12 @@ func TestDrillDownRowCap(t *testing.T) {
 
 	// a small stream is fully buffered and not truncated
 	small := 0
-	nextSmall := func() ([]driver.Value, bool) {
+	nextSmall := func() ([]any, bool) {
 		if small >= 2 {
 			return nil, false
 		}
 		small++
-		return []driver.Value{int64(1)}, true
+		return []any{int64(1)}, true
 	}
 	out, truncated, err = d.bufferRows(false, 0, 1, norm, nextSmall)
 	if err != nil {
@@ -147,6 +148,57 @@ func norm2canonKey(m map[string]*rowRec) string {
 		return k
 	}
 	return ""
+}
+
+// TestLookupKeyCollision covers the P3-#19 fix: string key components
+// containing the " | " join separator used to collide across component
+// boundaries in the keyed drill-down map. Components are now quoted.
+func TestLookupKeyCollision(t *testing.T) {
+	a := lookupKey([]any{"a", "b | c"})
+	b := lookupKey([]any{"a | b", "c"})
+	if a == b {
+		t.Errorf("separator collision across components: both render as %q", a)
+	}
+	// a string and the same text as a number must stay distinct too
+	if s := lookupKey([]any{"42"}); s == lookupKey([]any{int64(42)}) {
+		t.Errorf("string \"42\" must not collide with int 42: %q", s)
+	}
+	// long components stay bounded (shortened before quoting)
+	long := strings.Repeat("x", 500)
+	if k := lookupKey([]any{long}); len(k) > 200 {
+		t.Errorf("long key component must be shortened, got %d chars", len(k))
+	}
+}
+
+// TestMultisetDiffKinds covers the P3-#20 fix: a keyless row present on
+// both sides with differing multiplicity is a COUNT_DIFF, not an arbitrary
+// MISSING_IN_DST.
+func TestMultisetDiffKinds(t *testing.T) {
+	d := &DrillDown{}
+	mk := func(vals string, n int) *rowRec { return &rowRec{vals: vals, n: n} }
+	src := map[string]*rowRec{"r1": mk("v1", 2), "r2": mk("v2", 1), "r3": mk("v3", 1)}
+	dst := map[string]*rowRec{"r1": mk("v1", 3), "r2": mk("v2", 1), "r4": mk("v4", 1)}
+	out := d.multisetDiff(src, dst, 10)
+	if len(out) != 3 {
+		t.Fatalf("want 3 differences, got %d: %+v", len(out), out)
+	}
+	byRow := map[string]RowDiff{}
+	for _, r := range out {
+		if r.SrcVals != "" {
+			byRow[r.SrcVals] = r
+		} else {
+			byRow[r.DstVals] = r
+		}
+	}
+	if r, ok := byRow["v1 x2"]; !ok || r.Kind != RowCountDiff {
+		t.Errorf("both-sides count difference must be COUNT_DIFF, got %+v", r)
+	}
+	if r, ok := byRow["v3 x1"]; !ok || r.Kind != RowMissingInDst || r.DstVals != "" {
+		t.Errorf("src-only row must be MISSING_IN_DST, got %+v", r)
+	}
+	if r, ok := byRow["v4 x1"]; !ok || r.Kind != RowMissingInSrc || r.SrcVals != "" {
+		t.Errorf("dst-only row must be MISSING_IN_SRC, got %+v", r)
+	}
 }
 
 // TestApplyKey covers the explicit --key override and the nullable-key
@@ -197,9 +249,63 @@ func chunkDigest(ordered bool, id, count int) mhash.ChunkDigest {
 	return d
 }
 
-// TestFoldDigests covers the verdict folding, in particular the P2-9
-// count-mismatch branch: equal chunk digests but differing row counts must
-// still mark the table DIFFERENT.
+// TestSkipRowScan covers the P3-#14 rule: differing row counts already make
+// the table DIFFERENT, so planning and row scans are skipped — unless the
+// operator asked for --drill row-level detail.
+func TestSkipRowScan(t *testing.T) {
+	cases := []struct {
+		src, dst int64
+		drill    bool
+		want     bool
+	}{
+		{100, 100, false, false}, // equal counts: full comparison
+		{100, 101, false, true},  // insert on dst: skip
+		{101, 100, false, true},  // insert on src: skip
+		{0, 5, false, true},
+		{5, 0, false, true},
+		{100, 101, true, false}, // drill wants row detail: still scan
+		{101, 100, true, false}, // ditto
+		{0, 0, false, false},    // both empty: nothing to skip (no chunks)
+	}
+	for _, c := range cases {
+		if got := skipRowScan(c.src, c.dst, c.drill); got != c.want {
+			t.Errorf("skipRowScan(%d, %d, drill=%v) = %v, want %v", c.src, c.dst, c.drill, got, c.want)
+		}
+	}
+}
+
+// TestPickScanError covers error attribution for the concurrent two-side
+// scan (P3-#13): a side whose scan merely reported context cancellation
+// (because the other side failed first) must not be blamed.
+func TestPickScanError(t *testing.T) {
+	canceled := context.Canceled
+	wrapped := fmt.Errorf("query: %w", context.Canceled)
+	cases := []struct {
+		name     string
+		src, dst error
+		wantSide string // "", "src", "dst"
+	}{
+		{"both nil", nil, nil, ""},
+		{"src fails", fmt.Errorf("boom"), nil, "src"},
+		{"dst fails", nil, fmt.Errorf("boom"), "dst"},
+		{"src canceled, dst real error", canceled, fmt.Errorf("boom"), "dst"},
+		{"src real error, dst canceled", fmt.Errorf("boom"), wrapped, "src"},
+		{"both canceled", canceled, wrapped, "src"}, // first non-nil wins
+	}
+	for _, c := range cases {
+		err := pickScanError(c.src, c.dst)
+		if c.wantSide == "" {
+			if err != nil {
+				t.Errorf("%s: want nil error, got %v", c.name, err)
+			}
+			continue
+		}
+		if err == nil || !strings.Contains(err.Error(), c.wantSide+" scan:") {
+			t.Errorf("%s: want %s scan error, got %v", c.name, c.wantSide, err)
+		}
+	}
+}
+
 func TestFoldDigests(t *testing.T) {
 	// identical digests and counts: OK
 	res := TableResult{Name: "t", Status: "OK"}
