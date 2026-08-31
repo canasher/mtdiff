@@ -41,7 +41,7 @@ src:
   host: 10.0.0.1
   port: 3306
   user: replica
-  password_env: SRC_MYSQL_PWD   # 密码从环境变量读，支持 ${ENV} 展开
+  password_env: SRC_MYSQL_PWD   # 密码从环境变量读（变量未设置会报错）；${ENV} 是原文替换，值含引号/换行慎用
   database: dbA
 dst: { ... }
 options:
@@ -50,7 +50,7 @@ options:
   ignore_columns: [updated_at]
 ```
 
-密码优先级：`password_env` 环境变量 > YAML/DSN 内嵌 > 终端交互输入（非 TTY 时不询问，直接报连接错误）。所有日志与报错中的 DSN 都会打码。
+密码优先级：`password_env` 环境变量（指向未设置的变量会直接报错，而非静默无密码连接）> YAML/DSN 内嵌 > 终端交互输入（非 TTY 时不询问，直接报连接错误）。所有日志与报错中的 DSN 都会打码。`${ENV}` 展开是解析前的原文替换，值含引号/换行/冒号会破坏 YAML，只建议用于密码这类简单值。
 
 ### 主要选项
 

@@ -85,10 +85,17 @@ func (f *connFlags) build(prompt config.PromptFunc) (*config.Config, error) {
 	if err := apply(&cfg.Dst, f.dst, f.dstHost, f.dstUser, f.dstDB, f.dstPassEnv, f.dstPort, "dst"); err != nil {
 		return nil, failf(ExitArgErr, "%v", err)
 	}
-	cfg.ApplyDefaults()
+	// Validate before ApplyDefaults: defaults rewrite unset (<= 0) values,
+	// so a negative value from a YAML file would otherwise be silently
+	// replaced instead of reported.
 	if err := cfg.Validate(); err != nil {
-		return nil, failf(ExitArgErr, "%v", err)
+		msg := err.Error()
+		if f.configPath != "" {
+			msg = fmt.Sprintf("%s: %v", f.configPath, err)
+		}
+		return nil, failf(ExitArgErr, "%s", msg)
 	}
+	cfg.ApplyDefaults()
 	if err := cfg.Src.ResolvePassword(prompt); err != nil {
 		return nil, failf(ExitArgErr, "%v", err)
 	}

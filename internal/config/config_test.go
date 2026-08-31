@@ -126,6 +126,32 @@ func TestResolvePasswordPriority(t *testing.T) {
 	}
 }
 
+// TestResolvePasswordEnvMissing covers the P3-#11 behavior: a password_env
+// naming an unset variable is a configuration error, not a silent
+// fallback to a password-less connection.
+func TestResolvePasswordEnvMissing(t *testing.T) {
+	t.Setenv("MTDIFF_TEST_UNSET_PWD", "")
+	os.Unsetenv("MTDIFF_TEST_UNSET_PWD")
+	e := Endpoint{User: "u", Host: "h", PasswordEnv: "MTDIFF_TEST_UNSET_PWD"}
+	err := e.ResolvePassword(nil)
+	if err == nil {
+		t.Fatalf("unset password_env variable must error, connected password-less instead (pw=%q)", e.Password)
+	}
+	if e.Password != "" {
+		t.Errorf("password must stay empty on error, got %q", e.Password)
+	}
+
+	// a set-but-empty variable resolves to an empty password without error
+	t.Setenv("MTDIFF_TEST_EMPTY_PWD", "")
+	e2 := Endpoint{User: "u", Host: "h", PasswordEnv: "MTDIFF_TEST_EMPTY_PWD"}
+	if err := e2.ResolvePassword(nil); err != nil {
+		t.Fatalf("set-but-empty variable must not error: %v", err)
+	}
+	if e2.Password != "" {
+		t.Errorf("empty variable must yield empty password, got %q", e2.Password)
+	}
+}
+
 func TestValidateAndDefaults(t *testing.T) {
 	c := &Config{Src: Endpoint{Host: "a"}, Dst: Endpoint{Host: "b"}}
 	if err := c.Validate(); err != nil {
@@ -138,5 +164,40 @@ func TestValidateAndDefaults(t *testing.T) {
 	c2 := &Config{Src: Endpoint{Host: "a"}}
 	if err := c2.Validate(); err == nil {
 		t.Error("missing dst host should fail")
+	}
+
+	// P3-#10: explicitly negative values must be reported by Validate
+	// (the old order ran ApplyDefaults first and silently rewrote them).
+	c3 := &Config{Src: Endpoint{Host: "a"}, Dst: Endpoint{Host: "b"}}
+	c3.Opts.Parallel = -1
+	if err := c3.Validate(); err == nil {
+		t.Error("negative parallel must fail validation")
+	}
+	c3.Opts.Parallel = 0
+	c3.Opts.ChunkSize = -5
+	if err := c3.Validate(); err == nil {
+		t.Error("negative chunk_size must fail validation")
+	}
+	c3.Opts.ChunkSize = 0
+	c3.Opts.DrillLimit = -1
+	if err := c3.Validate(); err == nil {
+		t.Error("negative drill_limit must fail validation")
+	}
+	c3.Opts.DrillLimit = 0
+	c3.Opts.Tolerance = -1e-9
+	if err := c3.Validate(); err == nil {
+		t.Error("negative tolerance must fail validation")
+	}
+
+	// P3-#17: a positive but tiny chunk_size is rejected (0 is still
+	// "unset" and legal — it receives the default).
+	c4 := &Config{Src: Endpoint{Host: "a"}, Dst: Endpoint{Host: "b"}}
+	c4.Opts.ChunkSize = 5
+	if err := c4.Validate(); err == nil {
+		t.Errorf("chunk_size 5 is below the minimum of %d, must fail", MinChunkSize)
+	}
+	c4.Opts.ChunkSize = MinChunkSize
+	if err := c4.Validate(); err != nil {
+		t.Errorf("chunk_size %d must be accepted: %v", MinChunkSize, err)
 	}
 }

@@ -78,10 +78,17 @@ type PromptFunc func(label string) (string, error)
 // ResolvePassword fills Endpoint.Password from its configured source.
 // Priority: PasswordEnv > pre-filled Password (YAML/DSN) > prompt.
 // If no source yields a password the endpoint stays password-less
-// (the server will reject if it requires one).
+// (the server will reject if it requires one). A password_env that names an
+// unset variable is a configuration error, not a silent fallback: an
+// accidental no-password connection surfaces as an incomprehensible server
+// auth failure instead of an actionable message.
 func (e *Endpoint) ResolvePassword(prompt PromptFunc) error {
 	if e.PasswordEnv != "" {
-		e.Password = os.Getenv(e.PasswordEnv)
+		p, ok := os.LookupEnv(e.PasswordEnv)
+		if !ok {
+			return fmt.Errorf("password_env %q is set but the environment variable is not", e.PasswordEnv)
+		}
+		e.Password = p
 		return nil
 	}
 	if e.Password != "" {
@@ -97,7 +104,15 @@ func (e *Endpoint) ResolvePassword(prompt PromptFunc) error {
 	return nil
 }
 
-// Validate checks that the config is usable.
+// MinChunkSize is the smallest chunk-size accepted as an explicit value
+// (0 still means "unset, apply default"). A smaller positive value on a
+// large table means one chunk per few rows: the chunk/channel bookkeeping
+// grows without bound.
+const MinChunkSize = 10
+
+// Validate checks that the config is usable. It must run BEFORE
+// ApplyDefaults: defaults rewrite unset (<= 0) values, so validating after
+// them can never see an explicit negative value from a YAML file.
 func (c *Config) Validate() error {
 	if c.Src.Host == "" {
 		return fmt.Errorf("source host is required (--src or --src-host)")
@@ -107,13 +122,19 @@ func (c *Config) Validate() error {
 	}
 	// 0 means "unset, apply default"; only reject explicitly negative values.
 	if c.Opts.Parallel < 0 {
-		return fmt.Errorf("--parallel must be >= 0")
+		return fmt.Errorf("parallel must be >= 0, got %d", c.Opts.Parallel)
 	}
 	if c.Opts.ChunkSize < 0 {
-		return fmt.Errorf("--chunk-size must be >= 0")
+		return fmt.Errorf("chunk_size must be >= 0, got %d", c.Opts.ChunkSize)
+	}
+	if c.Opts.ChunkSize > 0 && c.Opts.ChunkSize < MinChunkSize {
+		return fmt.Errorf("chunk_size %d is below the minimum of %d", c.Opts.ChunkSize, MinChunkSize)
+	}
+	if c.Opts.DrillLimit < 0 {
+		return fmt.Errorf("drill_limit must be >= 0, got %d", c.Opts.DrillLimit)
 	}
 	if c.Opts.Tolerance < 0 {
-		return fmt.Errorf("--tolerance must be >= 0")
+		return fmt.Errorf("tolerance must be >= 0, got %v", c.Opts.Tolerance)
 	}
 	return nil
 }

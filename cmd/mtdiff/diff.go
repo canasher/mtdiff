@@ -164,10 +164,11 @@ func diffRunE(cmd *cobra.Command, _ []string) error {
 	if err := applyOptions(cmd, cfg); err != nil {
 		return failf(ExitArgErr, "%v", err)
 	}
-	cfg.ApplyDefaults()
+	// Same order as build(): validate before defaults rewrite unset values.
 	if err := cfg.Validate(); err != nil {
 		return failf(ExitArgErr, "%v", err)
 	}
+	cfg.ApplyDefaults()
 	ctx := context.Background()
 	// The connect phase is bounded: a broken port forward or a stalled
 	// handshake must fail fast, not hang the whole run. Scans use ctx
