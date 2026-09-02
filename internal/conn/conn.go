@@ -36,6 +36,16 @@ type Side struct {
 // both sides must interpret timestamps in UTC or TIMESTAMP columns spanning
 // time zones produce false positives.
 func BuildDSN(ep config.Endpoint, maxAllowedPacket int) string {
+	return buildDSN(ep, maxAllowedPacket, 10)
+}
+
+// BuildWriterDSN is BuildDSN with a longer network write timeout: sending a
+// multi-row INSERT batch can take far longer than a plain query send.
+func BuildWriterDSN(ep config.Endpoint, maxAllowedPacket int) string {
+	return buildDSN(ep, maxAllowedPacket, 600)
+}
+
+func buildDSN(ep config.Endpoint, maxAllowedPacket, writeTimeoutSec int) string {
 	cred := url.User(ep.User)
 	if ep.Password != "" {
 		cred = url.UserPassword(ep.User, ep.Password)
@@ -47,7 +57,7 @@ func BuildDSN(ep config.Endpoint, maxAllowedPacket int) string {
 	b.WriteString(hostport)
 	b.WriteString(")/")
 	b.WriteString(ep.Database)
-	b.WriteString("?parseTime=true&loc=UTC&charset=utf8mb4&timeout=10s&readTimeout=10m&writeTimeout=10s")
+	fmt.Fprintf(&b, "?parseTime=true&loc=UTC&charset=utf8mb4&timeout=10s&readTimeout=10m&writeTimeout=%ds", writeTimeoutSec)
 	if maxAllowedPacket > 0 {
 		fmt.Fprintf(&b, "&maxAllowedPacket=%d", maxAllowedPacket)
 	}
@@ -152,10 +162,18 @@ func applySession(ctx context.Context, c *sql.Conn) error {
 			return fmt.Errorf("refusing to continue: cannot enforce read-only session (read_only: %v; transaction read only: %v)", err, err2)
 		}
 	}
+	applyGuardrails(ctx, c)
+	return nil
+}
+
+// applyGuardrails applies the best-effort session guardrails without the
+// read-only enforcement. It is shared by the read-only pools (via
+// applySession) and the destination write pool (which is intentionally not
+// read-only — see OpenWriter in writer.go).
+func applyGuardrails(ctx context.Context, c *sql.Conn) {
 	bestEffort(ctx, c, "SET SESSION innodb_lock_wait_timeout = 5")
 	bestEffort(ctx, c, "SET SESSION max_execution_time = 300000")
 	addSQLModeFlags(ctx, c)
-	return nil
 }
 
 // addSQLModeFlags ensures the zero-date guard flags are in the session

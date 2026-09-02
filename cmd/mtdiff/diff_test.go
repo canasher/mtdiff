@@ -10,13 +10,14 @@ import (
 )
 
 // newDiffCommand builds a command carrying the diff flags with all values
-// reset to their defaults. bindDiffFlags registers into the package-global
-// diff struct, so reset it first to avoid cross-test contamination.
+// reset to their defaults. bindCmpFlags registers into the given diffOpts,
+// so the package-global diff is reset first to avoid cross-test
+// contamination.
 func newDiffCommand(t *testing.T) *cobra.Command {
 	t.Helper()
 	diff = diffOpts{}
 	cmd := &cobra.Command{Use: "diff"}
-	bindDiffFlags(cmd)
+	bindCmpFlags(cmd, &diff)
 	return cmd
 }
 
@@ -34,7 +35,7 @@ func TestApplyOptionsZeroOverrides(t *testing.T) {
 	cfg.Opts.ChunkSize = 1000
 
 	// no flags given: YAML values survive
-	if err := applyOptions(cmd, cfg); err != nil {
+	if err := applyCmpOptions(cmd, &diff, cfg); err != nil {
 		t.Fatalf("no flags: %v", err)
 	}
 	if cfg.Opts.Tolerance != 0.5 || cfg.Opts.DrillLimit != 42 || cfg.Opts.MaxAllowedPacket != 123 {
@@ -48,7 +49,7 @@ func TestApplyOptionsZeroOverrides(t *testing.T) {
 	cmd.Flags().Set("tolerance", "0")
 	cmd.Flags().Set("drill-limit", "0")
 	cmd.Flags().Set("max-allowed-packet", "0")
-	if err := applyOptions(cmd, cfg); err != nil {
+	if err := applyCmpOptions(cmd, &diff, cfg); err != nil {
 		t.Fatalf("explicit zero: %v", err)
 	}
 	if cfg.Opts.Tolerance != 0 || cfg.Opts.DrillLimit != 0 || cfg.Opts.MaxAllowedPacket != 0 {
@@ -60,7 +61,7 @@ func TestApplyOptionsZeroOverrides(t *testing.T) {
 	cfg2 := &config.Config{}
 	cfg2.Opts.Tolerance = 0.5
 	cmd2.Flags().Set("tolerance", "2")
-	if err := applyOptions(cmd2, cfg2); err != nil {
+	if err := applyCmpOptions(cmd2, &diff, cfg2); err != nil {
 		t.Fatalf("non-zero: %v", err)
 	}
 	if cfg2.Opts.Tolerance != 2 {
@@ -73,12 +74,12 @@ func TestApplyOptionsIllegalValues(t *testing.T) {
 	cmd := newDiffCommand(t)
 	cfg := &config.Config{}
 	cmd.Flags().Set("parallel", "0")
-	if err := applyOptions(cmd, cfg); err == nil || !strings.Contains(err.Error(), "--parallel") {
+	if err := applyCmpOptions(cmd, &diff, cfg); err == nil || !strings.Contains(err.Error(), "--parallel") {
 		t.Errorf("--parallel 0 must be an argument error, got %v", err)
 	}
 	cmd.Flags().Set("parallel", "2")
 	cmd.Flags().Set("chunk-size", "-1")
-	if err := applyOptions(cmd, cfg); err == nil || !strings.Contains(err.Error(), "--chunk-size") {
+	if err := applyCmpOptions(cmd, &diff, cfg); err == nil || !strings.Contains(err.Error(), "--chunk-size") {
 		t.Errorf("--chunk-size -1 must be an argument error, got %v", err)
 	}
 	if cfg.Opts.Parallel != 2 {

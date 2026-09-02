@@ -72,7 +72,7 @@ func (n *Normalizer) encodeValue(c conn.Column, v driver.Value) ([]byte, error) 
 		if !ok {
 			return nil, fmt.Errorf("expected time.Time, got %T", v)
 		}
-		return []byte(formatMySQLDateTime(t)), nil
+		return []byte(FormatDateTime(t)), nil
 	case conn.FamYEAR:
 		i, ok := v.(int64)
 		if !ok {
@@ -179,10 +179,12 @@ func formatMySQLTime(d time.Duration) string {
 	return out
 }
 
-// formatMySQLDateTime renders as Y-m-d H:i:s[.f]; fractional seconds are
+// FormatDateTime renders as Y-m-d H:i:s[.f]; fractional seconds are
 // present only when non-zero, so equal instants render identically across
-// different column precisions.
-func formatMySQLDateTime(t time.Time) string {
+// different column precisions. It keeps up to 6 fractional digits (MySQL's
+// maximum precision): a lossy rendering here would also corrupt sync
+// writes and chunk-boundary literals for sub-second-precision columns.
+func FormatDateTime(t time.Time) string {
 	out := t.Format("2006-01-02 15:04:05")
 	if ns := t.Nanosecond(); ns != 0 {
 		// Zero-pad the microsecond count to 6 digits before trimming

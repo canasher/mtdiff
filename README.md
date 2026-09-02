@@ -30,9 +30,21 @@ mtdiff diff \
 
 # 列出两侧表
 mtdiff tables --src ... --dst ...
+
+# 把源库数据同步到目的库（先对齐表结构，再把 dst 补齐 / 修正 / 删多余，直到与 src 完全一致）
+# 默认 dry-run：只做只读对比，打印同步计划和示例 SQL，零写入
+mtdiff sync \
+  --src root:pass@10.0.0.1:3306/dbA \
+  --dst root:pass@10.0.0.2:3306/dbB \
+  --tables orders,users
+
+# 真正执行：交互式确认后只对 dst 写库（CI / 脚本用 --yes 跳过确认）
+mtdiff sync --src ... --dst ... --tables orders,users --apply --yes
 ```
 
 `diff` 子命令可省略：`mtdiff --src ... --dst ...` 直接执行对比（root 命令即 diff）。
+
+长任务（大表扫描、sync 写入）会每 ~10% 向 **stderr** 打一行进度（表名 + 百分比 + 已完成 chunk / 已写行数）；stdout 始终是干净的报告 / JSON，`--json | jq` 不受影响。
 
 连接信息也可以用细粒度 flag（`--src-host/--src-user/--src-password-env/--src-db`…）或 `--config cfg.yaml`：
 
@@ -74,20 +86,29 @@ options:
 | `--secure` | off | 128 位指纹（默认 64 位） |
 | `--json` | off | JSON 报告（CI 可 `jq .ok`） |
 | `--max-allowed-packet` | 驱动默认 | 大 BLOB 场景调大 |
+| `--apply`（仅 sync） | off | 真正执行写入（默认 dry-run，零写入） |
+| `--yes`（仅 sync） | off | 跳过 `--apply` 的交互确认（非终端下必须） |
+| `--batch-size`（仅 sync） | 1000 | 每条多行 INSERT 的行数上限 |
+| `--sample-limit`（仅 sync） | 5 | dry-run 每表展示的示例 SQL 条数（0 = 不展示） |
+| `--no-sync-schema`（仅 sync） | off | 跳过同步前的表结构同步（默认先对齐 dst 表结构：dry-run 显示将执行的 DDL，`--apply` 先执行 DDL 再写数据；开启后恢复旧的"结构不一致报错"行为） |
 
 ### 退出码
 
 | 码 | 含义 |
 |---|---|
-| 0 | 全部表一致 |
-| 1 | 存在差异 |
-| 2 | 运行时错误（连接 / schema 不兼容 / introspection） |
-| 3 | 参数错误 |
+| 0 | 全部表一致（sync：无需同步，或已同步且复验一致） |
+| 1 | 存在差异（sync dry-run：有差异未应用，含结构漂移待 DDL 对齐；sync apply：同步后仍有差异） |
+| 2 | 运行时错误（连接 / schema 不兼容 / introspection / 写入失败；sync 的结构漂移默认自动对齐，见"安全性"，加 `--no-sync-schema` 才在此报错） |
+| 3 | 参数错误（sync：非终端下 `--apply` 不带 `--yes`；无键表 + `--where` 无法同步） |
 
 ## 安全性
 
-- 每条连接（控制 + 扫描）建立后都会强制只读会话：优先 `SET SESSION read_only=ON`（TiDB 等兼容层直接支持）；MySQL 本体的 `read_only` 是 GLOBAL 变量，此时回退为 `SET SESSION TRANSACTION READ ONLY`（覆盖含 autocommit 在内的全部后续事务）。两者都失败则**拒绝运行**——mtdiff 永远不会向被对比的库发起写操作。
-- 尽力而为的护栏（失败仅告警）：`innodb_lock_wait_timeout=5`、`max_execution_time`、`NO_ZERO_DATE` sql_mode。
+- `diff` / `tables`（含裸 root 命令）**严格只读，硬保证**：每条连接（控制 + 扫描）建立后都会强制只读会话：优先 `SET SESSION read_only=ON`（TiDB 等兼容层直接支持）；MySQL 本体的 `read_only` 是 GLOBAL 变量，此时回退为 `SET SESSION TRANSACTION READ ONLY`（覆盖含 autocommit 在内的全部后续事务）。两者都失败则**拒绝运行**——这两个命令永远不会向被对比的库发起写操作。
+- `sync` 是唯一有写操作的命令，但**默认同样零写入**：dry-run 只跑只读对比并打印计划与示例 SQL。只有 `--apply` 且（交互）确认后才会写入，而且**只写目的端（dst）库**——源端（src）连接以及两侧所有扫描 / 控制连接在 sync 里也一律强制只读，做不到就拒绝运行。写连接是单独的一条、确认之后才打开。apply 成功后自动重跑一次对比复验，退出码以复验为准（仍有差异 → 1，不会假报成功）。
+- sync 的写入语义：缺的行 INSERT、值变的行 UPDATE、多的行 DELETE；当 dst 行数 > src（或表无可用键）时改为 `TRUNCATE` 后全量重灌——`TRUNCATE` 是 DDL（隐式提交、会重置 `AUTO_INCREMENT`），dst 用户需要 `DROP` 权限。
+- sync 默认**先同步表结构**再写数据：dst 结构与 src 漂移（缺列、类型/可空/默认值变化、多余列、缺主键或唯一索引）时，每表一条 `ALTER TABLE` 对齐（补列恢复 src 列序、删多余列、补索引；索引按列序比较、与名字无关；DATETIME↔TIMESTAMP 互换不产生 DDL，仍走 `--allow-tz-swap`）。dry-run 先显示将执行的 DDL（零写入）；`--apply` 确认后先执行 DDL 再全量重灌该表。**`DROP COLUMN` 不可逆**，确认摘要对结构变更的表点名（`structure+resync`）。`--ignore-columns` 里的列同时排除在数据同步与结构同步之外；src 列默认值是非字面表达式（8.0.13+ 的 `(expr)`）时不伪造值，该表直接报错。`--no-sync-schema` 跳过结构前置步骤（恢复旧的"结构不一致 → 报错"行为）。
+- 逐行 sync 只作用于 dst 中键值落在 src 最小～最大键范围内的行：范围外的 dst 行首轮删不掉。无 `--where` 时首轮后 dst 行数 > src，第二轮自动升级全量重灌自愈；带 `--where` 时需人工处理（例外：src 零匹配时直接删光 dst 匹配行）。
+- 尽力而为的护栏（失败仅告警）：`innodb_lock_wait_timeout=5`、`max_execution_time`、`NO_ZERO_DATE` sql_mode；sync 的写连接同样继承前两条。
 - 密码只存在于连接内：所有日志、报错、JSON 报告中的 DSN 一律打码（`u:***@h:port/db`）。
 
 ## 比较语义（重要）
@@ -104,11 +125,24 @@ options:
 - **零日期**（`0000-00-00`）：不支持，扫描会报明确错误；用 `--ignore-columns` 排除或先修数据。
 - **移动目标**：默认无事务，扫描窗口内并发写入可能引入抖动；需要强一致时用 `--snapshot`（每表一个一致性快照事务，长事务会持有 read view / 增长 undo log，千万行慎用）。
 
+## 性能
+
+实测（docker 双 MySQL 8.0，聊天形态 1000 万行表：BIGINT 主键 + VARCHAR 正文，localhost；宿主机有其他负载，数字偏保守）：
+
+| 操作 | 耗时 | 吞吐 |
+|---|---|---|
+| `diff` 10M×2 相同数据，默认 parallel 4 | ~2m09s | ~155k 行/s（双侧合计） |
+| `diff` 10M×2，`--parallel 16` | ~48s | ~420k 行/s（扩展 2.7×） |
+| sync row-level：补 5M 缺失行 + 全量复验 | ~8m11s | 写入段 ~14k 行/s（单写连接） |
+| sync FULL：1M TRUNCATE 重灌 + 复验 | ~1m49s | ~11k 行/s |
+
+按线性外推到 1 亿行（int 主键，算术切分零规划查询）：`diff` ≈ 20 min（parallel 4）/ 8 min（parallel 16）；row-level sync ≈ 45 min 固定开销（pre-pass + 复验）+ 增量写入（~14k 行/s）；FULL 全量重灌 ≈ 2.5~3 h，建议只用于初始化。大表建议 `--parallel 16`、sync 加 `--batch-size 5000~10000`，dst 处于静默期。
+
 ## 测试
 
 - 单测：`make test`（normalizer / 切块 / 指纹为重点，覆盖全部陷阱对）
-- E2E：`make e2e`（docker 双 MySQL 8.0 实例；"不同时区"由种子在会话级 `SET time_zone`（+08:00 vs -04:00）模拟，而非服务端 `system_time_zone`，见 `e2e/docker-compose.yml` 头注释；40+ 场景断言退出码 / JSON 报告 / 并行指纹确定性）
-- 验证状态（2026-08）：单测（含 `-race`）与全套 e2e 在 **MySQL 8.0** 上通过；TiDB / PolarDB-X / MySQL 5.7 按兼容性设计支持（应用层哈希、无 MySQL 专属函数），但尚未实测
+- E2E：`make e2e`（docker 双 MySQL 8.0 实例；"不同时区"由种子在会话级 `SET time_zone`（+08:00 vs -04:00）模拟，而非服务端 `system_time_zone`，见 `e2e/docker-compose.yml` 头注释；81 项断言（65 退出码 + 16 输出内容），覆盖退出码 / JSON 报告 / 并行指纹确定性，含 sync 的 dry-run 零写入 / row-level / TRUNCATE 全量 / 无键表 / `--where` 零匹配删除 / 结构漂移自动对齐（DDL 展示、零写入、information_schema 内容断言、`--no-sync-schema` 回归）/ 参数错路径）
+- 验证状态（2026-09）：单测（含 `-race`）与全套 e2e 在 **MySQL 8.0**（docker）上通过；10M 行基准亦在 MySQL 8.0 实测（见"性能"节）；TiDB / PolarDB-X / MySQL 5.7 按兼容性设计支持（应用层哈希、无 MySQL 专属函数），但尚未实测
 
 ```sh
 # CI（GitHub Actions 参考）

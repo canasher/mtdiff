@@ -44,6 +44,13 @@ sql() {
   # empty-output check above can't make the function return 1 under set -e.
   return 0
 }
+# qdst <sql> runs a query on the dst database and returns the result
+# machine-readable (-N no headers, -B tab/line separated).
+qdst() {
+  $COMPOSE -f e2e/docker-compose.yml exec -T -e MYSQL_PWD=rootpw mysql-dst \
+    mysql -uroot -D dstdb -N -B -e "$1"
+}
+
 wait_ready() {
   local svc="mysql-$1"
   # Probe with a real authenticated query (mysqladmin ping exits 0 even on
@@ -230,6 +237,120 @@ if command -v jq >/dev/null 2>&1; then
 else
   echo "skip: jq not available"
 fi
+
+say "sync"
+# dry-run: a value change is planned (UPDATE sample shown) but nothing is
+# written — a plain diff right after must still report the difference.
+sql dst dstdb m_mut_reseed.sql
+sql dst dstdb m_update.sql
+expect 1 "sync dry-run: 3 updated rows planned" sync --src "$SRC" --dst "$DST" --tables t_mut
+if ! grep -q 'UPDATE `t_mut`' "$OUT"; then
+  echo "FAIL: sync dry-run showed no UPDATE sample"; cat "$OUT"; exit 1
+fi
+echo "ok: dry-run shows UPDATE sample"
+expect 1 "diff still differs after dry-run (zero writes)" --src "$SRC" --dst "$DST" --tables t_mut
+# apply: row-level (same row counts) -> verified -> plain diff is clean.
+expect 0 "sync --apply --yes: row-level updates" sync --src "$SRC" --dst "$DST" --tables t_mut --apply --yes
+expect 0 "diff identical after row-level sync" --src "$SRC" --dst "$DST" --tables t_mut
+# dst has MORE rows than src (999 vs 1499) -> TRUNCATE + full resync.
+sql dst dstdb m_sync_more.sql
+expect 0 "sync: dst has more rows -> truncate + resync" sync --src "$SRC" --dst "$DST" --tables t_mut --apply --yes
+expect 0 "diff identical after full resync" --src "$SRC" --dst "$DST" --tables t_mut
+# dst is MISSING rows (899 vs 999) -> row-level inserts, no TRUNCATE.
+sql dst dstdb m_mut_reseed.sql
+sql dst dstdb m_sync_missing.sql
+expect 0 "sync: dst missing rows -> inserts" sync --src "$SRC" --dst "$DST" --tables t_mut --apply --yes
+expect 0 "diff identical after insert sync" --src "$SRC" --dst "$DST" --tables t_mut
+# keyless table: any difference means a full resync (rows cannot be targeted).
+sql dst dstdb m_nopk_change.sql
+expect 1 "keyless dry-run: full resync planned" sync --src "$SRC" --dst "$DST" --tables t_nopk
+if ! grep -q 'TRUNCATE TABLE `t_nopk`' "$OUT"; then
+  echo "FAIL: keyless dry-run showed no TRUNCATE sample"; cat "$OUT"; exit 1
+fi
+echo "ok: keyless dry-run shows TRUNCATE sample"
+expect 0 "keyless --apply --yes: full resync" sync --src "$SRC" --dst "$DST" --tables t_nopk --apply --yes
+expect 0 "keyless diff identical after sync" --src "$SRC" --dst "$DST" --tables t_nopk
+# keyless + --where: a filtered keyless table cannot be synced (arg error).
+# The table must actually differ: identical tables are skipped before the
+# plan (and its error) is even computed.
+sql dst dstdb m_nopk_change.sql
+expect 3 "keyless + --where: cannot sync" sync --src "$SRC" --dst "$DST" --tables t_nopk --where "w < 'zzz'"
+# --where with zero source matches: the source re-plan yields no chunks, so
+# the destination's matching rows are planned from the destination side and
+# deleted outright (a filtered table cannot be truncated — this is the only
+# path to convergence). m_sync_more left 500 rows with id 5001..5499 on the
+# dst, none of which exist on the src.
+sql dst dstdb m_sync_more.sql
+expect 1 "where dry-run: empty source match set planned" sync --src "$SRC" --dst "$DST" --tables t_mut --where "id >= 5001"
+if ! grep -q 'DELETE FROM `t_mut`' "$OUT"; then
+  echo "FAIL: where dry-run showed no DELETE sample"; cat "$OUT"; exit 1
+fi
+echo "ok: where dry-run shows DELETE sample"
+expect 0 "sync --where: empty source match set -> deletes" sync --src "$SRC" --dst "$DST" --tables t_mut --where "id >= 5001" --apply --yes
+expect 0 "diff identical after where-delete sync" --src "$SRC" --dst "$DST" --tables t_mut --where "id >= 5001"
+# non-TTY --apply without --yes: no terminal to confirm in -> arg error.
+# stdin is a pipe (not a character device), so stdinIsTTY is false.
+sql dst dstdb m_mut_reseed.sql
+sql dst dstdb m_update.sql
+set +e
+echo "" | timeout 600 "$MTDIFF" sync --src "$SRC" --dst "$DST" --tables t_mut --apply > "$OUT" 2>&1
+rc=$?
+set -e
+if [ "$rc" -ne 3 ]; then
+  echo "FAIL [non-TTY --apply without --yes]: exit $rc, want 3"; cat "$OUT"; exit 1
+fi
+echo "ok: non-TTY --apply without --yes (exit 3)"
+if ! grep -q "requires a terminal" "$OUT"; then
+  echo "FAIL: missing the non-TTY confirmation message"; cat "$OUT"; exit 1
+fi
+echo "ok: non-TTY message shown"
+# nothing to do: identical table, no writes, clean exit.
+sql dst dstdb m_mut_reseed.sql
+expect 0 "sync: identical table, nothing to do" sync --src "$SRC" --dst "$DST" --tables t_mut
+
+say "structure sync"
+# t_struct on the dst drifts: a column dropped, a type changed, an extra
+# column added, the PK removed. Structure sync (default on) plans the DDL.
+sql dst dstdb m_struct_drift.sql
+expect 1 "structure drift: DDL planned (dry-run)" sync --src "$SRC" --dst "$DST" --tables t_struct
+if ! grep -q 'ALTER TABLE `t_struct`' "$OUT"; then
+  echo "FAIL: structure dry-run showed no ALTER TABLE"; cat "$OUT"; exit 1
+fi
+echo "ok: dry-run shows the structure DDL"
+# the dry-run wrote nothing: the dst still errors the plain diff (structure
+# drift is not comparable), so this also proves the DDL was not executed.
+expect 2 "diff still errors after structure dry-run (zero writes)" --src "$SRC" --dst "$DST" --tables t_struct
+expect 0 "structure drift --apply: aligned + resynced" sync --src "$SRC" --dst "$DST" --tables t_struct --apply --yes
+expect 0 "diff identical after structure sync" --src "$SRC" --dst "$DST" --tables t_struct
+# information_schema content: the dst must now mirror the src exactly.
+cols=$(qdst "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='dstdb' AND TABLE_NAME='t_struct' ORDER BY ORDINAL_POSITION")
+[ "$(printf '%s\n' "$cols" | tr '\n' ' ')" = "id name amt ts " ] || {
+  echo "FAIL: dst columns after structure sync: [$cols] (want: id name amt ts)"; exit 1; }
+echo "ok: dst column set and order aligned"
+idtype=$(qdst "SELECT DATA_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='dstdb' AND TABLE_NAME='t_struct' AND COLUMN_NAME='id'")
+[ "$idtype" = "int" ] || {
+  echo "FAIL: dst id type after structure sync: $idtype (want int)"; exit 1; }
+echo "ok: dst id type restored to int"
+pk=$(qdst "SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA='dstdb' AND TABLE_NAME='t_struct' AND INDEX_NAME='PRIMARY'")
+[ "$pk" = "1" ] || {
+  echo "FAIL: dst PRIMARY index after structure sync (count=$pk, want 1)"; exit 1; }
+echo "ok: dst PRIMARY key restored"
+# Structure-only drift (data identical): structure sync alone must converge.
+sql dst dstdb m_struct_drift.sql
+expect 1 "structure-only drift: DDL planned" sync --src "$SRC" --dst "$DST" --tables t_struct
+expect 0 "structure-only drift --apply: aligned" sync --src "$SRC" --dst "$DST" --tables t_struct --apply --yes
+expect 0 "diff identical after structure-only sync" --src "$SRC" --dst "$DST" --tables t_struct
+# A structurally identical table must show no DDL.
+sql dst dstdb m_mut_reseed.sql
+expect 0 "identical table: no DDL planned" sync --src "$SRC" --dst "$DST" --tables t_mut
+if grep -q "ALTER TABLE" "$OUT"; then
+  echo "FAIL: DDL shown for a structurally identical table"; cat "$OUT"; exit 1
+fi
+echo "ok: no DDL for an identical table"
+# --no-sync-schema restores the old behavior: structure drift is a hard
+# failure instead of a planned DDL.
+sql dst dstdb m_struct_drift.sql
+expect 2 "structure drift with --no-sync-schema: not syncable" sync --src "$SRC" --dst "$DST" --tables t_struct --no-sync-schema
 
 E2E_OK=1
 say "ALL E2E SCENARIOS PASSED"

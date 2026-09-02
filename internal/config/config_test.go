@@ -158,7 +158,7 @@ func TestValidateAndDefaults(t *testing.T) {
 		t.Fatalf("valid config rejected: %v", err)
 	}
 	c.ApplyDefaults()
-	if c.Src.Port != 3306 || c.Opts.Parallel != 4 || c.Opts.ChunkSize != 10000 || c.Opts.DrillLimit != 10 {
+	if c.Src.Port != 3306 || c.Opts.Parallel != 4 || c.Opts.ChunkSize != 10000 || c.Opts.DrillLimit != 10 || c.Opts.BatchSize != 1000 || c.Opts.SampleLimit != 5 {
 		t.Errorf("defaults wrong: %+v", c)
 	}
 	c2 := &Config{Src: Endpoint{Host: "a"}}
@@ -187,6 +187,16 @@ func TestValidateAndDefaults(t *testing.T) {
 	c3.Opts.Tolerance = -1e-9
 	if err := c3.Validate(); err == nil {
 		t.Error("negative tolerance must fail validation")
+	}
+	c3.Opts.Tolerance = 0
+	c3.Opts.BatchSize = -1
+	if err := c3.Validate(); err == nil {
+		t.Error("negative batch_size must fail validation")
+	}
+	c3.Opts.BatchSize = 0
+	c3.Opts.SampleLimit = -1
+	if err := c3.Validate(); err == nil {
+		t.Error("negative sample_limit must fail validation")
 	}
 
 	// P3-#17: a positive but tiny chunk_size is rejected (0 is still

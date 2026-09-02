@@ -67,6 +67,15 @@ func failf(code int, format string, args ...any) *ExitError {
 	return &ExitError{Code: code, Msg: fmt.Sprintf(format, args...)}
 }
 
+// progressLog is the Progress callback wired into the comparer and the
+// sync runner: long-running phases (chunk scans, resync chunks) land on
+// stderr so a multi-hour run on a huge table is not a silent process. The
+// report (text or JSON) goes to stdout and stays untouched, so JSON output
+// stays parseable even with progress lines on the terminal.
+func progressLog(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, format+"\n", args...)
+}
+
 var versionCmd = &cobra.Command{
 	Use:   "version",
 	Short: "Print version",
@@ -79,5 +88,5 @@ func init() {
 	// `mtdiff --src ... --dst ...` works without a subcommand.
 	rootCmd.RunE = diffRunE
 	diffFlags.bind(rootCmd)
-	bindDiffFlags(rootCmd)
+	bindCmpFlags(rootCmd, &diff)
 }

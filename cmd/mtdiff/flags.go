@@ -105,11 +105,16 @@ func (f *connFlags) build(prompt config.PromptFunc) (*config.Config, error) {
 	return cfg, nil
 }
 
+// stdinIsTTY reports whether stdin is a terminal.
+func stdinIsTTY() bool {
+	fi, _ := os.Stdin.Stat()
+	return fi.Mode()&os.ModeCharDevice != 0
+}
+
 // makePrompt returns an interactive password prompt, or nil when stdin is not
 // a terminal (CI: never hang; a missing password surfaces as a server error).
 func makePrompt() config.PromptFunc {
-	fi, _ := os.Stdin.Stat()
-	if fi.Mode()&os.ModeCharDevice == 0 {
+	if !stdinIsTTY() {
 		return nil
 	}
 	return func(label string) (string, error) {

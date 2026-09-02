@@ -51,6 +51,37 @@ type Schema struct {
 	KeyIsUnique bool
 }
 
+// ColMeta is one column's full structure metadata (the structure-sync
+// path). It extends Column with the attributes needed to re-create the
+// column on the other side: default value, auto_increment, charset and
+// comment.
+type ColMeta struct {
+	Column
+	Default    string // COLUMN_DEFAULT verbatim: "NULL", a literal, CURRENT_TIMESTAMP, or an expression "(...)"
+	HasDefault bool
+	AutoInc    bool // EXTRA contains auto_increment
+	OnUpdate   bool // EXTRA contains "on update"
+	Charset    string
+	Comment    string
+}
+
+// Index is one key of a table: the primary key (Name "PRIMARY") or a unique
+// index, with its columns in index order. Non-unique indexes are not part
+// of the structure sync (they are not needed to address rows).
+type Index struct {
+	Name   string
+	Unique bool
+	Cols   []string
+}
+
+// Struct is the full structure of one table: columns in physical order plus
+// its primary/unique indexes.
+type Struct struct {
+	Table   string
+	Cols    []ColMeta
+	Indexes []Index
+}
+
 // QuoteIdent backtick-quotes an SQL identifier.
 func QuoteIdent(name string) string {
 	return "`" + strings.ReplaceAll(name, "`", "``") + "`"
@@ -165,6 +196,107 @@ func IntrospectTable(ctx context.Context, db *sql.DB, table string) (*Schema, er
 	s.Key, s.KeySource = key, source
 	s.KeyIsUnique = source == "primary" || source == "unique"
 	return s, nil
+}
+
+// IntrospectStructure reads the full column metadata and the primary/unique
+// indexes of a table. Unlike IntrospectTable (which serves comparison and
+// stays minimal) it fetches everything the structure sync needs to re-create
+// columns on the other side. Uses the MySQL 8.0 information_schema column
+// names (COLUMN_DEFAULT, EXTRA); 5.7 naming differs and is not supported
+// here.
+func IntrospectStructure(ctx context.Context, db *sql.DB, table string) (*Struct, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLLATION_NAME,
+		       CHARACTER_SET_NAME, COLUMN_DEFAULT, EXTRA, COLUMN_COMMENT
+		FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?
+		ORDER BY ORDINAL_POSITION`, table)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	s := &Struct{Table: table}
+	for rows.Next() {
+		var (
+			col                     ColMeta
+			nullable                string
+			collation, charset, def sql.NullString
+			extra, comment          string
+		)
+		if err := rows.Scan(&col.Name, &col.RawType, &nullable, &collation, &charset, &def, &extra, &comment); err != nil {
+			return nil, err
+		}
+		col.Nullable = nullable == "YES"
+		col.Collation = collation.String
+		col.Charset = charset.String
+		col.Default = def.String
+		col.HasDefault = def.Valid
+		col.Family, col.Precision, col.Scale = classify(col.RawType)
+		col.AutoInc = strings.Contains(extra, "auto_increment")
+		col.OnUpdate = strings.Contains(extra, "on update")
+		col.Comment = comment
+		s.Cols = append(s.Cols, col)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(s.Cols) == 0 {
+		return nil, fmt.Errorf("table %q not found in current database", table)
+	}
+	s.Indexes, err = structureIndexes(ctx, db, table)
+	if err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+// structureIndexes returns the primary key and all unique indexes of the
+// table, each with its columns in index order. Functional index parts (no
+// physical column) are skipped, and non-unique indexes are dropped: the
+// structure sync only needs the keys that address or constrain rows.
+func structureIndexes(ctx context.Context, db *sql.DB, table string) ([]Index, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT INDEX_NAME, NON_UNIQUE, SEQ_IN_INDEX, COLUMN_NAME
+		FROM information_schema.STATISTICS
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?
+		ORDER BY INDEX_NAME, SEQ_IN_INDEX`, table)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Index
+	var cur Index
+	flush := func() {
+		if cur.Name != "" {
+			out = append(out, cur)
+		}
+		cur = Index{}
+	}
+	for rows.Next() {
+		var (
+			keyName  string
+			nonUniq  string
+			seqInIdx int
+			colName  sql.NullString
+		)
+		if err := rows.Scan(&keyName, &nonUniq, &seqInIdx, &colName); err != nil {
+			return nil, err
+		}
+		// PRIMARY is special-cased by name: older servers report its
+		// NON_UNIQUE differently (the same reason SelectKey avoids SHOW INDEX).
+		if keyName != "PRIMARY" && nonUniq != "0" {
+			continue
+		}
+		if keyName != cur.Name {
+			flush()
+			cur = Index{Name: keyName, Unique: true}
+		}
+		if colName.Valid {
+			cur.Cols = append(cur.Cols, colName.String)
+		}
+	}
+	flush()
+	return out, rows.Err()
 }
 
 // SelectKey picks the chunking key: primary key first, then the first unique

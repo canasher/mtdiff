@@ -52,12 +52,13 @@ func splitList(s string) []string {
 	return out
 }
 
-// applyOptions overlays explicit CLI options onto the config (which may have
-// come from a YAML file). Zero/false/empty flag values mean "not given" —
-// except parallel and chunk-size, where 0 is not a legal value: an explicit
-// 0 (detected via Flags().Changed) is an argument error, not "use default".
-func applyOptions(cmd *cobra.Command, c *config.Config) error {
-	o := diff
+// applyCmpOptions overlays explicit CLI comparison options onto the config
+// (which may have come from a YAML file). Zero/false/empty flag values mean
+// "not given" — except parallel and chunk-size, where 0 is not a legal
+// value: an explicit 0 (detected via Flags().Changed) is an argument error,
+// not "use default". The sync subcommand reuses it via its own diffOpts
+// instance.
+func applyCmpOptions(cmd *cobra.Command, o *diffOpts, c *config.Config) error {
 	if cmd.Flags().Changed("parallel") {
 		if o.parallel < 1 {
 			return fmt.Errorf("--parallel must be >= 1 (got %d)", o.parallel)
@@ -161,7 +162,7 @@ func diffRunE(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return err
 	}
-	if err := applyOptions(cmd, cfg); err != nil {
+	if err := applyCmpOptions(cmd, &diff, cfg); err != nil {
 		return failf(ExitArgErr, "%v", err)
 	}
 	// Same order as build(): validate before defaults rewrite unset values.
@@ -196,7 +197,9 @@ func diffRunE(cmd *cobra.Command, _ []string) error {
 		fmt.Printf("src: %s (%s)\n", src.Masked(), src.Version)
 		fmt.Printf("dst: %s (%s)\n", dst.Masked(), dst.Version)
 	}
-	comparer := compare.NewComparer(buildComparerOpts(cfg))
+	cmpOpts := buildComparerOpts(cfg)
+	cmpOpts.Progress = progressLog
+	comparer := compare.NewComparer(cmpOpts)
 	results, err := comparer.Compare(ctx, src, dst, tables)
 	if err != nil {
 		return failf(ExitRuntimeErr, "%v", err)
@@ -264,35 +267,36 @@ func resolveTables(ctx context.Context, cfg *config.Config, src, dst *conn.Side)
 	return out, nil
 }
 
-// bindDiffFlags registers the comparison flags on a command. The same flags
-// are registered on both the `diff` subcommand and the root command (which
-// runs diff directly), so `mtdiff --src ...` and `mtdiff diff --src ...` are
-// equivalent.
-func bindDiffFlags(cmd *cobra.Command) {
+// bindCmpFlags registers the comparison flags (bound to the given diffOpts
+// instance) on a command. The same flags are registered on the `diff`
+// subcommand, the root command (which runs diff directly, so `mtdiff
+// --src ...` and `mtdiff diff --src ...` are equivalent) and the `sync`
+// subcommand (which reuses the whole comparison surface).
+func bindCmpFlags(cmd *cobra.Command, o *diffOpts) {
 	f := cmd.Flags()
-	f.StringVar(&diff.tables, "tables", "", "tables to compare, comma-separated (default: all common tables)")
-	f.StringVar(&diff.excludeTables, "exclude-tables", "", "tables to skip, comma-separated")
-	f.StringVar(&diff.key, "key", "", "key columns to chunk by, comma-separated (default: PK/unique)")
-	f.StringVar(&diff.where, "where", "", "extra WHERE filter applied to both sides")
-	f.StringVar(&diff.ignoreColumns, "ignore-columns", "", "columns to exclude from comparison, comma-separated")
-	f.IntVar(&diff.parallel, "parallel", 0, "concurrent chunk scans (default 4)")
-	f.IntVar(&diff.chunkSize, "chunk-size", 0, "target rows per chunk (default 10000)")
-	f.IntVar(&diff.drillLimit, "drill-limit", 0, "max example rows per differing chunk (default 10)")
-	f.IntVar(&diff.maxAllowedPacket, "max-allowed-packet", 0, "max packet size in bytes (default: driver limit)")
-	f.Float64Var(&diff.tolerance, "tolerance", 0, "float/double comparison tolerance (0 = exact)")
-	f.BoolVar(&diff.snapshot, "snapshot", false, "scan each table under a consistent snapshot (slower, stable under writes)")
-	f.BoolVar(&diff.drill, "drill", false, "show example differing rows (uses --drill-limit)")
-	f.BoolVar(&diff.noTrim, "no-trim", false, "do not trim trailing spaces from strings")
-	f.BoolVar(&diff.foldCase, "fold-case", false, "compare strings case-insensitively")
-	f.BoolVar(&diff.normalizeJSON, "normalize-json", false, "canonicalize JSON values (sorted keys, normalized numbers)")
-	f.BoolVar(&diff.allowTZSwap, "allow-tz-swap", false, "allow DATETIME/TIMESTAMP type swaps, compared as UTC instants")
-	f.BoolVar(&diff.strictTypes, "strict-types", false, "require byte-identical column types")
-	f.BoolVar(&diff.secure, "secure", false, "use 128-bit fingerprints instead of 64-bit")
-	f.BoolVar(&diff.jsonOut, "json", false, "output JSON report")
+	f.StringVar(&o.tables, "tables", "", "tables to compare, comma-separated (default: all common tables)")
+	f.StringVar(&o.excludeTables, "exclude-tables", "", "tables to skip, comma-separated")
+	f.StringVar(&o.key, "key", "", "key columns to chunk by, comma-separated (default: PK/unique)")
+	f.StringVar(&o.where, "where", "", "extra WHERE filter applied to both sides")
+	f.StringVar(&o.ignoreColumns, "ignore-columns", "", "columns to exclude from comparison, comma-separated")
+	f.IntVar(&o.parallel, "parallel", 0, "concurrent chunk scans (default 4)")
+	f.IntVar(&o.chunkSize, "chunk-size", 0, "target rows per chunk (default 10000)")
+	f.IntVar(&o.drillLimit, "drill-limit", 0, "max example rows per differing chunk (default 10)")
+	f.IntVar(&o.maxAllowedPacket, "max-allowed-packet", 0, "max packet size in bytes (default: driver limit)")
+	f.Float64Var(&o.tolerance, "tolerance", 0, "float/double comparison tolerance (0 = exact)")
+	f.BoolVar(&o.snapshot, "snapshot", false, "scan each table under a consistent snapshot (slower, stable under writes)")
+	f.BoolVar(&o.drill, "drill", false, "show example differing rows (uses --drill-limit)")
+	f.BoolVar(&o.noTrim, "no-trim", false, "do not trim trailing spaces from strings")
+	f.BoolVar(&o.foldCase, "fold-case", false, "compare strings case-insensitively")
+	f.BoolVar(&o.normalizeJSON, "normalize-json", false, "canonicalize JSON values (sorted keys, normalized numbers)")
+	f.BoolVar(&o.allowTZSwap, "allow-tz-swap", false, "allow DATETIME/TIMESTAMP type swaps, compared as UTC instants")
+	f.BoolVar(&o.strictTypes, "strict-types", false, "require byte-identical column types")
+	f.BoolVar(&o.secure, "secure", false, "use 128-bit fingerprints instead of 64-bit")
+	f.BoolVar(&o.jsonOut, "json", false, "output JSON report")
 }
 
 func init() {
 	diffFlags.bind(diffCmd)
-	bindDiffFlags(diffCmd)
+	bindCmpFlags(diffCmd, &diff)
 	rootCmd.AddCommand(diffCmd)
 }

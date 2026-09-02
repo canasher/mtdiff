@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"mtdiff/internal/normalize"
 )
 
 // Chunk is a key range to scan. The predicate is
@@ -44,7 +46,7 @@ func (c Chunk) RenderBound(lo bool) string {
 	}
 	parts := make([]string, len(vs))
 	for i, v := range vs {
-		parts[i] = literal(v)
+		parts[i] = Literal(v)
 	}
 	return strings.Join(parts, ",")
 }
@@ -66,11 +68,11 @@ func (c Chunk) Predicate(keyCols []string, extraWhere string) string {
 		switch {
 		case c.Hi != nil && c.Hi[0] != nil && c.LoIncl:
 			// NULL minimum (first chunk): NULL rows plus values <= Hi.
-			parts = append(parts, fmt.Sprintf("(%s IS NULL OR %s <= %s)", k, k, literal(c.Hi[0])))
+			parts = append(parts, fmt.Sprintf("(%s IS NULL OR %s <= %s)", k, k, Literal(c.Hi[0])))
 		case c.Hi != nil && c.Hi[0] != nil:
 			// Exclusive: NULL is the minimum, so strictly-greater rows are
 			// exactly the non-NULL rows.
-			parts = append(parts, fmt.Sprintf("%s IS NOT NULL AND %s <= %s", k, k, literal(c.Hi[0])))
+			parts = append(parts, fmt.Sprintf("%s IS NOT NULL AND %s <= %s", k, k, Literal(c.Hi[0])))
 		case !c.LoIncl:
 			// No upper bound: only the non-NULL rows.
 			parts = append(parts, fmt.Sprintf("%s IS NOT NULL", k))
@@ -87,10 +89,10 @@ func (c Chunk) Predicate(keyCols []string, extraWhere string) string {
 				// integer lead): plain column comparisons, each lead
 				// column independently, no lexicographic expansion.
 				for i := 0; i < c.LoPrefix; i++ {
-					parts = append(parts, fmt.Sprintf("%s %s %s", ident(keyCols[i]), op, literal(c.Lo[i])))
+					parts = append(parts, fmt.Sprintf("%s %s %s", ident(keyCols[i]), op, Literal(c.Lo[i])))
 				}
 			case len(keyCols) == 1:
-				parts = append(parts, fmt.Sprintf("%s %s %s", ident(keyCols[0]), op, literal(c.Lo[0])))
+				parts = append(parts, fmt.Sprintf("%s %s %s", ident(keyCols[0]), op, Literal(c.Lo[0])))
 			default:
 				parts = append(parts, "("+rowCompare(keyCols, c.Lo, op)+")")
 			}
@@ -99,12 +101,12 @@ func (c Chunk) Predicate(keyCols []string, extraWhere string) string {
 			switch {
 			case c.HiPrefix > 0 && c.HiPrefix < len(keyCols):
 				for i := 0; i < c.HiPrefix; i++ {
-					parts = append(parts, fmt.Sprintf("%s <= %s", ident(keyCols[i]), literal(c.Hi[i])))
+					parts = append(parts, fmt.Sprintf("%s <= %s", ident(keyCols[i]), Literal(c.Hi[i])))
 				}
 			case len(keyCols) == 1 && c.Hi[0] == nil:
 				// All keys NULL: no effective upper bound.
 			case len(keyCols) == 1:
-				parts = append(parts, fmt.Sprintf("%s <= %s", ident(keyCols[0]), literal(c.Hi[0])))
+				parts = append(parts, fmt.Sprintf("%s <= %s", ident(keyCols[0]), Literal(c.Hi[0])))
 			default:
 				parts = append(parts, "("+rowCompare(keyCols, c.Hi, "<=")+")")
 			}
@@ -155,7 +157,7 @@ func rowCompare(cols []string, vals []driver.Value, op string) string {
 				return fmt.Sprintf("%s IS NULL AND %s", col, term(i+1))
 			}
 		}
-		lit := literal(v)
+		lit := Literal(v)
 		if last {
 			return fmt.Sprintf("%s %s %s", col, op, lit)
 		}
@@ -173,8 +175,10 @@ func ident(name string) string {
 	return "`" + strings.ReplaceAll(name, "`", "``") + "`"
 }
 
-// literal renders a driver value as a SQL literal.
-func literal(v driver.Value) string {
+// Literal renders a driver value as a SQL literal. It is the single
+// source of truth for turning raw driver values into executable SQL text
+// (chunk bounds, sync statements); never render values by hand.
+func Literal(v driver.Value) string {
 	switch t := v.(type) {
 	case nil:
 		return "NULL"
@@ -196,11 +200,15 @@ func literal(v driver.Value) string {
 	case []byte:
 		return "X'" + hex.EncodeToString(t) + "'"
 	case time.Time:
-		return quoteString(t.Format("2006-01-02 15:04:05.999"))
+		return quoteString(normalize.FormatDateTime(t))
 	}
 	return "NULL"
 }
 
+// quoteString renders a character value as a quoted literal. It assumes the
+// server escapes backslashes (the default): with NO_BACKSLASH_ESCAPES in
+// sql_mode the data's own backslashes would be stored doubled, corrupting
+// sync writes (comparisons are unaffected — they see raw bytes).
 func quoteString(s string) string {
 	s = strings.ReplaceAll(s, `\`, `\\`)
 	s = strings.ReplaceAll(s, `'`, `''`)

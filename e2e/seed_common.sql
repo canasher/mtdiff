@@ -118,6 +118,24 @@ WITH RECURSIVE seq(n) AS (
 )
 SELECT n, CONCAT('v', n), '2024-01-01 00:00:00' FROM seq;
 
+-- t_struct: identical on both sides; the structure-sync scenarios drift the
+-- dst copy (m_struct_drift.sql) and expect the sync to realign it.
+DROP TABLE IF EXISTS t_struct;
+CREATE TABLE t_struct (
+  id   INT PRIMARY KEY,
+  name VARCHAR(32),
+  amt  DECIMAL(10,2),
+  ts   TIMESTAMP
+) ENGINE=InnoDB;
+
+INSERT INTO t_struct (id, name, amt, ts)
+WITH RECURSIVE seq(n) AS (
+  SELECT 1
+  UNION ALL
+  SELECT n + 1 FROM seq WHERE n < 100
+)
+SELECT n, CONCAT('s', n), n * 1.5, '2024-01-01 00:00:00' FROM seq;
+
 -- t_ignore: updated_at is identical at seed time; a later dst mutation
 -- shifts it, and --ignore-columns must hide the difference.
 DROP TABLE IF EXISTS t_ignore;

@@ -40,6 +40,10 @@ type Options struct {
 	StrictTypes      bool     `yaml:"strict_types"`
 	MaxAllowedPacket int      `yaml:"max_allowed_packet"`
 	Secure           bool     `yaml:"secure"`
+	// Sync options (used by the sync subcommand).
+	BatchSize    int  `yaml:"batch_size"`     // rows per multi-row INSERT / commit granularity
+	SampleLimit  int  `yaml:"sample_limit"`   // sample SQL statements shown per table in a dry-run
+	NoSyncSchema bool `yaml:"no_sync_schema"` // skip the structure pre-step (default: align the destination structure first)
 }
 
 // Config is the fully-resolved configuration.
@@ -136,6 +140,12 @@ func (c *Config) Validate() error {
 	if c.Opts.Tolerance < 0 {
 		return fmt.Errorf("tolerance must be >= 0, got %v", c.Opts.Tolerance)
 	}
+	if c.Opts.BatchSize < 0 {
+		return fmt.Errorf("batch_size must be >= 0, got %d", c.Opts.BatchSize)
+	}
+	if c.Opts.SampleLimit < 0 {
+		return fmt.Errorf("sample_limit must be >= 0, got %d", c.Opts.SampleLimit)
+	}
 	return nil
 }
 
@@ -155,5 +165,11 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.Opts.DrillLimit <= 0 {
 		c.Opts.DrillLimit = 10
+	}
+	if c.Opts.BatchSize <= 0 {
+		c.Opts.BatchSize = 1000
+	}
+	if c.Opts.SampleLimit <= 0 {
+		c.Opts.SampleLimit = 5
 	}
 }

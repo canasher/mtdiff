@@ -235,6 +235,23 @@ func TestApplyKey(t *testing.T) {
 	}
 }
 
+func TestKeyFamilies(t *testing.T) {
+	s := &conn.Schema{
+		Table: "t",
+		Cols:  []conn.Column{{Name: "a", Family: conn.FamINT, RawType: "int"}, {Name: "b", Family: conn.FamSTR, RawType: "varchar(10)"}},
+		Key:   []string{"a", "b"},
+	}
+	if got := KeyFamilies(s); len(got) != 2 || got[0] != conn.FamINT || got[1] != conn.FamSTR {
+		t.Errorf("KeyFamilies = %v, want [int str]", got)
+	}
+	// a key column missing from Cols (should not happen) yields an empty slot,
+	// not a panic
+	s2 := &conn.Schema{Table: "t", Cols: []conn.Column{{Name: "a", Family: conn.FamINT}}, Key: []string{"x", "a"}}
+	if got := KeyFamilies(s2); len(got) != 2 || got[0] != "" || got[1] != conn.FamINT {
+		t.Errorf("KeyFamilies missing column = %v", got)
+	}
+}
+
 // chunkDigest builds a digest with distinct statistics per (id, count).
 func chunkDigest(ordered bool, id, count int) mhash.ChunkDigest {
 	d := mhash.ChunkDigest{ID: id, Count: uint64(count)}

@@ -87,6 +87,15 @@
 
 **已发布 v0.1.0**（2026-08-31 决策：发布）。P1 三个静默假阴性 + P2 六项全部修复并经单测 + e2e 双重验证后，打 annotated tag `v0.1.0`（指向 `c7316d5`；源码 `Version` 为 `0.1.0-dev`，发布构建需 `-ldflags "-X mtdiff/cmd/mtdiff.Version=v0.1.0"`）。
 
-P3 十一项于同日实施完毕（commits `a762295`/`d1f9ed0`/`ff2441b`），并在此过程中发现并修复了 `keyRow` 复合键 ORDER BY 潜伏 bug（见 P3-#15 附注）。这些改进在 tag 之后；如需发布，可在当前 HEAD 打 `v0.1.1`。
+P3 十一项于同日实施完毕（commits `a762295`/`d1f9ed0`/`ff2441b`），并在此过程中发现并修复了 `keyRow` 复合键 ORDER BY 潜伏 bug（见 P3-#15 附注）。
 
-剩余未验证项（TiDB/5.7 兼容、千万行性能基准）属兼容性/性能风险而非正确性阻断。仓库为纯本地 git（无 remote，按需求方要求不推远程）。
+**已发布 v0.2.0**（2026-09-02 决策）：在 v0.1.0 + P3 之上，新增 **sync 命令**（dry-run 默认零写入 / `--apply` 确认后单写连接只写 dst / 写后自动复验 / 结构同步前置默认开启、`--no-sync-schema` 关闭）+ stderr 进度显示（~10% 一行）。全部经单测（含 `-race`）+ e2e **81 项断言**（MySQL 8.0 docker 双实例，零跳过）验证后打 annotated tag `v0.2.0`（发布构建 `-ldflags "-X mtdiff/cmd/mtdiff.Version=v0.2.0"`；源码 `Version` 保持 `0.1.0-dev` 惯例不变）。
+
+剩余未验证项：TiDB/PolarDB-X 与 MySQL 5.7 兼容（结构同步依赖 information_schema 默认值渲染，5.7 未实测）；1 亿行级为线性外推（10M 行已实测，见 09-02 更新节）。属兼容性/性能风险而非正确性阻断。仓库为纯本地 git（无 remote，按需求方要求不推远程）。
+
+## 更新（2026-09-02）
+
+- **千万行性能基准已实测**（docker 双 MySQL 8.0，聊天形态 1000 万行表，BIGINT 主键；宿主机有其他负载、数字偏保守）：`diff` 10M×2 相同数据 parallel 4 ≈ 2m09s、`--parallel 16` ≈ 48s；sync row-level 补 5M 缺失行（含全量复验）≈ 8m11s（写入段 ~14k 行/s，单写连接）；FULL 1M 重灌+复验 ≈ 1m49s（~11k 行/s）。线性外推 1 亿行：diff ≈ 20min（p4）/ 8min（p16）；row-level sync ≈ 45min 固定开销 + 增量；FULL ≈ 2.5~3h。详见 README"性能"节与 MANUAL"性能"节。
+- 同期新增 **sync 命令**（dry-run 默认零写入 / `--apply` 只写 dst / 写后自动复验）+ stderr 进度显示（~10% 一行，不影响 stdout 报告与 `--json`），review 修复后 e2e 扩至 **67 项断言**全过。注意：sync 全部改动尚未 commit（工作区 + untracked `internal/sync/` 等），v0.1.0 tag 之后。
+- 明确不修（留单独一轮）：dst 键落在 src 键范围外的行首轮不删——无 `--where` 二轮升 FULL 自愈；带 `--where` 需人工；正解"范围外删除扫描"需复合键 + NULL 安全谓词。
+- **sync 新增"先同步表结构"前置步骤**（默认开启，`--no-sync-schema` 跳过）：dst 结构漂移（缺列 / 类型或可空或默认值变化 / 多余列 / 缺主键或唯一索引）时，每表生成一条 `ALTER TABLE`（子句序 DROP INDEX → DROP COLUMN → MODIFY COLUMN → ADD COLUMN → ADD INDEX；ADD COLUMN 用 FIRST/AFTER 恢复 src 列序；索引按列序比较、与索引名无关；DATETIME↔TIMESTAMP 互换不产生 DDL，仍交 `--allow-tz-swap`）。流程：dry-run 先显示 DDL（零写入，exit 1）；`--apply` 确认后 TRUNCATE（先清空，保证 NOT NULL 无默认值补列安全）→ 执行 DDL → 重新 introspect/compare → 全量重灌 + 复验。dst 多余列 DROP 掉（与 TRUNCATE 全量重灌语义一致）；`--ignore-columns` 的列同时排除在数据与结构同步之外；src 列默认值为非字面表达式（8.0.13+ `(expr)`）拒发 DDL、该表报错（不伪造值）。实现：`conn.IntrospectStructure`（information_schema，现有 diff 路径的 IntrospectTable 不动）+ `internal/sync/struct.go`（纯函数 DiffStructure/RenderDDL，单测覆盖）；`--where` 与结构漂移组合明确报参数错误。退出码：sync 结构漂移 dry-run 由旧行为 2（FAILED）变为 1（待 DDL）；diff 严格只读、行为不变。e2e 新增 `t_struct` 种子 + `m_struct_drift.sql`（5 个场景 / 14 项断言：dry-run DDL 展示 / 零写入证明 / apply 后 information_schema 列集·列序·类型·PK 内容断言 / 仅结构漂移单独收敛 / 结构相同无 DDL / `--no-sync-schema` 回归 exit 2），断言总数 67→81。注意：本轮改动与上一轮 sync 全部改动**均未 commit**（工作区 + untracked `internal/sync/` 等），v0.1.0 tag 之后。

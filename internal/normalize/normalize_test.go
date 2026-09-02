@@ -141,14 +141,18 @@ func TestFractionalSecondCollisions(t *testing.T) {
 	}
 	// DATETIME fractional seconds: the e2e t_fracsec pair, 100ms vs 10ms.
 	base := mkTime(2024, 1, 1, 0, 0, 0)
-	if got := formatMySQLDateTime(base.Add(100 * time.Millisecond)); got != "2024-01-01 00:00:00.1" {
+	if got := FormatDateTime(base.Add(100 * time.Millisecond)); got != "2024-01-01 00:00:00.1" {
 		t.Errorf("DATETIME 100ms = %q", got)
 	}
-	if got := formatMySQLDateTime(base.Add(10 * time.Millisecond)); got != "2024-01-01 00:00:00.01" {
+	if got := FormatDateTime(base.Add(10 * time.Millisecond)); got != "2024-01-01 00:00:00.01" {
 		t.Errorf("DATETIME 10ms = %q", got)
 	}
+	// microsecond precision (DATETIME(6)): the literal path must keep all 6 digits
+	if got := FormatDateTime(base.Add(123456 * time.Microsecond)); got != "2024-01-01 00:00:00.123456" {
+		t.Errorf("DATETIME 123456us = %q", got)
+	}
 	// whole seconds are unaffected
-	if got := formatMySQLDateTime(base); got != "2024-01-01 00:00:00" {
+	if got := FormatDateTime(base); got != "2024-01-01 00:00:00" {
 		t.Errorf("DATETIME whole second = %q", got)
 	}
 }

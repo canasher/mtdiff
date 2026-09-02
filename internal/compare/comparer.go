@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
 
 	"golang.org/x/sync/errgroup"
 
@@ -27,6 +28,11 @@ type Options struct {
 	Normalize  normalize.Options
 	Key        []string // explicit key override (replaces PK/unique selection)
 	Where      string
+	// Progress receives long-running phase updates (per-table start, chunk
+	// scan percentages) so multi-hour runs on huge tables are not a silent
+	// process. nil = no progress output. The caller should write to stderr:
+	// the report (text or JSON) goes to stdout and must stay untouched.
+	Progress func(format string, args ...any)
 }
 
 // ChunkDiff describes one differing chunk.
@@ -80,24 +86,11 @@ func (c *Comparer) compareTable(ctx context.Context, src, dst *conn.Side, name s
 		return res
 	}
 
-	srcSchema, err := conn.IntrospectTable(ctx, src.Ctl(), name)
-	if err != nil {
-		return fail("src introspection: %v", err)
-	}
-	dstSchema, err := conn.IntrospectTable(ctx, dst.Ctl(), name)
-	if err != nil {
-		return fail("dst introspection: %v", err)
-	}
-	keyWarns := applyKey(srcSchema, dstSchema, c.opts.Key)
-	srcSchema, dstSchema, err = filterIgnored(srcSchema, dstSchema, c.opts.Normalize.IgnoreCols)
+	srcSchema, dstSchema, warns, err := PrepareSchemas(ctx, src, dst, name, c.opts.Key, c.opts.Normalize.IgnoreCols, c.opts.Compat)
 	if err != nil {
 		return fail("%v", err)
 	}
-	warns, err := conn.Compatible(srcSchema, dstSchema, c.opts.Compat)
-	if err != nil {
-		return fail("schema mismatch: %v", err)
-	}
-	res.Warnings = append(keyWarns, warns...)
+	res.Warnings = warns
 
 	srcNorm := normalize.NewNormalizer(srcSchema.Cols, c.opts.Normalize)
 	dstNorm := normalize.NewNormalizer(dstSchema.Cols, c.opts.Normalize)
@@ -119,6 +112,9 @@ func (c *Comparer) compareTable(ctx context.Context, src, dst *conn.Side, name s
 		// detail are uninformative here. With --drill the operator paid
 		// for row-level detail, so scan as before.
 		res.Status = "DIFFERENT"
+		if c.opts.Progress != nil {
+			c.opts.Progress("%-24s: %d vs %d rows, count mismatch (scan skipped)", name, srcTotal, dstTotal)
+		}
 		return res
 	}
 
@@ -127,7 +123,7 @@ func (c *Comparer) compareTable(ctx context.Context, src, dst *conn.Side, name s
 		p := chunk.Planner{
 			Table:       name,
 			KeyCols:     srcSchema.Key,
-			KeyFamilies: keyFamilies(srcSchema),
+			KeyFamilies: KeyFamilies(srcSchema),
 			ChunkSize:   c.opts.ChunkSize,
 			Where:       c.opts.Where,
 		}
@@ -140,6 +136,10 @@ func (c *Comparer) compareTable(ctx context.Context, src, dst *conn.Side, name s
 	ordered := len(srcSchema.Key) > 0
 	sc := chunk.NewScanner(srcNorm, ordered)
 	dc := chunk.NewScanner(dstNorm, ordered)
+
+	if c.opts.Progress != nil {
+		c.opts.Progress("%-24s: comparing %d chunks (src %d / dst %d rows)", name, len(chunks), srcTotal, dstTotal)
+	}
 
 	// Both sides have independent pools, scanners and schemas, so scan
 	// them concurrently: wall time is max(src, dst) instead of src+dst.
@@ -192,6 +192,22 @@ func (c *Comparer) scanSide(ctx context.Context, side *conn.Side, sc *chunk.Scan
 	if len(chunks) == 0 {
 		return out, nil
 	}
+	// chunk progress: ~10 lines per side over the whole scan (throttled by
+	// step), so a multi-hour scan of a huge table is not a silent process
+	var done atomic.Int64
+	step := len(chunks) / 10
+	if step < 1 {
+		step = 1
+	}
+	report := func() {
+		if c.opts.Progress == nil {
+			return
+		}
+		n := done.Add(1)
+		if n%int64(step) == 0 {
+			c.opts.Progress("  %-24s %s scan %3d%% (%d/%d chunks)", table, side.Name, 100*n/int64(len(chunks)), n, len(chunks))
+		}
+	}
 	if c.opts.Snapshot {
 		cn, err := side.AcquireScan(ctx)
 		if err != nil {
@@ -207,6 +223,7 @@ func (c *Comparer) scanSide(ctx context.Context, side *conn.Side, sc *chunk.Scan
 				return nil, err
 			}
 			out[ch.ID] = d
+			report()
 		}
 		if _, err := cn.ExecContext(ctx, "COMMIT"); err != nil {
 			return nil, fmt.Errorf("%s %s: commit: %w", side.Name, table, err)
@@ -243,6 +260,7 @@ func (c *Comparer) scanSide(ctx context.Context, side *conn.Side, sc *chunk.Scan
 				if err != nil {
 					return err
 				}
+				report()
 				results <- result{ch.ID, d}
 			}
 			return nil
@@ -426,17 +444,4 @@ func filterIgnored(src, dst *conn.Schema, ignore map[string]bool) (*conn.Schema,
 	dst2 := *dst
 	dst2.Cols = dstKeep
 	return &src2, &dst2, nil
-}
-
-func keyFamilies(s *conn.Schema) []string {
-	fams := make([]string, len(s.Key))
-	for i, k := range s.Key {
-		for _, col := range s.Cols {
-			if col.Name == k {
-				fams[i] = col.Family
-				break
-			}
-		}
-	}
-	return fams
 }

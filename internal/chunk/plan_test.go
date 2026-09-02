@@ -3,6 +3,7 @@ package chunk
 import (
 	"database/sql/driver"
 	"testing"
+	"time"
 )
 
 func TestIntBoundaries(t *testing.T) {
@@ -269,14 +270,20 @@ func TestLiteral(t *testing.T) {
 		{int64(-42), "-42"},
 		{uint64(18446744073709551615), "18446744073709551615"},
 		{float64(1.5), "1.5"},
+		{float32(2.25), "2.25"},
 		{true, "1"},
+		{false, "0"},
 		{"it's", `'it''s'`},
 		{`a\b`, `'a\\b'`},
 		{[]byte{0xDE, 0xAD}, "X'dead'"},
+		{time.Date(2026, 8, 31, 23, 59, 59, 0, time.UTC), `'2026-08-31 23:59:59'`},
+		// DATETIME(6) precision must survive the literal (sync writes and
+		// chunk bounds go through this rendering)
+		{time.Date(2026, 8, 31, 23, 59, 59, 123456000, time.UTC), `'2026-08-31 23:59:59.123456'`},
 	}
 	for _, tt := range tests {
-		if got := literal(tt.v); got != tt.want {
-			t.Errorf("literal(%v) = %q, want %q", tt.v, got, tt.want)
+		if got := Literal(tt.v); got != tt.want {
+			t.Errorf("Literal(%v) = %q, want %q", tt.v, got, tt.want)
 		}
 	}
 }

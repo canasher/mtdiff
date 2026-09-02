@@ -1,0 +1,372 @@
+package sync
+
+import (
+	"strings"
+	"testing"
+
+	"mtdiff/internal/conn"
+)
+
+// metaCol builds a ColMeta with the family set explicitly (tests need the
+// family for the DATETIME/TIMESTAMP carve-out; production derives it from
+// the type string via classify).
+func metaCol(name, typ, fam string, nullable bool) conn.ColMeta {
+	c := conn.ColMeta{Column: conn.Column{Name: name, RawType: typ, Nullable: nullable}}
+	c.Family = fam
+	return c
+}
+
+func kindsOf(t *testing.T, changes []Change) []ChangeKind {
+	t.Helper()
+	out := make([]ChangeKind, 0, len(changes))
+	for _, ch := range changes {
+		out = append(out, ch.Kind)
+	}
+	return out
+}
+
+func findChange(t *testing.T, changes []Change, kind ChangeKind) *Change {
+	t.Helper()
+	for i := range changes {
+		if changes[i].Kind == kind {
+			return &changes[i]
+		}
+	}
+	t.Fatalf("no %v change in %v", kind, kindsOf(t, changes))
+	return nil
+}
+
+func TestDiffStructureIdentical(t *testing.T) {
+	src := &conn.Struct{Table: "t", Cols: []conn.ColMeta{
+		metaCol("id", "int", conn.FamINT, false),
+		metaCol("name", "varchar(50)", conn.FamSTR, true),
+	}, Indexes: []conn.Index{{Name: "PRIMARY", Unique: true, Cols: []string{"id"}}}}
+	dst := &conn.Struct{Table: "t", Cols: []conn.ColMeta{
+		metaCol("id", "int", conn.FamINT, false),
+		metaCol("name", "varchar(50)", conn.FamSTR, true),
+	}, Indexes: []conn.Index{{Name: "PRIMARY", Unique: true, Cols: []string{"id"}}}}
+	changes, err := DiffStructure(src, dst)
+	if err != nil {
+		t.Fatalf("DiffStructure: %v", err)
+	}
+	if len(changes) != 0 {
+		t.Fatalf("expected no changes, got %v", changes)
+	}
+}
+
+func TestDiffStructureColumns(t *testing.T) {
+	cases := []struct {
+		name     string
+		src, dst *conn.Struct
+		wantNone bool // expect no changes at all
+		wantKind ChangeKind
+		check    func(t *testing.T, ch *Change)
+	}{
+		{
+			name: "add column in the middle",
+			src: &conn.Struct{Cols: []conn.ColMeta{
+				metaCol("id", "int", conn.FamINT, false),
+				metaCol("mid", "int", conn.FamINT, true),
+				metaCol("end", "int", conn.FamINT, true),
+			}},
+			dst: &conn.Struct{Cols: []conn.ColMeta{
+				metaCol("id", "int", conn.FamINT, false),
+				metaCol("end", "int", conn.FamINT, true),
+			}},
+			wantKind: ChangeAddColumn,
+			check: func(t *testing.T, ch *Change) {
+				if ch.Col.Name != "mid" || ch.After != "id" || ch.First {
+					t.Fatalf("wrong placement: %+v", ch)
+				}
+			},
+		},
+		{
+			name: "add leading column uses FIRST",
+			src: &conn.Struct{Cols: []conn.ColMeta{
+				metaCol("new", "int", conn.FamINT, true),
+				metaCol("id", "int", conn.FamINT, false),
+			}},
+			dst: &conn.Struct{Cols: []conn.ColMeta{
+				metaCol("id", "int", conn.FamINT, false),
+			}},
+			wantKind: ChangeAddColumn,
+			check: func(t *testing.T, ch *Change) {
+				if !ch.First || ch.After != "" {
+					t.Fatalf("wrong placement: %+v", ch)
+				}
+			},
+		},
+		{
+			name:     "type drift",
+			src:      &conn.Struct{Cols: []conn.ColMeta{metaCol("id", "bigint", conn.FamINT, false)}},
+			dst:      &conn.Struct{Cols: []conn.ColMeta{metaCol("id", "int", conn.FamINT, false)}},
+			wantKind: ChangeModifyColumn,
+		},
+		{
+			name:     "nullability drift",
+			src:      &conn.Struct{Cols: []conn.ColMeta{metaCol("id", "int", conn.FamINT, false)}},
+			dst:      &conn.Struct{Cols: []conn.ColMeta{metaCol("id", "int", conn.FamINT, true)}},
+			wantKind: ChangeModifyColumn,
+		},
+		{
+			name:     "default drift",
+			src:      &conn.Struct{Cols: []conn.ColMeta{{Column: conn.Column{Name: "id", RawType: "int", Nullable: false, Family: conn.FamINT}, Default: "0", HasDefault: true}}},
+			dst:      &conn.Struct{Cols: []conn.ColMeta{metaCol("id", "int", conn.FamINT, false)}},
+			wantKind: ChangeModifyColumn,
+		},
+		{
+			name:     "collation drift",
+			src:      &conn.Struct{Cols: []conn.ColMeta{{Column: conn.Column{Name: "n", RawType: "varchar(10)", Nullable: true, Collation: "utf8mb4_0900_ai_ci", Family: conn.FamSTR}, Charset: "utf8mb4"}}},
+			dst:      &conn.Struct{Cols: []conn.ColMeta{{Column: conn.Column{Name: "n", RawType: "varchar(10)", Nullable: true, Collation: "utf8mb4_general_ci", Family: conn.FamSTR}, Charset: "utf8mb4"}}},
+			wantKind: ChangeModifyColumn,
+		},
+		{
+			name:     "auto_increment drift",
+			src:      &conn.Struct{Cols: []conn.ColMeta{{Column: conn.Column{Name: "id", RawType: "int", Nullable: false, Family: conn.FamINT}, AutoInc: true}}},
+			dst:      &conn.Struct{Cols: []conn.ColMeta{metaCol("id", "int", conn.FamINT, false)}},
+			wantKind: ChangeModifyColumn,
+		},
+		{
+			name: "drop destination-only column",
+			src:  &conn.Struct{Cols: []conn.ColMeta{metaCol("id", "int", conn.FamINT, false)}},
+			dst: &conn.Struct{Cols: []conn.ColMeta{
+				metaCol("id", "int", conn.FamINT, false),
+				metaCol("extra", "int", conn.FamINT, true),
+			}},
+			wantKind: ChangeDropColumn,
+		},
+		{
+			name: "rename becomes drop plus add",
+			src: &conn.Struct{Cols: []conn.ColMeta{
+				metaCol("id", "int", conn.FamINT, false),
+				metaCol("renamed", "varchar(5)", conn.FamSTR, true),
+			}},
+			dst: &conn.Struct{Cols: []conn.ColMeta{
+				metaCol("id", "int", conn.FamINT, false),
+				metaCol("old", "varchar(5)", conn.FamSTR, true),
+			}},
+			wantKind: ChangeAddColumn,
+		},
+		{
+			name:     "DATETIME/TIMESTAMP swap is not a drift",
+			src:      &conn.Struct{Cols: []conn.ColMeta{metaCol("ts", "timestamp", conn.FamTIMESTAMP, true)}},
+			dst:      &conn.Struct{Cols: []conn.ColMeta{metaCol("ts", "datetime", conn.FamDATETIME, true)}},
+			wantNone: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			changes, err := DiffStructure(tc.src, tc.dst)
+			if err != nil {
+				t.Fatalf("DiffStructure: %v", err)
+			}
+			if tc.wantNone {
+				if len(changes) != 0 {
+					t.Fatalf("expected no changes, got %v", changes)
+				}
+				return
+			}
+			ch := findChange(t, changes, tc.wantKind)
+			if tc.check != nil {
+				tc.check(t, ch)
+			}
+		})
+	}
+}
+
+func TestDiffStructureRenameEmitsBoth(t *testing.T) {
+	src := &conn.Struct{Cols: []conn.ColMeta{metaCol("renamed", "varchar(5)", conn.FamSTR, true)}}
+	dst := &conn.Struct{Cols: []conn.ColMeta{metaCol("old", "varchar(5)", conn.FamSTR, true)}}
+	changes, err := DiffStructure(src, dst)
+	if err != nil {
+		t.Fatalf("DiffStructure: %v", err)
+	}
+	if len(changes) != 2 {
+		t.Fatalf("want drop+add, got %d changes: %v", len(changes), changes)
+	}
+	if findChange(t, changes, ChangeDropColumn).Col.Name != "old" {
+		t.Fatalf("wrong drop: %+v", changes)
+	}
+	if findChange(t, changes, ChangeAddColumn).Col.Name != "renamed" {
+		t.Fatalf("wrong add: %+v", changes)
+	}
+}
+
+func TestDiffStructureIndexes(t *testing.T) {
+	cases := []struct {
+		name     string
+		srcIdx   []conn.Index
+		dstIdx   []conn.Index
+		wantAdd  bool // want an AddIndex
+		wantDrop bool // want a DropIndex
+		dropName string
+		addPK    bool
+	}{
+		{name: "pk drift: different columns",
+			srcIdx:  []conn.Index{{Name: "PRIMARY", Unique: true, Cols: []string{"id"}}},
+			dstIdx:  []conn.Index{{Name: "PRIMARY", Unique: true, Cols: []string{"name"}}},
+			wantAdd: true, wantDrop: true, dropName: "PRIMARY", addPK: true},
+		{name: "src pk missing on dst",
+			srcIdx:  []conn.Index{{Name: "PRIMARY", Unique: true, Cols: []string{"id"}}},
+			dstIdx:  nil,
+			wantAdd: true, addPK: true},
+		{name: "dst-only unique index",
+			srcIdx:   nil,
+			dstIdx:   []conn.Index{{Name: "u_x", Unique: true, Cols: []string{"x"}}},
+			wantDrop: true, dropName: "u_x"},
+		{name: "same columns, different names: no change",
+			srcIdx: []conn.Index{{Name: "u_a", Unique: true, Cols: []string{"a"}}},
+			dstIdx: []conn.Index{{Name: "u_b", Unique: true, Cols: []string{"a"}}}},
+		{name: "unique satisfies the source pk by column set",
+			srcIdx: []conn.Index{{Name: "PRIMARY", Unique: true, Cols: []string{"id"}}},
+			dstIdx: []conn.Index{{Name: "u_id", Unique: true, Cols: []string{"id"}}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			src := &conn.Struct{Indexes: tc.srcIdx}
+			dst := &conn.Struct{Indexes: tc.dstIdx}
+			changes, err := DiffStructure(src, dst)
+			if err != nil {
+				t.Fatalf("DiffStructure: %v", err)
+			}
+			add, drop := findChangeSafe(changes, ChangeAddIndex), findChangeSafe(changes, ChangeDropIndex)
+			if tc.wantAdd != (add != nil) {
+				t.Fatalf("AddIndex: want %v, got %v", tc.wantAdd, add)
+			}
+			if tc.wantDrop != (drop != nil) {
+				t.Fatalf("DropIndex: want %v, got %v", tc.wantDrop, drop)
+			}
+			if drop != nil && drop.Idx.Name != tc.dropName {
+				t.Fatalf("dropped %q, want %q", drop.Idx.Name, tc.dropName)
+			}
+			if add != nil && (add.Idx.Name == "PRIMARY") != tc.addPK {
+				t.Fatalf("added %q, wantPK=%v", add.Idx.Name, tc.addPK)
+			}
+		})
+	}
+}
+
+func findChangeSafe(changes []Change, kind ChangeKind) *Change {
+	for i := range changes {
+		if changes[i].Kind == kind {
+			return &changes[i]
+		}
+	}
+	return nil
+}
+
+func TestDiffStructureExpressionDefaultRefused(t *testing.T) {
+	src := &conn.Struct{Cols: []conn.ColMeta{{
+		Column:     conn.Column{Name: "tok", RawType: "varchar(36)", Nullable: true, Family: conn.FamSTR},
+		HasDefault: true, Default: "(uuid())",
+	}}}
+	dst := &conn.Struct{Cols: []conn.ColMeta{metaCol("tok", "varchar(36)", conn.FamSTR, true)}}
+	if _, err := DiffStructure(src, dst); err == nil {
+		t.Fatal("expected the expression default to be refused")
+	}
+	// An identical expression default on both sides needs no change and
+	// is not refused: nothing is re-emitted.
+	dst.Cols[0].HasDefault, dst.Cols[0].Default = true, "(uuid())"
+	if changes, err := DiffStructure(src, dst); err != nil || len(changes) != 0 {
+		t.Fatalf("identical expression default: changes=%v err=%v", changes, err)
+	}
+}
+
+func TestFilterStruct(t *testing.T) {
+	s := &conn.Struct{
+		Table: "t",
+		Cols: []conn.ColMeta{
+			metaCol("id", "int", conn.FamINT, false),
+			metaCol("local", "int", conn.FamINT, true),
+		},
+		Indexes: []conn.Index{
+			{Name: "PRIMARY", Unique: true, Cols: []string{"id"}},
+			{Name: "u_l", Unique: true, Cols: []string{"local"}},
+		},
+	}
+	out := filterStruct(s, map[string]bool{"local": true})
+	if len(out.Cols) != 1 || out.Cols[0].Name != "id" {
+		t.Fatalf("wrong columns: %v", out.Cols)
+	}
+	if len(out.Indexes) != 1 || out.Indexes[0].Name != "PRIMARY" {
+		t.Fatalf("wrong indexes: %v", out.Indexes)
+	}
+	if same := filterStruct(s, nil); same != s {
+		t.Fatal("empty ignore set must return the same struct")
+	}
+}
+
+func TestRenderDDLEmpty(t *testing.T) {
+	if got := RenderDDL("t", nil); got != nil {
+		t.Fatalf("want nil, got %v", got)
+	}
+}
+
+func TestRenderDDLClauseOrder(t *testing.T) {
+	changes := []Change{
+		{Kind: ChangeAddIndex, Idx: conn.Index{Name: "u_a", Unique: true, Cols: []string{"a"}}},
+		{Kind: ChangeDropColumn, Col: metaCol("gone", "int", conn.FamINT, true)},
+		{Kind: ChangeModifyColumn, Col: metaCol("c", "bigint", conn.FamINT, false)},
+		{Kind: ChangeDropIndex, Idx: conn.Index{Name: "u_x", Unique: true, Cols: []string{"x"}}},
+		{Kind: ChangeAddColumn, Col: metaCol("n", "varchar(10)", conn.FamSTR, true), After: "c"},
+		{Kind: ChangeDropIndex, Idx: conn.Index{Name: "PRIMARY", Unique: true, Cols: []string{"p"}}},
+	}
+	got := RenderDDL("t", changes)
+	want := "ALTER TABLE `t` DROP INDEX `u_x`, DROP PRIMARY KEY, DROP COLUMN `gone`, " +
+		"MODIFY COLUMN `c` bigint NOT NULL, ADD COLUMN `n` varchar(10) AFTER `c`, ADD UNIQUE (`a`)"
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("DDL mismatch:\n got %v\nwant %s", got, want)
+	}
+}
+
+func TestRenderDDLColumnDef(t *testing.T) {
+	cases := []struct {
+		name string
+		col  conn.ColMeta
+		want string
+	}{
+		{
+			name: "full definition",
+			col: conn.ColMeta{
+				Column:     conn.Column{Name: "ts", RawType: "timestamp", Nullable: false, Collation: "utf8mb4_0900_ai_ci", Family: conn.FamTIMESTAMP},
+				Charset:    "utf8mb4",
+				HasDefault: true, Default: "CURRENT_TIMESTAMP", OnUpdate: true, Comment: "created\\'s note",
+			},
+			want: "`ts` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP " +
+				"CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci COMMENT 'created\\\\''s note'",
+		},
+		{
+			name: "auto increment",
+			col: conn.ColMeta{
+				Column:  conn.Column{Name: "id", RawType: "bigint", Nullable: false, Family: conn.FamINT},
+				AutoInc: true,
+			},
+			want: "`id` bigint NOT NULL AUTO_INCREMENT",
+		},
+		{
+			name: "nullable without default",
+			col:  metaCol("n", "int", conn.FamINT, true),
+			want: "`n` int",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := renderColDef(tc.col); got != tc.want {
+				t.Fatalf("column def mismatch:\n got %s\nwant %s", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRenderDDLFirstAndPK(t *testing.T) {
+	got := RenderDDL("t", []Change{
+		{Kind: ChangeAddColumn, Col: metaCol("new", "int", conn.FamINT, true), First: true},
+		{Kind: ChangeAddIndex, Idx: conn.Index{Name: "PRIMARY", Unique: true, Cols: []string{"a", "b"}}},
+	})
+	if !strings.Contains(got[0], "ADD COLUMN `new` int FIRST") {
+		t.Fatalf("FIRST placement missing: %s", got[0])
+	}
+	if !strings.Contains(got[0], "ADD PRIMARY KEY (`a`, `b`)") {
+		t.Fatalf("ADD PRIMARY KEY missing: %s", got[0])
+	}
+}
