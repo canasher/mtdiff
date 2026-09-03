@@ -74,7 +74,10 @@ func buildDSN(ep config.Endpoint, maxAllowedPacket, writeTimeoutSec int) string 
 // not idempotent: re-applying it grew the session sql_mode by 31 characters
 // per checkout until it exceeded sql_max_mode_size (255 on 8.0) and every
 // subsequent chunk printed a stderr warning.
-func OpenSide(ctx context.Context, name string, ep config.Endpoint, maxAllowedPacket, parallel int) (*Side, error) {
+//
+// allowUnenforcedReadOnly is config.Options.AllowUnenforcedReadOnly; see
+// applySession for what it relaxes.
+func OpenSide(ctx context.Context, name string, ep config.Endpoint, maxAllowedPacket, parallel int, allowUnenforcedReadOnly bool) (*Side, error) {
 	if parallel < 1 {
 		parallel = 1
 	}
@@ -101,7 +104,7 @@ func OpenSide(ctx context.Context, name string, ep config.Endpoint, maxAllowedPa
 		ctlDB.Close()
 		return nil, fmt.Errorf("%s: connect to %s: %w", name, ep.MaskedDSN(), err)
 	}
-	if err := applySession(ctx, c); err != nil {
+	if err := applySession(ctx, c, allowUnenforcedReadOnly); err != nil {
 		c.Close()
 		scanDB.Close()
 		ctlDB.Close()
@@ -133,7 +136,7 @@ func OpenSide(ctx context.Context, name string, ep config.Endpoint, maxAllowedPa
 			ctlDB.Close()
 			return nil, fmt.Errorf("%s: pre-warm scan pool: %s: %w", name, ep.MaskedDSN(), err)
 		}
-		if err := applySession(ctx, sc); err != nil {
+		if err := applySession(ctx, sc, allowUnenforcedReadOnly); err != nil {
 			sc.Close()
 			scanDB.Close()
 			ctlDB.Close()
@@ -144,22 +147,31 @@ func OpenSide(ctx context.Context, name string, ep config.Endpoint, maxAllowedPa
 	return &Side{Name: name, Version: version, ep: ep, scan: scanDB, ctl: ctlDB}, nil
 }
 
-// applySession enforces the read-only safety net (hard requirement) and
-// best-effort guardrails that may not exist on compatible layers. It is
-// idempotent: every statement it runs may be re-executed on the same session
-// without observable effect (the sql_mode flags in particular are appended
-// at most once, see addSQLModeFlags).
+// applySession enforces the read-only safety net and best-effort guardrails
+// that may not exist on compatible layers. It is idempotent: every statement
+// it runs may be re-executed on the same session without observable effect
+// (the sql_mode flags in particular are appended at most once, see
+// addSQLModeFlags).
 //
 // Read-only is enforced two-tier: MySQL proper only has a GLOBAL read_only,
 // so a session SET fails with ER_VARIABLE_IS_READONLY (1229); the fallback is
 // a session default transaction character (READ ONLY), which also covers
-// implicit autocommit statements. TiDB and some forks accept the session
-// read_only directly, making the first attempt succeed there. If neither
-// works, we refuse to continue.
-func applySession(ctx context.Context, c *sql.Conn) error {
+// implicit autocommit statements. TiDB inverts the problem: read_only is
+// GLOBAL-only there as well (1229), and SET SESSION TRANSACTION READ ONLY is
+// a disabled no-op (1235, unless tidb_enable_noop_functions is set), so both
+// tiers fail. By default mtdiff then refuses to continue: a read pool the
+// server cannot keep read-only is not acceptable silently. With
+// allowUnenforcedReadOnly (--allow-unenforced-readonly) it proceeds instead,
+// printing a per-connection warning: mtdiff still only issues SELECTs on
+// these connections, the accepted risk is that the server could not stop
+// other statements from a shared account.
+func applySession(ctx context.Context, c *sql.Conn, allowUnenforced bool) error {
 	if _, err := c.ExecContext(ctx, "SET SESSION read_only = ON"); err != nil {
 		if _, err2 := c.ExecContext(ctx, "SET SESSION TRANSACTION READ ONLY"); err2 != nil {
-			return fmt.Errorf("refusing to continue: cannot enforce read-only session (read_only: %v; transaction read only: %v)", err, err2)
+			if !allowUnenforced {
+				return fmt.Errorf("refusing to continue: cannot enforce read-only session (read_only: %v; transaction read only: %v)", err, err2)
+			}
+			fmt.Fprintf(os.Stderr, "warn: cannot enforce a read-only session on this backend (read_only: %v; transaction read only: %v); continuing per --allow-unenforced-readonly, read connections issue SELECTs only\n", err, err2)
 		}
 	}
 	applyGuardrails(ctx, c)

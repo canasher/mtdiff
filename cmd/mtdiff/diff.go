@@ -175,13 +175,13 @@ func diffRunE(cmd *cobra.Command, _ []string) error {
 	// handshake must fail fast, not hang the whole run. Scans use ctx
 	// (unbounded) because large tables legitimately take a long time.
 	connectCtx, cancelConnect := context.WithTimeout(ctx, 2*time.Minute)
-	src, err := conn.OpenSide(connectCtx, "src", cfg.Src, cfg.Opts.MaxAllowedPacket, cfg.Opts.Parallel)
+	src, err := conn.OpenSide(connectCtx, "src", cfg.Src, cfg.Opts.MaxAllowedPacket, cfg.Opts.Parallel, cfg.Opts.AllowUnenforcedReadOnly)
 	if err != nil {
 		cancelConnect()
 		return failf(ExitRuntimeErr, "%v", err)
 	}
 	defer src.Close()
-	dst, err := conn.OpenSide(connectCtx, "dst", cfg.Dst, cfg.Opts.MaxAllowedPacket, cfg.Opts.Parallel)
+	dst, err := conn.OpenSide(connectCtx, "dst", cfg.Dst, cfg.Opts.MaxAllowedPacket, cfg.Opts.Parallel, cfg.Opts.AllowUnenforcedReadOnly)
 	if err != nil {
 		cancelConnect()
 		return failf(ExitRuntimeErr, "%v", err)

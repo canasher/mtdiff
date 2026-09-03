@@ -1,0 +1,25 @@
+# TiDB compatibility pair (run_compat.sh tidb): MySQL 8.0 source,
+# single-node TiDB destination (root, no password, port 4000).
+services:
+  mysql-src:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpw
+      MYSQL_DATABASE: srcdb
+    ports:
+      - "15308:3306"
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -uroot -prootpw --silent"]
+      interval: 2s
+      timeout: 3s
+      retries: 120
+
+  tidb-dst:
+    image: pingcap/tidb:latest
+    ports:
+      - "15309:4000"
+    healthcheck:
+      test: ["CMD-SHELL", "mysql -h127.0.0.1 -P4000 -uroot -e 'SELECT 1' >/dev/null 2>&1"]
+      interval: 2s
+      timeout: 5s
+      retries: 180

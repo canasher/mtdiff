@@ -18,6 +18,12 @@ type Endpoint struct {
 	Password    string `yaml:"password"`
 	PasswordEnv string `yaml:"password_env"`
 	Database    string `yaml:"database"`
+	// passwordSet is true when a password was given explicitly, including an
+	// empty one (the "user:@host" shorthand: the server has no password,
+	// e.g. TiDB's default root). An explicit empty password suppresses the
+	// interactive prompt; an absent one ("user@host") still prompts. The
+	// field is unexported, so YAML config files can never set it.
+	passwordSet bool
 }
 
 // Options are comparison-behavior flags, shared by CLI and YAML.
@@ -40,6 +46,15 @@ type Options struct {
 	StrictTypes      bool     `yaml:"strict_types"`
 	MaxAllowedPacket int      `yaml:"max_allowed_packet"`
 	Secure           bool     `yaml:"secure"`
+	// AllowUnenforcedReadOnly relaxes the read-only safety net for backends
+	// that cannot enforce a session-level read-only (TiDB: read_only is
+	// GLOBAL-only and SET SESSION TRANSACTION READ ONLY is a disabled no-op).
+	// When set, opening a read side whose server rejects both enforcement
+	// tiers proceeds with a per-connection warning; when clear (default),
+	// such a connection is refused. mtdiff still only issues SELECTs on read
+	// connections — the flag only accepts that the server could not stop
+	// other statements.
+	AllowUnenforcedReadOnly bool `yaml:"allow_unenforced_readonly"`
 	// Sync options (used by the sync subcommand).
 	BatchSize    int  `yaml:"batch_size"`     // rows per multi-row INSERT / commit granularity
 	SampleLimit  int  `yaml:"sample_limit"`   // sample SQL statements shown per table in a dry-run
@@ -96,6 +111,11 @@ func (e *Endpoint) ResolvePassword(prompt PromptFunc) error {
 		return nil
 	}
 	if e.Password != "" {
+		return nil
+	}
+	if e.passwordSet {
+		// An explicit empty password (the "user:@host" shorthand): the
+		// server is password-less, do not prompt.
 		return nil
 	}
 	if prompt != nil {

@@ -1,0 +1,28 @@
+# MySQL 5.7 compatibility pair (run_compat.sh 57). 5.7 has no recursive
+# CTEs, so the seed generates rows via a numbers-table join instead.
+services:
+  mysql57-src:
+    image: mysql:5.7
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpw
+      MYSQL_DATABASE: srcdb
+    ports:
+      - "15306:3306"
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -uroot -prootpw --silent"]
+      interval: 2s
+      timeout: 3s
+      retries: 120
+
+  mysql57-dst:
+    image: mysql:5.7
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpw
+      MYSQL_DATABASE: dstdb
+    ports:
+      - "15307:3306"
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -uroot -prootpw --silent"]
+      interval: 2s
+      timeout: 3s
+      retries: 120

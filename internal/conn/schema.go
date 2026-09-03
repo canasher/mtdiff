@@ -406,6 +406,27 @@ func nullableColumns(ctx context.Context, db *sql.DB, table string) (map[string]
 	return set, nil
 }
 
+// DefaultCollation returns the collation that a column created without an
+// explicit COLLATE would receive in the connection's database: the
+// database-level default when the schema defines one, otherwise the server
+// default. Structure sync uses it to tell an explicitly chosen collation
+// from "left to the backend's default": backends disagree on what that
+// default is (MySQL 8.0: utf8mb4_0900_ai_ci, TiDB: utf8mb4_bin), so two
+// sides that both left it to the default are not in drift.
+func DefaultCollation(ctx context.Context, db *sql.DB) (string, error) {
+	var c string
+	err := db.QueryRowContext(ctx,
+		"SELECT COALESCE(s.DEFAULT_COLLATION_NAME, @@collation_server) "+
+			"FROM information_schema.SCHEMATA s WHERE s.SCHEMA_NAME = DATABASE()").Scan(&c)
+	if err == sql.ErrNoRows {
+		err = db.QueryRowContext(ctx, "SELECT @@collation_server").Scan(&c)
+	}
+	if err != nil {
+		return "", err
+	}
+	return c, nil
+}
+
 // ListTables returns the table names of the current database.
 func ListTables(ctx context.Context, db *sql.DB) ([]string, error) {
 	rows, err := db.QueryContext(ctx, "SHOW TABLES")

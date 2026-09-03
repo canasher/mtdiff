@@ -45,7 +45,7 @@ func TestDiffStructureIdentical(t *testing.T) {
 		metaCol("id", "int", conn.FamINT, false),
 		metaCol("name", "varchar(50)", conn.FamSTR, true),
 	}, Indexes: []conn.Index{{Name: "PRIMARY", Unique: true, Cols: []string{"id"}}}}
-	changes, err := DiffStructure(src, dst)
+	changes, err := DiffStructure(src, dst, "", "")
 	if err != nil {
 		t.Fatalf("DiffStructure: %v", err)
 	}
@@ -156,7 +156,7 @@ func TestDiffStructureColumns(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			changes, err := DiffStructure(tc.src, tc.dst)
+			changes, err := DiffStructure(tc.src, tc.dst, "", "")
 			if err != nil {
 				t.Fatalf("DiffStructure: %v", err)
 			}
@@ -177,7 +177,7 @@ func TestDiffStructureColumns(t *testing.T) {
 func TestDiffStructureRenameEmitsBoth(t *testing.T) {
 	src := &conn.Struct{Cols: []conn.ColMeta{metaCol("renamed", "varchar(5)", conn.FamSTR, true)}}
 	dst := &conn.Struct{Cols: []conn.ColMeta{metaCol("old", "varchar(5)", conn.FamSTR, true)}}
-	changes, err := DiffStructure(src, dst)
+	changes, err := DiffStructure(src, dst, "", "")
 	if err != nil {
 		t.Fatalf("DiffStructure: %v", err)
 	}
@@ -225,7 +225,7 @@ func TestDiffStructureIndexes(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			src := &conn.Struct{Indexes: tc.srcIdx}
 			dst := &conn.Struct{Indexes: tc.dstIdx}
-			changes, err := DiffStructure(src, dst)
+			changes, err := DiffStructure(src, dst, "", "")
 			if err != nil {
 				t.Fatalf("DiffStructure: %v", err)
 			}
@@ -261,13 +261,13 @@ func TestDiffStructureExpressionDefaultRefused(t *testing.T) {
 		HasDefault: true, Default: "(uuid())",
 	}}}
 	dst := &conn.Struct{Cols: []conn.ColMeta{metaCol("tok", "varchar(36)", conn.FamSTR, true)}}
-	if _, err := DiffStructure(src, dst); err == nil {
+	if _, err := DiffStructure(src, dst, "", ""); err == nil {
 		t.Fatal("expected the expression default to be refused")
 	}
 	// An identical expression default on both sides needs no change and
 	// is not refused: nothing is re-emitted.
 	dst.Cols[0].HasDefault, dst.Cols[0].Default = true, "(uuid())"
-	if changes, err := DiffStructure(src, dst); err != nil || len(changes) != 0 {
+	if changes, err := DiffStructure(src, dst, "", ""); err != nil || len(changes) != 0 {
 		t.Fatalf("identical expression default: changes=%v err=%v", changes, err)
 	}
 }
@@ -369,4 +369,132 @@ func TestRenderDDLFirstAndPK(t *testing.T) {
 	if !strings.Contains(got[0], "ADD PRIMARY KEY (`a`, `b`)") {
 		t.Fatalf("ADD PRIMARY KEY missing: %s", got[0])
 	}
+}
+
+// TestRenderDDLSplitSameColumn pins the TiDB split: two operations on one
+// column in a single DDL job are rejected there (Error 8200), so the key
+// on the re-defined column runs in a follow-up statement.
+func TestRenderDDLSplitSameColumn(t *testing.T) {
+	got := RenderDDL("t", []Change{
+		{Kind: ChangeDropColumn, Col: metaCol("extra", "int", conn.FamINT, true)},
+		{Kind: ChangeModifyColumn, Col: metaCol("id", "int", conn.FamINT, false)},
+		{Kind: ChangeAddColumn, Col: metaCol("amt", "decimal(10,2)", conn.FamDECIMAL, true), After: "name"},
+		{Kind: ChangeAddIndex, Idx: conn.Index{Name: "PRIMARY", Unique: true, Cols: []string{"id"}}},
+	})
+	if len(got) != 2 {
+		t.Fatalf("want 2 statements, got %d: %v", len(got), got)
+	}
+	if !strings.Contains(got[0], "DROP COLUMN `extra`") ||
+		!strings.Contains(got[0], "MODIFY COLUMN `id` int NOT NULL") ||
+		!strings.Contains(got[0], "ADD COLUMN `amt` decimal(10,2) AFTER `name`") ||
+		strings.Contains(got[0], "PRIMARY") {
+		t.Fatalf("statement 1 wrong: %s", got[0])
+	}
+	if got[1] != "ALTER TABLE `t` ADD PRIMARY KEY (`id`)" {
+		t.Fatalf("statement 2 wrong: %s", got[1])
+	}
+}
+
+// TestRenderDDLSkipImplicitIndexDrop pins the implicit-drop rule: an index
+// confined to dropped columns dies with them and must not be dropped
+// explicitly (the drop would fail once the column is gone).
+func TestRenderDDLSkipImplicitIndexDrop(t *testing.T) {
+	got := RenderDDL("t", []Change{
+		{Kind: ChangeDropIndex, Idx: conn.Index{Name: "u_x", Unique: true, Cols: []string{"x"}}},
+		{Kind: ChangeDropColumn, Col: metaCol("x", "int", conn.FamINT, true)},
+	})
+	if len(got) != 1 {
+		t.Fatalf("want exactly 1 statement, got %v", got)
+	}
+	if !strings.Contains(got[0], "DROP COLUMN `x`") {
+		t.Fatalf("column drop missing: %s", got[0])
+	}
+	if strings.Contains(got[0], "DROP INDEX") {
+		t.Fatalf("implicit index drop must not be emitted: %s", got[0])
+	}
+}
+
+func TestNormalizeIntType(t *testing.T) {
+	cases := map[string]string{
+		"int":                 "int",
+		"int(11)":             "int",
+		"int unsigned":        "int unsigned",
+		"int(10) unsigned":    "int unsigned",
+		"bigint(20) unsigned": "bigint unsigned",
+		"tinyint(1)":          "tinyint",
+		"mediumint(9)":        "mediumint",
+		"decimal(10,2)":       "decimal(10,2)",
+		"varchar(32)":         "varchar(32)",
+		"char(1)":             "char(1)",
+		"enum('a','b')":       "enum('a','b')",
+		"INT(11)":             "int",
+	}
+	for in, want := range cases {
+		if got := normalizeIntType(in); got != want {
+			t.Errorf("normalizeIntType(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// strCol builds a ColMeta with charset/collation for the default-collation
+// tests.
+func strCol(name, collation string) conn.ColMeta {
+	return conn.ColMeta{
+		Column:  conn.Column{Name: name, RawType: "varchar(10)", Nullable: true, Collation: collation, Family: conn.FamSTR},
+		Charset: "utf8mb4",
+	}
+}
+
+// TestDiffStructureCrossBackend pins the two cross-backend normalizations
+// found on the MySQL 8.0 -> TiDB compatibility run: integer display
+// widths, and collations that are each side's own database default.
+func TestDiffStructureCrossBackend(t *testing.T) {
+	t.Run("display width is not a drift", func(t *testing.T) {
+		src := &conn.Struct{Cols: []conn.ColMeta{metaCol("id", "int", conn.FamINT, false)}}
+		dst := &conn.Struct{Cols: []conn.ColMeta{metaCol("id", "int(11)", conn.FamINT, false)}}
+		changes, err := DiffStructure(src, dst, "", "")
+		if err != nil || len(changes) != 0 {
+			t.Fatalf("changes=%v err=%v", changes, err)
+		}
+	})
+	t.Run("display width with unsigned", func(t *testing.T) {
+		src := &conn.Struct{Cols: []conn.ColMeta{metaCol("id", "int unsigned", conn.FamINT, false)}}
+		dst := &conn.Struct{Cols: []conn.ColMeta{metaCol("id", "int(10) unsigned", conn.FamINT, false)}}
+		if changes, _ := DiffStructure(src, dst, "", ""); len(changes) != 0 {
+			t.Fatalf("changes=%v", changes)
+		}
+	})
+	t.Run("sign drift is still a drift", func(t *testing.T) {
+		src := &conn.Struct{Cols: []conn.ColMeta{metaCol("id", "int", conn.FamINT, false)}}
+		dst := &conn.Struct{Cols: []conn.ColMeta{metaCol("id", "int(11) unsigned", conn.FamINT, false)}}
+		if changes, _ := DiffStructure(src, dst, "", ""); len(changes) != 1 {
+			t.Fatalf("want 1 change, got %v", changes)
+		}
+	})
+	// MySQL 8.0's default (utf8mb4_0900_ai_ci) vs TiDB's (utf8mb4_bin):
+	// both sides left the collation to their own backend's default.
+	t.Run("both sides on their own default collation", func(t *testing.T) {
+		src := &conn.Struct{Cols: []conn.ColMeta{strCol("n", "utf8mb4_0900_ai_ci")}}
+		dst := &conn.Struct{Cols: []conn.ColMeta{strCol("n", "utf8mb4_bin")}}
+		changes, err := DiffStructure(src, dst, "utf8mb4_0900_ai_ci", "utf8mb4_bin")
+		if err != nil || len(changes) != 0 {
+			t.Fatalf("changes=%v err=%v", changes, err)
+		}
+	})
+	t.Run("explicit collation still drifts", func(t *testing.T) {
+		src := &conn.Struct{Cols: []conn.ColMeta{strCol("n", "utf8mb4_0900_ai_ci")}}
+		dst := &conn.Struct{Cols: []conn.ColMeta{strCol("n", "utf8mb4_bin")}}
+		// src's value is not its own default -> the src side chose it.
+		changes, err := DiffStructure(src, dst, "utf8mb4_bin", "utf8mb4_bin")
+		if err != nil || len(changes) != 1 {
+			t.Fatalf("want 1 change, got %v err=%v", changes, err)
+		}
+	})
+	t.Run("unknown defaults fall back to strict", func(t *testing.T) {
+		src := &conn.Struct{Cols: []conn.ColMeta{strCol("n", "utf8mb4_0900_ai_ci")}}
+		dst := &conn.Struct{Cols: []conn.ColMeta{strCol("n", "utf8mb4_bin")}}
+		if changes, _ := DiffStructure(src, dst, "", ""); len(changes) != 1 {
+			t.Fatalf("want 1 change, got %v", changes)
+		}
+	})
 }

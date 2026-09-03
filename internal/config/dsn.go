@@ -13,6 +13,11 @@ import (
 //
 // Missing port defaults to 3306. IPv6 addresses are not supported in
 // shorthand form; use the granular flags instead.
+//
+// The password segment is optional, and an explicitly empty one is
+// meaningful: "user:@host" declares a password-less server (TiDB's default
+// root) and suppresses the interactive password prompt, while "user@host"
+// leaves the password to be prompted for (or taken from password_env).
 func ParseShorthand(s string) (Endpoint, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
@@ -27,7 +32,9 @@ func ParseShorthand(s string) (Endpoint, error) {
 		userpart := rest[:i]
 		rest = rest[i+1:]
 		if j := strings.IndexByte(userpart, ':'); j >= 0 {
-			ep.User, ep.Password = userpart[:j], userpart[j+1:]
+			// A colon means the password segment is present, even when it
+			// is empty ("user:@host" = password-less server).
+			ep.User, ep.Password, ep.passwordSet = userpart[:j], userpart[j+1:], true
 		} else {
 			ep.User = userpart
 		}

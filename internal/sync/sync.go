@@ -5,8 +5,10 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
+	"sync"
 
 	"mtdiff/internal/chunk"
 	"mtdiff/internal/compare"
@@ -74,6 +76,12 @@ type Runner struct {
 	Src, Dst *conn.Side
 	o        Options
 	cmp      *compare.Comparer
+
+	// Per-side database default collations, resolved once per run (see
+	// sideDefaultCollations); "" when the query fails (strict fallback).
+	sdOnce sync.Once
+	sdSrc  string
+	sdDst  string
 }
 
 func NewRunner(src, dst *conn.Side, o Options) *Runner {
@@ -81,6 +89,21 @@ func NewRunner(src, dst *conn.Side, o Options) *Runner {
 		o.Cmp.Progress = o.Progress
 	}
 	return &Runner{Src: src, Dst: dst, o: o, cmp: compare.NewComparer(o.Cmp)}
+}
+
+// sideDefaultCollations resolves each side's database default collation
+// (conn.DefaultCollation), once per run. It is best-effort: a backend
+// that refuses the query degrades to the strict comparison (a collation
+// difference is always reported), never to a failed run.
+func (r *Runner) sideDefaultCollations(ctx context.Context) (src, dst string) {
+	r.sdOnce.Do(func() {
+		r.sdSrc, _ = conn.DefaultCollation(ctx, r.Src.Ctl())
+		r.sdDst, _ = conn.DefaultCollation(ctx, r.Dst.Ctl())
+		if r.sdSrc == "" || r.sdDst == "" {
+			fmt.Fprintf(os.Stderr, "warn: could not resolve the database default collation (src=%q dst=%q); collation differences are treated as drift\n", r.sdSrc, r.sdDst)
+		}
+	})
+	return r.sdSrc, r.sdDst
 }
 
 // PrePass runs the (read-only) comparison over the given tables.
@@ -476,7 +499,8 @@ func (r *Runner) SchemaPlanFor(ctx context.Context, table string) (*StructPlan, 
 	}
 	srcS = filterStruct(srcS, r.o.Cmp.Normalize.IgnoreCols)
 	dstS = filterStruct(dstS, r.o.Cmp.Normalize.IgnoreCols)
-	changes, err := DiffStructure(srcS, dstS)
+	srcDef, dstDef := r.sideDefaultCollations(ctx)
+	changes, err := DiffStructure(srcS, dstS, srcDef, dstDef)
 	if err != nil {
 		return nil, err
 	}

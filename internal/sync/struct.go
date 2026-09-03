@@ -39,10 +39,15 @@ type Change struct {
 // structure. A rename is not detected — it becomes a drop plus an add,
 // which is safe under the disposable-destination semantics.
 //
+// srcDef and dstDef are each side's default collation for its database
+// (conn.DefaultCollation; "" when unknown). They let the comparison tell
+// an explicitly chosen collation apart from "left to the backend's
+// default" — see colDiffers.
+//
 // It returns an error when a source definition cannot be reproduced on the
 // destination (an expression default): the caller then fails the table
 // instead of guessing.
-func DiffStructure(src, dst *conn.Struct) ([]Change, error) {
+func DiffStructure(src, dst *conn.Struct, srcDef, dstDef string) ([]Change, error) {
 	srcCols := make(map[string]bool, len(src.Cols))
 	for _, c := range src.Cols {
 		srcCols[c.Name] = true
@@ -67,7 +72,7 @@ func DiffStructure(src, dst *conn.Struct) ([]Change, error) {
 				ch.After = src.Cols[i-1].Name
 			}
 			out = append(out, ch)
-		case colDiffers(sc, dc):
+		case colDiffers(sc, dc, srcDef, dstDef):
 			if err := addable(sc); err != nil {
 				return nil, err
 			}
@@ -114,12 +119,21 @@ func DiffStructure(src, dst *conn.Struct) ([]Change, error) {
 // column rewrites the stored values, which is a data decision the operator
 // makes with --allow-tz-swap, not something the structure sync may do
 // silently.
-func colDiffers(sc, dc conn.ColMeta) bool {
+//
+// Two cross-backend cosmetic differences are not drifts either: integer
+// display widths (5.7/TiDB report "int(11)" where 8.0 reports "int") and
+// collations that are each side's own database default — information
+// schema cannot say whether a collation was declared, so "both sides left
+// it to the default" is the closest test available, and re-emitting the
+// source's default collation DDL at every sync would be noise. An
+// explicitly declared collation (different from the side's own default)
+// still drifts against a different one.
+func colDiffers(sc, dc conn.ColMeta, srcDef, dstDef string) bool {
 	if (sc.Family == conn.FamDATETIME && dc.Family == conn.FamTIMESTAMP) ||
 		(sc.Family == conn.FamTIMESTAMP && dc.Family == conn.FamDATETIME) {
 		return false
 	}
-	if !strings.EqualFold(sc.RawType, dc.RawType) {
+	if normalizeIntType(sc.RawType) != normalizeIntType(dc.RawType) {
 		return true
 	}
 	if sc.Nullable != dc.Nullable {
@@ -131,10 +145,48 @@ func colDiffers(sc, dc conn.ColMeta) bool {
 	if sc.AutoInc != dc.AutoInc || sc.OnUpdate != dc.OnUpdate {
 		return true
 	}
-	if sc.Charset != dc.Charset || sc.Collation != dc.Collation {
+	if sc.Charset != dc.Charset {
+		return true
+	}
+	if sc.Collation != dc.Collation && !defaultCollationsMatch(sc, dc, srcDef, dstDef) {
 		return true
 	}
 	return false
+}
+
+// normalizeIntType folds integer display widths into the bare type
+// ("int(11)" -> "int", "int(10) unsigned" -> "int unsigned"). MySQL 8.0
+// stopped reporting display widths while 5.7 and TiDB still do, and they
+// never change the storage. Only single-argument integer types are
+// affected: decimal(10,2) keeps its spec, as do char/varchar lengths and
+// enum/set value lists.
+func normalizeIntType(rawType string) string {
+	l := strings.ToLower(strings.TrimSpace(rawType))
+	i := strings.IndexByte(l, '(')
+	if i < 0 {
+		return l
+	}
+	base := strings.TrimSpace(l[:i])
+	unsigned := strings.HasSuffix(l, "unsigned")
+	switch base {
+	case "tinyint", "smallint", "mediumint", "int", "integer", "bigint":
+		if unsigned {
+			return base + " unsigned"
+		}
+		return base
+	}
+	return l
+}
+
+// defaultCollationsMatch reports whether the collation difference between
+// two columns of the same charset is explainable by the backends'
+// different defaults: both sides' values equal their own database
+// default. A missing default ("" — unknown) disables the test and the
+// difference counts as drift, the strict pre-existing behavior.
+func defaultCollationsMatch(sc, dc conn.ColMeta, srcDef, dstDef string) bool {
+	return srcDef != "" && dstDef != "" &&
+		strings.EqualFold(sc.Collation, srcDef) &&
+		strings.EqualFold(dc.Collation, dstDef)
 }
 
 // colWhy renders a short drift description for the report.
@@ -204,24 +256,61 @@ func indexKey(cols []string) string {
 	return strings.ToLower(strings.Join(cols, "\x00"))
 }
 
-// RenderDDL renders the changes as DDL for the destination table: one
-// ALTER TABLE with all clauses. InnoDB executes it atomically (all-or-
-// nothing), so a failure never leaves a half-migrated structure; the
-// single round trip also keeps a mid-list failure visible in one server
-// error. Clause order is deliberate: drop indexes before the columns they
-// reference, and add them after the columns exist (a primary key may only
-// be added to columns that are already in place).
+// RenderDDL renders the changes as DDL for the destination table:
+// normally one ALTER TABLE with all clauses. InnoDB executes it atomically
+// (all-or-nothing), so a failure never leaves a half-migrated structure;
+// the single round trip also keeps a mid-list failure visible in one
+// server error. Clause order is deliberate: drop indexes before the
+// columns they reference, and add them after the columns exist (a primary
+// key may only be added to columns that are already in place).
 //
-// It returns nil when there is nothing to do.
+// Two exceptions, both found on TiDB, may split the batch:
+//
+//   - an index change whose columns are re-defined (MODIFY) or added in
+//     this same batch runs in a follow-up statement after the column work
+//     has been applied: TiDB rejects two operations on one column in a
+//     single DDL job (Error 8200 "Unsupported operate same column"),
+//     e.g. MODIFY COLUMN id …, ADD PRIMARY KEY (id);
+//   - an index drop confined to columns that are themselves dropped is not
+//     emitted at all: both backends remove an index together with its
+//     column, so an explicit drop would fail once the column is gone.
 func RenderDDL(table string, changes []Change) []string {
 	if len(changes) == 0 {
 		return nil
 	}
-	var dropIdx, dropCol, modifyCol, addCol, addIdx []string
+	// Column names re-defined or added in this batch: an index on one of
+	// them cannot share a statement with the column work (see above).
+	touched := make(map[string]bool)
+	// Columns being dropped: their indexes die with them, no explicit drop.
+	dropped := make(map[string]bool)
+	for _, ch := range changes {
+		switch ch.Kind {
+		case ChangeModifyColumn, ChangeAddColumn:
+			touched[ch.Col.Name] = true
+		case ChangeDropColumn:
+			dropped[ch.Col.Name] = true
+		}
+	}
+	refsAny := func(cols []string, set map[string]bool) bool {
+		for _, c := range cols {
+			if set[c] {
+				return true
+			}
+		}
+		return false
+	}
+	var dropIdx, dropCol, modifyCol, addCol, addIdx, deferIdx []string
 	for _, ch := range changes {
 		switch ch.Kind {
 		case ChangeDropIndex:
-			dropIdx = append(dropIdx, renderDropIndex(ch.Idx))
+			switch {
+			case refsAny(ch.Idx.Cols, dropped):
+				// the index is removed together with its column
+			case refsAny(ch.Idx.Cols, touched):
+				deferIdx = append(deferIdx, renderDropIndex(ch.Idx))
+			default:
+				dropIdx = append(dropIdx, renderDropIndex(ch.Idx))
+			}
 		case ChangeDropColumn:
 			dropCol = append(dropCol, "DROP COLUMN "+conn.QuoteIdent(ch.Col.Name))
 		case ChangeModifyColumn:
@@ -229,6 +318,10 @@ func RenderDDL(table string, changes []Change) []string {
 		case ChangeAddColumn:
 			addCol = append(addCol, renderAddColumn(ch))
 		case ChangeAddIndex:
+			if refsAny(ch.Idx.Cols, touched) {
+				deferIdx = append(deferIdx, renderAddIndex(ch.Idx))
+				continue
+			}
 			addIdx = append(addIdx, renderAddIndex(ch.Idx))
 		}
 	}
@@ -238,7 +331,11 @@ func RenderDDL(table string, changes []Change) []string {
 	clauses = append(clauses, modifyCol...)
 	clauses = append(clauses, addCol...)
 	clauses = append(clauses, addIdx...)
-	return []string{"ALTER TABLE " + conn.QuoteIdent(table) + " " + strings.Join(clauses, ", ")}
+	out := []string{"ALTER TABLE " + conn.QuoteIdent(table) + " " + strings.Join(clauses, ", ")}
+	if len(deferIdx) > 0 {
+		out = append(out, "ALTER TABLE "+conn.QuoteIdent(table)+" "+strings.Join(deferIdx, ", "))
+	}
+	return out
 }
 
 // renderColDef re-emits a source column definition for use in ADD/MODIFY

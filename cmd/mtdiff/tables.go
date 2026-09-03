@@ -24,12 +24,12 @@ var tablesCmd = &cobra.Command{
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
-		src, err := conn.OpenSide(ctx, "src", cfg.Src, 0, 1)
+		src, err := conn.OpenSide(ctx, "src", cfg.Src, 0, 1, cfg.Opts.AllowUnenforcedReadOnly)
 		if err != nil {
 			return failf(ExitRuntimeErr, "%v", err)
 		}
 		defer src.Close()
-		dst, err := conn.OpenSide(ctx, "dst", cfg.Dst, 0, 1)
+		dst, err := conn.OpenSide(ctx, "dst", cfg.Dst, 0, 1, cfg.Opts.AllowUnenforcedReadOnly)
 		if err != nil {
 			return failf(ExitRuntimeErr, "%v", err)
 		}

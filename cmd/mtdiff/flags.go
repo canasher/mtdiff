@@ -12,18 +12,19 @@ import (
 
 // connFlags carries the raw connection flags shared by all subcommands.
 type connFlags struct {
-	configPath string
-	src, dst   string
-	srcHost    string
-	dstHost    string
-	srcPort    int
-	dstPort    int
-	srcUser    string
-	dstUser    string
-	srcPassEnv string
-	dstPassEnv string
-	srcDB      string
-	dstDB      string
+	configPath              string
+	src, dst                string
+	srcHost                 string
+	dstHost                 string
+	srcPort                 int
+	dstPort                 int
+	srcUser                 string
+	dstUser                 string
+	srcPassEnv              string
+	dstPassEnv              string
+	srcDB                   string
+	dstDB                   string
+	allowUnenforcedReadOnly bool
 }
 
 func (f *connFlags) bind(cmd *cobra.Command) {
@@ -40,6 +41,8 @@ func (f *connFlags) bind(cmd *cobra.Command) {
 	cmd.Flags().StringVar(&f.dstPassEnv, "dst-password-env", "", "env var holding the destination password")
 	cmd.Flags().StringVar(&f.srcDB, "src-db", "", "source database")
 	cmd.Flags().StringVar(&f.dstDB, "dst-db", "", "destination database")
+	cmd.Flags().BoolVar(&f.allowUnenforcedReadOnly, "allow-unenforced-readonly", false,
+		"proceed when the backend cannot enforce a session read-only (e.g. TiDB); read connections still issue SELECTs only")
 }
 
 // build resolves the full configuration: YAML base, granular flags, then the
@@ -88,6 +91,9 @@ func (f *connFlags) build(prompt config.PromptFunc) (*config.Config, error) {
 	// Validate before ApplyDefaults: defaults rewrite unset (<= 0) values,
 	// so a negative value from a YAML file would otherwise be silently
 	// replaced instead of reported.
+	if f.allowUnenforcedReadOnly {
+		cfg.Opts.AllowUnenforcedReadOnly = true
+	}
 	if err := cfg.Validate(); err != nil {
 		msg := err.Error()
 		if f.configPath != "" {

@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestParseShorthand(t *testing.T) {
@@ -13,13 +15,17 @@ func TestParseShorthand(t *testing.T) {
 		wantErr bool
 	}{
 		{in: "root:secret@10.0.0.1:3307/dbA",
-			want: Endpoint{Host: "10.0.0.1", Port: 3307, User: "root", Password: "secret", Database: "dbA"}},
+			want: Endpoint{Host: "10.0.0.1", Port: 3307, User: "root", Password: "secret", Database: "dbA", passwordSet: true}},
 		{in: "root@localhost/mydb",
 			want: Endpoint{Host: "localhost", Port: 3306, User: "root", Database: "mydb"}},
+		// an explicit empty password segment marks a password-less server
+		// (TiDB's default root) and suppresses the prompt
+		{in: "root:@localhost/mydb",
+			want: Endpoint{Host: "localhost", Port: 3306, User: "root", Database: "mydb", passwordSet: true}},
 		{in: "192.168.1.5",
 			want: Endpoint{Host: "192.168.1.5", Port: 3306}},
 		{in: "  u:p@h:1/db  ",
-			want: Endpoint{Host: "h", Port: 1, User: "u", Password: "p", Database: "db"}},
+			want: Endpoint{Host: "h", Port: 1, User: "u", Password: "p", Database: "db", passwordSet: true}},
 		{in: "u:p @h:1/db", wantErr: true}, // inner whitespace is a typo trap
 		{in: "host:badport/db", wantErr: true},
 		{in: "/db", wantErr: true},
@@ -126,6 +132,35 @@ func TestResolvePasswordPriority(t *testing.T) {
 	}
 }
 
+// TestResolvePasswordExplicitEmpty pins the "user:@host" semantics: an
+// explicitly empty password (a password-less server, e.g. TiDB's default
+// root) must not prompt, while an absent password segment still does.
+func TestResolvePasswordExplicitEmpty(t *testing.T) {
+	e, err := ParseShorthand("root:@localhost/mydb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	prompted := false
+	if err := e.ResolvePassword(func(string) (string, error) { prompted = true; return "x", nil }); err != nil {
+		t.Fatal(err)
+	}
+	if prompted || e.Password != "" {
+		t.Errorf("explicit empty password must not prompt: pw=%q prompted=%v", e.Password, prompted)
+	}
+
+	e2, err := ParseShorthand("root@localhost/mydb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	prompted = false
+	if err := e2.ResolvePassword(func(string) (string, error) { prompted = true; return "x", nil }); err != nil {
+		t.Fatal(err)
+	}
+	if !prompted {
+		t.Errorf("absent password should prompt")
+	}
+}
+
 // TestResolvePasswordEnvMissing covers the P3-#11 behavior: a password_env
 // naming an unset variable is a configuration error, not a silent
 // fallback to a password-less connection.
@@ -149,6 +184,19 @@ func TestResolvePasswordEnvMissing(t *testing.T) {
 	}
 	if e2.Password != "" {
 		t.Errorf("empty variable must yield empty password, got %q", e2.Password)
+	}
+}
+
+// TestAllowUnenforcedReadOnlyYAML pins the YAML spelling of the read-only
+// guard opt-in (config files cannot set the unexported passwordSet, but this
+// is a normal exported option).
+func TestAllowUnenforcedReadOnlyYAML(t *testing.T) {
+	var o Options
+	if err := yaml.Unmarshal([]byte("allow_unenforced_readonly: true\n"), &o); err != nil {
+		t.Fatal(err)
+	}
+	if !o.AllowUnenforcedReadOnly {
+		t.Errorf("allow_unenforced_readonly not parsed: %+v", o)
 	}
 }
 
