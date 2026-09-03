@@ -104,6 +104,7 @@ func (e *Engine) buffer(norm, keyNorm *normalize.Normalizer, next func() ([]any,
 		if err != nil {
 			return nil, err
 		}
+		buf, kbuf = canon[:0], keyCanon[:0] // reuse the (possibly grown) buffer, as the chunk scanner does
 		cp := make([]any, len(vals))
 		copy(cp, vals)
 		out[string(keyCanon)] = append(out[string(keyCanon)], &srow{vals: cp, canon: string(canon)})
@@ -157,6 +158,59 @@ func (e *Engine) scanSide(ctx context.Context, side *conn.Side, schema *conn.Sch
 		return nil, err
 	}
 	return m, nil
+}
+
+// scanKeyRows streams one side's key columns (in key order) through the
+// side's read-only scan pool, under a free-form predicate ANDed with the
+// optional --where filter, and returns each row's raw key values. It
+// serves the out-of-range delete scan, which needs nothing but the
+// destination rows' keys. The connection is taken from the scan pool and
+// closed on return.
+func (e *Engine) scanKeyRows(ctx context.Context, side *conn.Side, schema *conn.Schema, pred, where string) ([][]any, error) {
+	cn, err := side.AcquireScan(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer cn.Close()
+	idents := make([]string, len(schema.Key))
+	for i, k := range schema.Key {
+		idents[i] = conn.QuoteIdent(k)
+	}
+	query := fmt.Sprintf("SELECT %s FROM %s", strings.Join(idents, ", "), conn.QuoteIdent(schema.Table))
+	var conds []string
+	if pred != "" {
+		conds = append(conds, "("+pred+")")
+	}
+	if where != "" {
+		conds = append(conds, "("+where+")")
+	}
+	if len(conds) > 0 {
+		query += " WHERE " + strings.Join(conds, " AND ")
+	}
+	rows, err := cn.QueryContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	vals := make([]any, len(schema.Key))
+	ptrs := make([]any, len(schema.Key))
+	for i := range vals {
+		ptrs[i] = &vals[i]
+	}
+	var out [][]any
+	for rows.Next() {
+		for i := range vals {
+			vals[i] = nil
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			return nil, err
+		}
+		cp := make([]any, len(vals))
+		copy(cp, vals)
+		out = append(out, cp)
+	}
+	return out, rows.Err()
 }
 
 // Diff derives the row-level operations between two buffered sides. Ops
@@ -251,4 +305,26 @@ func Counts(chunked [][]op) (inserts, updates, deletes int) {
 		}
 	}
 	return
+}
+
+// groupOps splits ops into groups of at most batch (batch < 1: one group):
+// the applier commits one transaction per group, and the out-of-range
+// deletes are not chunk-bounded, so the groups keep those transactions
+// small.
+func groupOps(ops []op, batch int) [][]op {
+	if len(ops) == 0 {
+		return nil
+	}
+	if batch < 1 {
+		return [][]op{ops}
+	}
+	out := make([][]op, 0, (len(ops)+batch-1)/batch)
+	for start := 0; start < len(ops); start += batch {
+		end := start + batch
+		if end > len(ops) {
+			end = len(ops)
+		}
+		out = append(out, ops[start:end])
+	}
+	return out
 }

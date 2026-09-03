@@ -308,6 +308,105 @@ echo "ok: non-TTY message shown"
 sql dst dstdb m_mut_reseed.sql
 expect 0 "sync: identical table, nothing to do" sync --src "$SRC" --dst "$DST" --tables t_mut
 
+say "out-of-range sync"
+# (a) t_oor: dst loses 4 rows, 2 are changed, and 4 keys outside the
+# source's range (id 0 below, 101..103 above) are added — equal counts, so
+# row-level. The out-of-range rows converge only via the out-of-range scan.
+sql dst dstdb m_oor_oor.sql
+expect 1 "oor dry-run: deletes planned" sync --src "$SRC" --dst "$DST" --tables t_oor
+if ! grep -q 'DELETE FROM `t_oor`' "$OUT"; then
+  echo "FAIL: oor dry-run showed no DELETE sample"; cat "$OUT"; exit 1
+fi
+echo "ok: oor dry-run shows DELETE sample"
+if grep -q 'TRUNCATE' "$OUT"; then
+  echo "FAIL: equal-count oor table was planned as a full resync"; cat "$OUT"; exit 1
+fi
+echo "ok: oor dry-run is row-level (no TRUNCATE)"
+expect 0 "oor --apply --yes: out-of-range rows deleted" sync --src "$SRC" --dst "$DST" --tables t_oor --apply --yes
+expect 0 "diff identical after oor sync" --src "$SRC" --dst "$DST" --tables t_oor
+oor=$(qdst "SELECT COUNT(*) FROM t_oor WHERE id < 1 OR id > 100")
+[ "$oor" = "0" ] || { echo "FAIL: out-of-range rows remain on dst: $oor"; exit 1; }
+echo "ok: out-of-range rows (id 0, 101..103) deleted"
+oor=$(qdst "SELECT COUNT(*) FROM t_oor WHERE id IN (10, 20, 30, 40, 50, 60) AND val = CONCAT('o', id)")
+[ "$oor" = "6" ] || { echo "FAIL: deleted/changed rows not restored: $oor/6"; exit 1; }
+echo "ok: deleted and changed rows restored"
+oor=$(qdst "SELECT COUNT(*) FROM t_oor")
+[ "$oor" = "100" ] || { echo "FAIL: row count after oor sync: $oor (want 100)"; exit 1; }
+echo "ok: row count back to 100"
+# (b) t_oorc (composite PK): out-of-range rows on both tails, plus the
+# strict boundary probes (1,0) and (10,4); the boundary rows (1,1)/(10,3)
+# must survive (a strict predicate excludes them, an inclusive one would not).
+sql dst dstdb m_oorc_oor.sql
+expect 0 "oorc --apply --yes: composite out-of-range rows deleted" sync --src "$SRC" --dst "$DST" --tables t_oorc --apply --yes
+expect 0 "diff identical after composite oor sync" --src "$SRC" --dst "$DST" --tables t_oorc
+oor=$(qdst "SELECT COUNT(*) FROM t_oorc WHERE a < 1 OR a > 10 OR (a = 1 AND b < 1) OR (a = 10 AND b > 3)")
+[ "$oor" = "0" ] || { echo "FAIL: composite out-of-range rows remain: $oor"; exit 1; }
+echo "ok: composite out-of-range rows (incl. boundary probes) deleted"
+oor=$(qdst "SELECT COUNT(*) FROM t_oorc WHERE (a, b) IN ((1, 1), (10, 3))")
+[ "$oor" = "2" ] || { echo "FAIL: boundary rows deleted (strict predicate must keep them): $oor/2"; exit 1; }
+echo "ok: boundary rows (1,1) and (10,3) kept"
+oor=$(qdst "SELECT COUNT(*) FROM t_oorc")
+[ "$oor" = "30" ] || { echo "FAIL: row count after composite oor sync: $oor (want 30)"; exit 1; }
+echo "ok: row count back to 30 (deleted rows re-inserted)"
+# (c) t_oors (VARCHAR PK): character keys rendered as quoted strings.
+sql dst dstdb m_oors_oor.sql
+expect 0 "oors --apply --yes: varchar out-of-range keys deleted" sync --src "$SRC" --dst "$DST" --tables t_oors --apply --yes
+expect 0 "diff identical after varchar oor sync" --src "$SRC" --dst "$DST" --tables t_oors
+oor=$(qdst "SELECT COUNT(*) FROM t_oors WHERE k < 'k001' OR k > 'k050'")
+[ "$oor" = "0" ] || { echo "FAIL: varchar out-of-range keys remain: $oor"; exit 1; }
+echo "ok: varchar out-of-range keys deleted"
+oor=$(qdst "SELECT COUNT(*) FROM t_oors WHERE k IN ('k010', 'k020', 'k030') AND val = CONCAT('s', CAST(SUBSTRING(k, 2) AS UNSIGNED))")
+[ "$oor" = "3" ] || { echo "FAIL: deleted varchar rows not restored: $oor/3"; exit 1; }
+echo "ok: deleted varchar rows restored"
+# (d) t_oorn (explicit --key a, nullable): the source minimum is NULL, so
+# only the upper tail can be out of range; the duplicate NULL-key rows and
+# the missing in-range row must be handled correctly.
+sql dst dstdb m_oorn_oor.sql
+expect 0 "oorn --apply --yes --key a: NULL-minimum table converges" sync --src "$SRC" --dst "$DST" --tables t_oorn --key a --apply --yes
+expect 0 "diff identical after NULL-key oor sync" --src "$SRC" --dst "$DST" --tables t_oorn --key a
+oor=$(qdst "SELECT COUNT(*) FROM t_oorn WHERE a IS NULL")
+[ "$oor" = "2" ] || { echo "FAIL: NULL-key rows must survive: $oor/2"; exit 1; }
+echo "ok: duplicate NULL-key rows kept"
+oor=$(qdst "SELECT COUNT(*) FROM t_oorn WHERE a = 5")
+[ "$oor" = "0" ] || { echo "FAIL: out-of-range row (a=5) not deleted: $oor"; exit 1; }
+echo "ok: out-of-range row (a=5) deleted"
+oor=$(qdst "SELECT COUNT(*) FROM t_oorn WHERE a = 2 AND v = 'y'")
+[ "$oor" = "1" ] || { echo "FAIL: missing row (2, 'y') not restored: $oor/1"; exit 1; }
+echo "ok: missing row (2, 'y') restored"
+# (e) t_mut + --where: out-of-range rows matching the filter are deleted,
+# the non-matching one is the documented residual (a filtered table cannot
+# be truncated): the filtered comparison converges, the plain one does not.
+sql dst dstdb m_oor_where.sql
+expect 0 "oor --where --apply: matching out-of-range rows deleted" sync --src "$SRC" --dst "$DST" --tables t_mut --where "updated_at < '2025-01-01'" --apply --yes
+expect 0 "diff identical after where oor sync (filtered)" --src "$SRC" --dst "$DST" --tables t_mut --where "updated_at < '2025-01-01'"
+expect 1 "unfiltered diff still differs: non-matching residual" --src "$SRC" --dst "$DST" --tables t_mut
+oor=$(qdst "SELECT COUNT(*) FROM t_mut WHERE id IN (1001, 1003)")
+[ "$oor" = "0" ] || { echo "FAIL: filter-matching out-of-range rows remain: $oor"; exit 1; }
+echo "ok: filter-matching out-of-range rows (1001, 1003) deleted"
+oor=$(qdst "SELECT COUNT(*) FROM t_mut WHERE id = 1002")
+[ "$oor" = "1" ] || { echo "FAIL: non-matching residual must stay (documented): $oor/1"; exit 1; }
+echo "ok: non-matching residual (1002) left in place"
+# (f) t_mut (no --where, equal counts): first-round convergence without a
+# full resync — the pre-fix behavior escalated to TRUNCATE + resync here.
+sql dst dstdb m_oor_converge.sql
+expect 1 "converge dry-run: row-level deletes planned" sync --src "$SRC" --dst "$DST" --tables t_mut
+if ! grep -q 'DELETE FROM `t_mut`' "$OUT"; then
+  echo "FAIL: converge dry-run showed no DELETE sample"; cat "$OUT"; exit 1
+fi
+echo "ok: converge dry-run shows DELETE sample"
+if grep -q 'TRUNCATE' "$OUT"; then
+  echo "FAIL: equal-count table escalated to a full resync"; cat "$OUT"; exit 1
+fi
+echo "ok: converge dry-run is row-level (no TRUNCATE)"
+expect 0 "converge --apply --yes: first-round convergence" sync --src "$SRC" --dst "$DST" --tables t_mut --apply --yes
+expect 0 "diff identical after converge sync" --src "$SRC" --dst "$DST" --tables t_mut
+oor=$(qdst "SELECT COUNT(*) FROM t_mut WHERE id > 1000")
+[ "$oor" = "0" ] || { echo "FAIL: out-of-range rows remain: $oor"; exit 1; }
+echo "ok: out-of-range rows (1001..1003) deleted"
+oor=$(qdst "SELECT COUNT(*) FROM t_mut")
+[ "$oor" = "1000" ] || { echo "FAIL: row count after converge sync: $oor (want 1000)"; exit 1; }
+echo "ok: row count back to 1000"
+
 say "structure sync"
 # t_struct on the dst drifts: a column dropped, a type changed, an extra
 # column added, the PK removed. Structure sync (default on) plans the DDL.
@@ -351,6 +450,62 @@ echo "ok: no DDL for an identical table"
 # failure instead of a planned DDL.
 sql dst dstdb m_struct_drift.sql
 expect 2 "structure drift with --no-sync-schema: not syncable" sync --src "$SRC" --dst "$DST" --tables t_struct --no-sync-schema
+
+say "key drift (keyed source vs keyless destination)"
+# t_keyless on the dst loses only its PRIMARY KEY: columns and data stay
+# identical, so the tables are still comparable, but no shared key exists
+# to plan chunks by. Before the keyless fallback this pair crashed with an
+# index-out-of-range panic in the chunk predicate.
+sql dst dstdb m_keyless_drift.sql
+expect 0 "keyless dst: diff falls back to keyless comparison (identical)" --src "$SRC" --dst "$DST" --tables t_keyless
+if ! grep -q "warn t_keyless" "$OUT"; then
+  echo "FAIL: the keyless fallback must be announced in the report"; cat "$OUT"; exit 1
+fi
+echo "ok: keyless fallback announced in the report"
+# Now the data drifts too: the multiset comparison still sees it, and the
+# sync (which cannot target rows without a shared key) must take the full
+# resync; --where on such a table is a misconfiguration.
+sql dst dstdb m_keyless_data.sql
+expect 1 "keyless dst: diff reports the data drift" --src "$SRC" --dst "$DST" --tables t_keyless
+expect 1 "keyless dst: dry-run plans the full resync" sync --src "$SRC" --dst "$DST" --tables t_keyless --no-sync-schema
+if ! grep -q 'TRUNCATE TABLE `t_keyless`' "$OUT"; then
+  echo "FAIL: keyless dst dry-run showed no TRUNCATE sample"; cat "$OUT"; exit 1
+fi
+echo "ok: keyless dst dry-run shows the TRUNCATE sample"
+expect 3 "keyless dst with --where: cannot sync" sync --src "$SRC" --dst "$DST" --tables t_keyless --no-sync-schema --where "id >= 1"
+expect 0 "keyless dst: full resync applied" sync --src "$SRC" --dst "$DST" --tables t_keyless --no-sync-schema --apply --yes
+expect 0 "diff identical after keyless-dst resync" --src "$SRC" --dst "$DST" --tables t_keyless
+n=$(qdst "SELECT COUNT(*) FROM t_keyless WHERE id IN (7, 17, 27)")
+if [ "$n" != "3" ]; then
+  echo "FAIL: resync restored the deleted rows (count=$n, want 3)"; exit 1
+fi
+echo "ok: resync restored the deleted rows"
+v=$(qdst "SELECT val FROM t_keyless WHERE id = 47")
+if [ "$v" != "v47" ]; then
+  echo "FAIL: resync restored the changed row (val=$v, want v47)"; exit 1
+fi
+echo "ok: resync restored the changed row"
+n=$(qdst "SELECT COUNT(*) FROM t_keyless WHERE id IN (51, 52, 53)")
+if [ "$n" != "0" ]; then
+  echo "FAIL: resync dropped the extra rows (count=$n, want 0)"; exit 1
+fi
+echo "ok: resync dropped the extra rows"
+# With structure sync (the default) the same drift is repaired instead:
+# the primary key is re-added and the table resynced.
+sql dst dstdb m_keyless_drift.sql
+sql dst dstdb m_keyless_data.sql
+expect 1 "key drift: default sync plans the key DDL" sync --src "$SRC" --dst "$DST" --tables t_keyless
+if ! grep -q "ADD PRIMARY KEY" "$OUT"; then
+  echo "FAIL: default sync must show the ADD PRIMARY KEY DDL"; cat "$OUT"; exit 1
+fi
+echo "ok: default sync shows the key DDL"
+expect 0 "key drift: default sync --apply" sync --src "$SRC" --dst "$DST" --tables t_keyless --apply --yes
+expect 0 "diff identical after default sync" --src "$SRC" --dst "$DST" --tables t_keyless
+pk=$(qdst "SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA='dstdb' AND TABLE_NAME='t_keyless' AND INDEX_NAME='PRIMARY'")
+if [ "$pk" != "1" ]; then
+  echo "FAIL: dst PRIMARY key after default sync (count=$pk, want 1)"; exit 1
+fi
+echo "ok: dst PRIMARY key restored by default sync"
 
 E2E_OK=1
 say "ALL E2E SCENARIOS PASSED"

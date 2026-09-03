@@ -2,6 +2,7 @@ package sync
 
 import (
 	"context"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"sort"
@@ -149,7 +150,7 @@ func (r *Runner) prepare(ctx context.Context, res compare.TableResult) (*prep, e
 	p := &prep{
 		srcS: srcS,
 		dstS: dstS,
-		plan: DecidePlan(res, len(srcS.Key) > 0, r.o.Cmp.Where),
+		plan: DecidePlan(res, len(srcS.Key) > 0, len(dstS.Key) > 0, r.o.Cmp.Where),
 		b:    NewBuilder(res.Name, srcS),
 	}
 	p.e = NewEngine(
@@ -179,6 +180,12 @@ func (r *Runner) prepare(ctx context.Context, res compare.TableResult) (*prep, e
 // matches), the destination side is re-planned instead and every
 // destination row is deleted: a filtered table cannot be truncated, so its
 // only path to convergence is emptying the destination's match set.
+//
+// After the chunk ops, the destination is scanned once for rows whose key
+// falls strictly outside the source's key range (the chunks never cover
+// them) and each is deleted individually (outOfRangeDeletes). Without a
+// filter this keeps the first round from escalating to a full resync; with
+// a filter it is the only path to convergence for out-of-range rows.
 func (r *Runner) RowOps(ctx context.Context, p *prep, res compare.TableResult, freshSrc, freshDst int64) ([][]op, error) {
 	planner := chunk.Planner{
 		Table:       res.Name,
@@ -227,7 +234,11 @@ func (r *Runner) RowOps(ctx context.Context, p *prep, res compare.TableResult, f
 		}
 		out = append(out, p.e.Diff(srcM, dstM))
 	}
-	return out, nil
+	oor, err := r.outOfRangeDeletes(ctx, p, freshSrc)
+	if err != nil {
+		return nil, fmt.Errorf("out-of-range scan: %w", err)
+	}
+	return append(out, oor...), nil
 }
 
 // dstDeletes plans the destination side and deletes every row it holds:
@@ -267,6 +278,167 @@ func (r *Runner) dstDeletes(ctx context.Context, p *prep, freshDst int64) ([][]o
 		out = append(out, ops)
 	}
 	return out, nil
+}
+
+// allNil reports whether every value is nil (the all-NULL key row).
+func allNil(v []driver.Value) bool {
+	for _, x := range v {
+		if x != nil {
+			return false
+		}
+	}
+	return true
+}
+
+// keyAgree reports whether both sides use the same key: same columns, in
+// the same order, by name. (Column drift with different names but
+// compatible types passes the pre-pass compatibility check positionally,
+// so only the structure pre-step or this check can catch it.)
+func keyAgree(a, b *conn.Schema) bool {
+	if len(a.Key) != len(b.Key) {
+		return false
+	}
+	for i := range a.Key {
+		if a.Key[i] != b.Key[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// oorPredicate renders the "key strictly outside [min, max]" predicate for
+// the destination's key columns, bounded by the source's minimum and
+// maximum key values: RenderLessThan(min) OR RenderGreaterThan(max). The
+// comparison is strict on purpose — a row equal to a bound is in range and
+// belongs to the chunk diff. A side that renders empty is dropped; when
+// both do (a single-column all-NULL minimum bounds everything below) ok is
+// false. The bounds are rendered with the source key columns' family-aware
+// literals (a character or decimal bound rendered as a hex blob would put
+// rows on the wrong side of the boundary).
+func (r *Runner) oorPredicate(p *prep, minV, maxV []driver.Value) (string, bool) {
+	lits := keyLits(compare.KeyFamilies(p.srcS))
+	// a side joins the two tails with a top-level OR only when the key is
+	// composite; wrap it then (a single term, or a fully parenthesized
+	// group like "(`a` IS NULL OR ...)", is safe to OR as-is)
+	wrap := func(s string) string {
+		if strings.Contains(s, " OR ") && !isParenGroup(s) {
+			return "(" + s + ")"
+		}
+		return s
+	}
+	var sides []string
+	if !allNil(minV) {
+		// the all-NULL row is the minimum: nothing sits below it
+		if s := chunk.RenderLessThan(p.dstS.Key, minV, lits); s != "1=0" {
+			sides = append(sides, wrap(s))
+		}
+	}
+	if s := chunk.RenderGreaterThan(p.dstS.Key, maxV, lits); s != "1=0" {
+		sides = append(sides, wrap(s))
+	}
+	if len(sides) == 0 {
+		return "", false
+	}
+	return strings.Join(sides, " OR "), true
+}
+
+// isParenGroup reports whether the whole string is one parenthesized group
+// (an unbalanced or trailing-paren string is not).
+func isParenGroup(s string) bool {
+	if len(s) < 2 || s[0] != '(' || s[len(s)-1] != ')' {
+		return false
+	}
+	depth := 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return i == len(s)-1
+			}
+		}
+	}
+	return false
+}
+
+// outOfRangeDeletes plans the deletes of destination rows whose key falls
+// strictly outside the source's key range: the row-level chunks only cover
+// the source's min..max range, so such rows would otherwise never be
+// touched. It reads the source's extremes (the --where filter applies, as
+// to the destination scan below), scans the destination for rows outside
+// them, and deletes them one by one, grouped in Batch-sized transactions
+// appended after the in-range chunk groups.
+//
+// It is a no-op for a keyless table, an empty source (the caller took
+// dstDeletes instead), a key the two sides disagree on, and a scan that
+// finds nothing. With a --where filter, out-of-range rows that do not
+// match the filter are left in place: a filtered table cannot be
+// truncated, so they are the one documented residual (the verification
+// reports the table DIFFERENT and a plain, unfiltered comparison shows
+// them).
+func (r *Runner) outOfRangeDeletes(ctx context.Context, p *prep, freshSrc int64) ([][]op, error) {
+	if freshSrc <= 0 || len(p.srcS.Key) == 0 || len(p.dstS.Key) == 0 {
+		return nil, nil
+	}
+	if !keyAgree(p.srcS, p.dstS) {
+		// the bounds are the SOURCE's key values rendered against the
+		// DESTINATION's key columns, so the two sides must agree on the
+		// key by name and order (with --no-sync-schema the keys can drift
+		// at equal length, e.g. PK (a, b) vs (b, a) — rendering the src
+		// values against the wrong columns would delete in-range rows)
+		return nil, nil
+	}
+	sp := chunk.Planner{
+		Table:       p.srcS.Table,
+		KeyCols:     p.srcS.Key,
+		KeyFamilies: compare.KeyFamilies(p.srcS),
+		Where:       r.o.Cmp.Where,
+	}
+	minV, maxV, err := sp.Extremes(ctx, r.Src.Ctl())
+	if err != nil {
+		return nil, err
+	}
+	if minV == nil || maxV == nil {
+		// the source emptied between the count and the extremes read
+		// (Extremes returns both nil in that case; maxV is checked too
+		// because a nil bound would panic the strict comparators)
+		return nil, nil
+	}
+	pred, ok := r.oorPredicate(p, minV, maxV)
+	if !ok {
+		return nil, nil
+	}
+	rows, err := p.e.scanKeyRows(ctx, r.Dst, p.dstS, pred, r.o.Cmp.Where)
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	// deterministic order: the same normalized key identity the in-range
+	// deletes are sorted by
+	type keyed struct {
+		canon string
+		kv    []any
+	}
+	kr := make([]keyed, 0, len(rows))
+	buf := make([]byte, 0, 256)
+	for _, vals := range rows {
+		canon, err := p.e.dstKey.Normalize(vals, buf)
+		if err != nil {
+			return nil, err
+		}
+		buf = canon[:0]
+		kr = append(kr, keyed{canon: string(canon), kv: vals})
+	}
+	sort.Slice(kr, func(i, j int) bool { return kr[i].canon < kr[j].canon })
+	ops := make([]op, 0, len(kr))
+	for _, k := range kr {
+		ops = append(ops, op{kind: opDelete, key: k.kv})
+	}
+	return groupOps(ops, r.o.Batch), nil
 }
 
 // StructPlan is the structure-sync verdict for one table: nil (from
@@ -371,25 +543,49 @@ func (r *Runner) ApplyStructureTable(ctx context.Context, res compare.TableResul
 	return ts
 }
 
-// samples renders up to limit sample statements from the ops (deterministic
-// order: the groups are in chunk order and the ops within a group are
-// sorted by key identity).
+// samples renders up to limit sample statements from the ops. Each op kind
+// present gets one sample first (a dry run that plans deletes must show a
+// delete, not five inserts), the remaining slots fill in order (deterministic:
+// the groups are in chunk order, the ops within a group are sorted by key
+// identity).
 func (r *Runner) samples(b *Builder, chunked [][]op, limit int) []string {
-	out := make([]string, 0, limit)
-outer:
+	if limit <= 0 {
+		return nil
+	}
+	var all []op
 	for _, ops := range chunked {
-		for _, o := range ops {
-			if len(out) >= limit {
-				break outer
-			}
-			switch o.kind {
-			case opInsert:
-				out = append(out, b.Insert(o.rows[0]))
-			case opUpdate:
-				out = append(out, b.Update(o.key, o.rows[0]))
-			case opDelete:
-				out = append(out, b.Delete(o.key))
-			}
+		all = append(all, ops...)
+	}
+	out := make([]string, 0, limit)
+	taken := make(map[int]bool, limit)
+	render := func(i int) {
+		o := all[i]
+		switch o.kind {
+		case opInsert:
+			out = append(out, b.Insert(o.rows[0]))
+		case opUpdate:
+			out = append(out, b.Update(o.key, o.rows[0]))
+		case opDelete:
+			out = append(out, b.Delete(o.key))
+		}
+		taken[i] = true
+	}
+	seen := make(map[opKind]bool)
+	for i, o := range all {
+		if len(out) == limit {
+			break
+		}
+		if !seen[o.kind] {
+			seen[o.kind] = true
+			render(i)
+		}
+	}
+	for i := range all {
+		if len(out) == limit {
+			break
+		}
+		if !taken[i] {
+			render(i)
 		}
 	}
 	return out

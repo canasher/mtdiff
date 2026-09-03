@@ -136,6 +136,65 @@ WITH RECURSIVE seq(n) AS (
 )
 SELECT n, CONCAT('s', n), n * 1.5, '2024-01-01 00:00:00' FROM seq;
 
+-- t_oor: 100 rows, INT PK; the out-of-range sync scenarios mutate the dst
+-- copy (m_oor_oor.sql et al.).
+DROP TABLE IF EXISTS t_oor;
+CREATE TABLE t_oor (
+  id  INT PRIMARY KEY,
+  val VARCHAR(32)
+) ENGINE=InnoDB;
+
+INSERT INTO t_oor (id, val)
+WITH RECURSIVE seq(n) AS (
+  SELECT 1
+  UNION ALL
+  SELECT n + 1 FROM seq WHERE n < 100
+)
+SELECT n, CONCAT('o', n) FROM seq;
+
+-- t_oorc: composite PK (a, b), a = 1..10 x b = 1..3 (30 rows).
+DROP TABLE IF EXISTS t_oorc;
+CREATE TABLE t_oorc (
+  a   INT NOT NULL,
+  b   INT NOT NULL,
+  val VARCHAR(32),
+  PRIMARY KEY (a, b)
+) ENGINE=InnoDB;
+
+INSERT INTO t_oorc (a, b, val)
+WITH RECURSIVE seq(n) AS (
+  SELECT 1
+  UNION ALL
+  SELECT n + 1 FROM seq WHERE n < 30
+)
+SELECT FLOOR((n - 1) / 3) + 1, MOD(n - 1, 3) + 1, CONCAT('c', n) FROM seq;
+
+-- t_oors: VARCHAR PK k001..k050 (exercises the quoted-string literal path).
+DROP TABLE IF EXISTS t_oors;
+CREATE TABLE t_oors (
+  k   VARCHAR(16) PRIMARY KEY,
+  val VARCHAR(32)
+) ENGINE=InnoDB;
+
+INSERT INTO t_oors (k, val)
+WITH RECURSIVE seq(n) AS (
+  SELECT 1
+  UNION ALL
+  SELECT n + 1 FROM seq WHERE n < 50
+)
+SELECT CONCAT('k', LPAD(n, 3, '0')), CONCAT('s', n) FROM seq;
+
+-- t_oorn: no PK, nullable key column a plus duplicate NULL-key rows; the
+-- scenarios address it with an explicit --key a (auto key selection
+-- rejects a nullable column).
+DROP TABLE IF EXISTS t_oorn;
+CREATE TABLE t_oorn (
+  a INT,
+  v VARCHAR(20)
+) ENGINE=InnoDB;
+
+INSERT INTO t_oorn VALUES (NULL, 'n1'), (NULL, 'n2'), (1, 'x'), (2, 'y'), (3, 'z');
+
 -- t_ignore: updated_at is identical at seed time; a later dst mutation
 -- shifts it, and --ignore-columns must hide the difference.
 DROP TABLE IF EXISTS t_ignore;
@@ -152,3 +211,20 @@ WITH RECURSIVE seq(n) AS (
   SELECT n + 1 FROM seq WHERE n < 500
 )
 SELECT n, n, '2024-01-01 00:00:00' FROM seq;
+
+-- t_keyless: identical on both sides; the key-drift scenarios
+-- (m_keyless_drift.sql) remove the dst's PRIMARY KEY only — the columns
+-- and the data stay identical to the src.
+DROP TABLE IF EXISTS t_keyless;
+CREATE TABLE t_keyless (
+  id  INT PRIMARY KEY,
+  val VARCHAR(32)
+) ENGINE=InnoDB;
+
+INSERT INTO t_keyless (id, val)
+WITH RECURSIVE seq(n) AS (
+  SELECT 1
+  UNION ALL
+  SELECT n + 1 FROM seq WHERE n < 50
+)
+SELECT n, CONCAT('v', n) FROM seq;

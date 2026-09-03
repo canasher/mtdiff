@@ -36,6 +36,19 @@ func literalFor(fam string, v driver.Value) string {
 	return chunk.Literal(v)
 }
 
+// keyLits builds one literal renderer per key column family, for the chunk
+// strict comparators (RenderLessThan / RenderGreaterThan): the out-of-range
+// bounds must be rendered with the same family awareness as the writes, or
+// a character or decimal key compared as a hex blob would put rows on the
+// wrong side of the boundary.
+func keyLits(fams []string) []chunk.LiteralFunc {
+	lits := make([]chunk.LiteralFunc, len(fams))
+	for i := range fams {
+		lits[i] = func(v driver.Value) string { return literalFor(fams[i], v) }
+	}
+	return lits
+}
+
 // bitLiteral renders a BIT value (the driver's big-endian byte pattern) as a
 // b'...' bit literal. MySQL stores a bit literal losslessly into a BIT
 // column of any width, whereas the byte pattern is meaningless as either a

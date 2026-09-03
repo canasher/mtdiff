@@ -118,6 +118,21 @@ func (c *Comparer) compareTable(ctx context.Context, src, dst *conn.Side, name s
 		return res
 	}
 
+	// Usable keys must agree for the chunk plan to be shared: the planner
+	// renders the source's key bounds into predicates that run against the
+	// destination's key columns, so a source with a key and a destination
+	// without one (or the reverse) cannot be chunked by key — planning the
+	// keyed side's bounds against the keyless side's schema is an
+	// index-out-of-range panic, not an error. Fall back to keyless
+	// whole-table mode on both sides: one unbounded chunk and
+	// order-independent multiset fingerprints, so identical data still
+	// compares equal and a real difference is still reported.
+	keyMismatch := (len(srcSchema.Key) > 0) != (len(dstSchema.Key) > 0)
+	if keyMismatch {
+		res.Warnings = append(res.Warnings,
+			"usable keys disagree (one side keyed, the other keyless): comparing as keyless whole-table multisets")
+	}
+
 	var chunks []chunk.Chunk
 	if srcTotal > 0 || dstTotal > 0 {
 		p := chunk.Planner{
@@ -127,13 +142,20 @@ func (c *Comparer) compareTable(ctx context.Context, src, dst *conn.Side, name s
 			ChunkSize:   c.opts.ChunkSize,
 			Where:       c.opts.Where,
 		}
+		if keyMismatch {
+			p.KeyCols = nil
+			p.KeyFamilies = nil
+		}
 		chunks, err = p.Plan(ctx, src.Ctl(), srcTotal)
 		if err != nil {
 			return fail("plan: %v", err)
 		}
 	}
 	res.Chunks = len(chunks)
-	ordered := len(srcSchema.Key) > 0
+	// The ordered accumulator needs a deterministic row order per chunk,
+	// which only the keyless fallback (no key to order by on one side)
+	// must give up: both sides compare as multisets instead.
+	ordered := len(srcSchema.Key) > 0 && !keyMismatch
 	sc := chunk.NewScanner(srcNorm, ordered)
 	dc := chunk.NewScanner(dstNorm, ordered)
 

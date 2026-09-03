@@ -179,6 +179,28 @@ func TestKeyOrder(t *testing.T) {
 	}
 }
 
+// TestToDriverValues pins the keyRow/sample conversion: nil must pass
+// through as nil (an all-NULL key row), driver values keep their dynamic
+// type.
+func TestToDriverValues(t *testing.T) {
+	got := toDriverValues([]any{nil, int64(5), "x", []byte("b")})
+	if len(got) != 4 {
+		t.Fatalf("len = %d, want 4", len(got))
+	}
+	if got[0] != nil {
+		t.Errorf("nil must stay nil, got %#v", got[0])
+	}
+	if v, ok := got[1].(int64); !ok || v != 5 {
+		t.Errorf("int64(5): got %#v", got[1])
+	}
+	if v, ok := got[2].(string); !ok || v != "x" {
+		t.Errorf(`"x": got %#v`, got[2])
+	}
+	if v, ok := got[3].([]byte); !ok || len(v) != 1 || v[0] != 'b' {
+		t.Errorf(`[]byte("b"): got %#v`, got[3])
+	}
+}
+
 func TestPredicate(t *testing.T) {
 	c := Chunk{ID: 1, Lo: []driver.Value{int64(5)}, Hi: []driver.Value{int64(10)}}
 	if got := c.Predicate([]string{"id"}, ""); got != "`id` > 5 AND `id` <= 10" {
@@ -297,5 +319,118 @@ func TestValuesEqual(t *testing.T) {
 	}
 	if valuesEqual([]driver.Value{int64(1)}, nil) {
 		t.Error("length mismatch must differ")
+	}
+}
+
+// TestRenderLessThan pins the strict "key < bound" rendering (the out-of-
+// range delete's low side). Strictness is load-bearing: a row EQUAL to the
+// bound is in range and must not be selected, and a NULL component of the
+// key sorts below the bound and must be selected (a plain "col < lit" is
+// UNKNOWN for it).
+func TestRenderLessThan(t *testing.T) {
+	tests := []struct {
+		key   []string
+		bound []driver.Value
+		lits  []LiteralFunc
+		want  string
+	}{
+		{
+			key:   []string{"a"},
+			bound: []driver.Value{int64(5)},
+			want:  "(`a` IS NULL OR `a` < 5)",
+		},
+		{
+			// all-NULL single-column bound: the minimum, nothing below it
+			key:   []string{"a"},
+			bound: []driver.Value{nil},
+			want:  "1=0",
+		},
+		{
+			key:   []string{"a", "b"},
+			bound: []driver.Value{int64(1), int64(2)},
+			want:  "(`a` IS NULL OR `a` < 1) OR (`a` = 1 AND (`b` IS NULL OR `b` < 2))",
+		},
+		{
+			// NULL leading bound component: only NULL rows continue into
+			// the (strict) suffix
+			key:   []string{"a", "b"},
+			bound: []driver.Value{nil, int64(2)},
+			want:  "`a` IS NULL AND (`b` IS NULL OR `b` < 2)",
+		},
+		{
+			// NULL last bound component: a row equal in the prefix with a
+			// NULL last component EQUALS the bound — the suffix is empty
+			key:   []string{"a", "b"},
+			bound: []driver.Value{int64(1), nil},
+			want:  "(`a` IS NULL OR `a` < 1) OR (`a` = 1 AND 1=0)",
+		},
+		{
+			// all-NULL composite bound: the all-NULL row is the bound
+			key:   []string{"a", "b"},
+			bound: []driver.Value{nil, nil},
+			want:  "`a` IS NULL AND 1=0",
+		},
+		{
+			// per-column literal renderers must be used verbatim
+			key:   []string{"a", "b"},
+			bound: []driver.Value{int64(1), int64(2)},
+			lits:  []LiteralFunc{func(driver.Value) string { return "X1" }, func(driver.Value) string { return "X2" }},
+			want:  "(`a` IS NULL OR `a` < X1) OR (`a` = X1 AND (`b` IS NULL OR `b` < X2))",
+		},
+	}
+	for _, tt := range tests {
+		if got := RenderLessThan(tt.key, tt.bound, tt.lits); got != tt.want {
+			t.Errorf("RenderLessThan(%v, %v) = %q, want %q", tt.key, tt.bound, got, tt.want)
+		}
+	}
+}
+
+// TestRenderGreaterThan pins the strict "key > bound" rendering (the
+// out-of-range delete's high side).
+func TestRenderGreaterThan(t *testing.T) {
+	tests := []struct {
+		key   []string
+		bound []driver.Value
+		want  string
+	}{
+		{
+			key:   []string{"a"},
+			bound: []driver.Value{int64(5)},
+			want:  "`a` > 5",
+		},
+		{
+			// all-NULL bound: every non-NULL row sits above the minimum
+			key:   []string{"a"},
+			bound: []driver.Value{nil},
+			want:  "`a` IS NOT NULL",
+		},
+		{
+			key:   []string{"a", "b"},
+			bound: []driver.Value{int64(1), int64(2)},
+			want:  "`a` > 1 OR (`a` = 1 AND `b` > 2)",
+		},
+		{
+			key:   []string{"a", "b"},
+			bound: []driver.Value{nil, int64(2)},
+			want:  "(`a` IS NULL AND `b` > 2) OR `a` IS NOT NULL",
+		},
+		{
+			// NULL last bound component: the equal-prefix all-NULL row is
+			// the bound itself and must stay out
+			key:   []string{"a", "b"},
+			bound: []driver.Value{int64(1), nil},
+			want:  "`a` > 1 OR (`a` = 1 AND `b` IS NOT NULL)",
+		},
+		{
+			// all-NULL composite bound: only the all-NULL row is excluded
+			key:   []string{"a", "b"},
+			bound: []driver.Value{nil, nil},
+			want:  "(`a` IS NULL AND `b` IS NOT NULL) OR `a` IS NOT NULL",
+		},
+	}
+	for _, tt := range tests {
+		if got := RenderGreaterThan(tt.key, tt.bound, nil); got != tt.want {
+			t.Errorf("RenderGreaterThan(%v, %v) = %q, want %q", tt.key, tt.bound, got, tt.want)
+		}
 	}
 }

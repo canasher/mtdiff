@@ -45,11 +45,14 @@ type Plan struct {
 // DecidePlan picks the strategy for one table from its comparison result.
 // It is pure (no I/O) so the decision rules are unit-testable.
 //
-// hasUsableKey is len(schema.Key) > 0 after the --key override. The FULL
-// mode is only produced without a --where filter: TRUNCATE is a whole-table
-// operation and cannot honor a filter (keyless + --where is an error
-// instead).
-func DecidePlan(res compare.TableResult, hasUsableKey bool, where string) Plan {
+// srcKeyed / dstKeyed are len(schema.Key) > 0 per side after the --key
+// override. A row-level plan targets destination rows by their key values,
+// so both sides need a usable key: with a keyless destination there are no
+// row addresses at all (and no columns to render chunk bounds against), so
+// only the full resync can converge. FULL mode is only produced without a
+// --where filter: TRUNCATE is a whole-table operation and cannot honor a
+// filter (a keyless side + --where is an error instead).
+func DecidePlan(res compare.TableResult, srcKeyed, dstKeyed bool, where string) Plan {
 	p := Plan{Table: res.Name, SrcRows: res.SrcRows, DstRows: res.DstRows}
 	switch res.Status {
 	case "OK":
@@ -60,14 +63,14 @@ func DecidePlan(res compare.TableResult, hasUsableKey bool, where string) Plan {
 		return p
 	}
 	// The table is DIFFERENT.
-	if where != "" && !hasUsableKey {
+	if where != "" && !(srcKeyed && dstKeyed) {
 		p.Mode, p.Error, p.ArgErr = ModeError,
-			"table has no usable key and --where is set: cannot sync a filtered keyless table", true
+			"no usable key on both sides and --where is set: cannot sync a keyless table with a filter", true
 		return p
 	}
 	switch {
-	case !hasUsableKey:
-		p.Mode, p.Reason = ModeFull, "no usable key: truncate + full resync"
+	case !srcKeyed || !dstKeyed:
+		p.Mode, p.Reason = ModeFull, "no usable key on both sides: truncate + full resync"
 	case res.DstRows > res.SrcRows && where == "":
 		p.Mode, p.Reason = ModeFull, "destination has more rows than source: truncate + full resync"
 	default:

@@ -57,15 +57,21 @@ const drillMaxRows = 100_000
 // was truncated to drillMaxRows: the row-level results are then a sample of
 // that many rows per side, not the exact multiset difference.
 func (d *DrillDown) Diff(ctx context.Context, src, dst *conn.Side, srcSchema, dstSchema *conn.Schema, srcNorm, dstNorm *normalize.Normalizer, ch chunk.Chunk, where string, limit int) ([]RowDiff, bool, error) {
-	srcRows, srcTrunc, err := d.scanRows(ctx, src, srcSchema, srcNorm, ch, where)
+	// Keyed matching only makes sense when both sides agree on a key.
+	// With a keyed source and a keyless destination (structure drift,
+	// --no-sync-schema) the row maps have different shapes, so buffer
+	// both sides as multisets: the key columns stay in Cols on both
+	// sides, so the canonical rows are still comparable.
+	bothKeyed := len(srcSchema.Key) > 0 && len(dstSchema.Key) > 0
+	srcRows, srcTrunc, err := d.scanRows(ctx, src, srcSchema, srcNorm, ch, where, bothKeyed)
 	if err != nil {
 		return nil, false, fmt.Errorf("src: %w", err)
 	}
-	dstRows, dstTrunc, err := d.scanRows(ctx, dst, dstSchema, dstNorm, ch, where)
+	dstRows, dstTrunc, err := d.scanRows(ctx, dst, dstSchema, dstNorm, ch, where, bothKeyed)
 	if err != nil {
 		return nil, false, fmt.Errorf("dst: %w", err)
 	}
-	if len(srcSchema.Key) > 0 {
+	if bothKeyed {
 		return d.keyedDiff(srcRows, dstRows, limit), srcTrunc || dstTrunc, nil
 	}
 	return d.multisetDiff(srcRows, dstRows, limit), srcTrunc || dstTrunc, nil
@@ -77,7 +83,7 @@ func (d *DrillDown) Diff(ctx context.Context, src, dst *conn.Side, srcSchema, ds
 // result set (closing it early would kill the dedicated pool connection,
 // which is pre-conditioned and not cheaply replaceable) but stops
 // buffering, and reports truncated=true.
-func (d *DrillDown) scanRows(ctx context.Context, side *conn.Side, schema *conn.Schema, norm *normalize.Normalizer, ch chunk.Chunk, where string) (map[string]*rowRec, bool, error) {
+func (d *DrillDown) scanRows(ctx context.Context, side *conn.Side, schema *conn.Schema, norm *normalize.Normalizer, ch chunk.Chunk, where string, keyed bool) (map[string]*rowRec, bool, error) {
 	cn, err := side.AcquireScan(ctx)
 	if err != nil {
 		return nil, false, err
@@ -124,7 +130,7 @@ func (d *DrillDown) scanRows(ctx context.Context, side *conn.Side, schema *conn.
 		}
 		return vals, true
 	}
-	out, truncated, err := d.bufferRows(keyN > 0, keyN, colN, norm, next)
+	out, truncated, err := d.bufferRows(keyed && keyN > 0, keyN, colN, norm, next)
 	if err != nil {
 		return nil, false, err
 	}

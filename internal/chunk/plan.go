@@ -57,23 +57,46 @@ func (p *Planner) integerLeadKey() bool {
 		(p.KeyFamilies[0] == conn.FamINT || p.KeyFamilies[0] == conn.FamUINT)
 }
 
-// extremes returns the first and last key value (with WHERE applied). Both
-// sides read the first/last row in key order rather than MIN/MAX: MIN and
-// MAX skip NULLs, which would drop NULL key rows (which sort first in
-// MySQL order) out of the plan.
+// Extremes returns the first and last key value in the table's key order
+// (the planner's WHERE is applied to both). Both are nil and err is nil
+// when the table has no rows. The planner must be keyed
+// (len(KeyCols) > 0).
+func (p *Planner) Extremes(ctx context.Context, db *sql.DB) ([]driver.Value, []driver.Value, error) {
+	return p.extremesMaybe(ctx, db)
+}
+
+// extremes returns the first and last key value (with WHERE applied),
+// erroring when the table holds no rows. Both sides read the first/last
+// row in key order rather than MIN/MAX: MIN and MAX skip NULLs, which
+// would drop NULL key rows (which sort first in MySQL order) out of the
+// plan.
 func (p *Planner) extremes(ctx context.Context, db *sql.DB) ([]driver.Value, []driver.Value, error) {
+	lo, hi, err := p.extremesMaybe(ctx, db)
+	if err != nil {
+		return nil, nil, err
+	}
+	if lo == nil || hi == nil {
+		return nil, nil, fmt.Errorf("empty key range in %s", p.Table)
+	}
+	return lo, hi, nil
+}
+
+// extremesMaybe reads the first and last key row in key order (see
+// extremes for why not MIN/MAX), returning (nil, nil, nil) instead of an
+// error when the table holds no rows.
+func (p *Planner) extremesMaybe(ctx context.Context, db *sql.DB) ([]driver.Value, []driver.Value, error) {
 	where := p.whereClause()
 	lo, err := p.keyRow(ctx, db, "ASC", where)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return nil, nil, fmt.Errorf("empty key range in %s", p.Table)
+			return nil, nil, nil
 		}
 		return nil, nil, err
 	}
 	hi, err := p.keyRow(ctx, db, "DESC", where)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return nil, nil, fmt.Errorf("empty key range in %s", p.Table)
+			return nil, nil, nil
 		}
 		return nil, nil, err
 	}
@@ -93,23 +116,36 @@ func keyOrder(idents []string, dir string) string {
 	return strings.Join(parts, ", ")
 }
 
+// keyRow returns the first/last row in key order as driver values.
 func (p *Planner) keyRow(ctx context.Context, db *sql.DB, dir, where string) ([]driver.Value, error) {
 	idents := p.keyIdents()
-	var vals []driver.Value
+	// Scan into []any, not []driver.Value: database/sql cannot store a NULL
+	// into a *driver.Value ("unsupported Scan"), and a key row may
+	// legitimately be all-NULL (an explicit --key on a nullable column).
+	dest := make([]any, len(p.KeyCols))
+	ptrs := make([]any, len(p.KeyCols))
+	for i := range dest {
+		ptrs[i] = &dest[i]
+	}
 	err := db.QueryRowContext(ctx,
 		fmt.Sprintf("SELECT %s FROM %s%s ORDER BY %s LIMIT 1",
 			strings.Join(idents, ", "), ident(p.Table), where, keyOrder(idents, dir))).
-		Scan(p.scanDest(&vals)...)
-	return vals, err
+		Scan(ptrs...)
+	if err != nil {
+		return nil, err
+	}
+	return toDriverValues(dest), nil
 }
 
-func (p *Planner) scanDest(dst *[]driver.Value) []any {
-	*dst = make([]driver.Value, len(p.KeyCols))
-	ptrs := make([]any, len(p.KeyCols))
-	for i := range *dst {
-		ptrs[i] = &(*dst)[i]
+// toDriverValues converts a []any scan result to []driver.Value: the
+// dynamic types are driver values either way (database/sql delivers them
+// as driver values inside the any), and a nil stays a nil.
+func toDriverValues(dest []any) []driver.Value {
+	out := make([]driver.Value, len(dest))
+	for i, v := range dest {
+		out[i] = v
 	}
-	return ptrs
+	return out
 }
 
 func (p *Planner) keyIdents() []string {
@@ -244,18 +280,23 @@ func (p *Planner) sample(ctx context.Context, db *sql.DB, lo, hi []driver.Value,
 	if pred != "" {
 		where = " WHERE " + pred
 	}
-	var vals []driver.Value
+	// []any scan destinations: see keyRow for why not []driver.Value.
+	dest := make([]any, len(p.KeyCols))
+	ptrs := make([]any, len(p.KeyCols))
+	for i := range dest {
+		ptrs[i] = &dest[i]
+	}
 	err := db.QueryRowContext(ctx,
 		fmt.Sprintf("SELECT %s FROM %s%s ORDER BY %s LIMIT 1 OFFSET %d",
 			strings.Join(p.keyIdents(), ", "), ident(p.Table), where, strings.Join(p.keyIdents(), ", "), off)).
-		Scan(p.scanDest(&vals)...)
+		Scan(ptrs...)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	return vals, nil
+	return toDriverValues(dest), nil
 }
 
 // Scanner streams one chunk row by row and folds rows into a chunk digest.

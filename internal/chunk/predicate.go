@@ -94,7 +94,7 @@ func (c Chunk) Predicate(keyCols []string, extraWhere string) string {
 			case len(keyCols) == 1:
 				parts = append(parts, fmt.Sprintf("%s %s %s", ident(keyCols[0]), op, Literal(c.Lo[0])))
 			default:
-				parts = append(parts, "("+rowCompare(keyCols, c.Lo, op)+")")
+				parts = append(parts, "("+rowCompare(keyCols, c.Lo, op, Literal)+")")
 			}
 		}
 		if c.Hi != nil {
@@ -108,7 +108,7 @@ func (c Chunk) Predicate(keyCols []string, extraWhere string) string {
 			case len(keyCols) == 1:
 				parts = append(parts, fmt.Sprintf("%s <= %s", ident(keyCols[0]), Literal(c.Hi[0])))
 			default:
-				parts = append(parts, "("+rowCompare(keyCols, c.Hi, "<=")+")")
+				parts = append(parts, "("+rowCompare(keyCols, c.Hi, "<=", Literal)+")")
 			}
 		}
 	}
@@ -132,7 +132,7 @@ func (c Chunk) Predicate(keyCols []string, extraWhere string) string {
 // non-NULL value", and a NULL upper bound means "this column is NULL and
 // the suffix is at/below". Plain comparisons cannot express that: k > NULL
 // is always UNKNOWN, which would silently exclude every row.
-func rowCompare(cols []string, vals []driver.Value, op string) string {
+func rowCompare(cols []string, vals []driver.Value, op string, lit LiteralFunc) string {
 	lower := op == ">" || op == ">="
 	var term func(i int) string
 	term = func(i int) string {
@@ -157,15 +157,105 @@ func rowCompare(cols []string, vals []driver.Value, op string) string {
 				return fmt.Sprintf("%s IS NULL AND %s", col, term(i+1))
 			}
 		}
-		lit := Literal(v)
+		litV := lit(v)
 		if last {
-			return fmt.Sprintf("%s %s %s", col, op, lit)
+			return fmt.Sprintf("%s %s %s", col, op, litV)
 		}
 		strict := ">"
 		if !lower {
 			strict = "<"
 		}
-		return fmt.Sprintf("%s %s %s OR (%s = %s AND %s)", col, strict, lit, col, lit, term(i+1))
+		return fmt.Sprintf("%s %s %s OR (%s = %s AND %s)", col, strict, litV, col, litV, term(i+1))
+	}
+	return term(0)
+}
+
+// LiteralFunc renders one raw driver value as a SQL literal. Literal is the
+// type-agnostic default; callers with per-column metadata (e.g. column
+// families) supply a family-aware function.
+type LiteralFunc func(v driver.Value) string
+
+// RenderLessThan renders the NULL-safe lexicographic "key < bound"
+// predicate for a (possibly composite) key: every row strictly below the
+// bound in MySQL key order (NULLs sort first). bound has one component per
+// key column; lits holds one literal renderer per key column (a nil entry
+// falls back to Literal). A single-column all-NULL bound renders "1=0":
+// the all-NULL row is the minimum, nothing sits below it.
+func RenderLessThan(keyCols []string, bound []driver.Value, lits []LiteralFunc) string {
+	return strictCompare(keyCols, bound, true, litAt(lits))
+}
+
+// RenderGreaterThan renders the NULL-safe "key > bound" predicate, the
+// strict complement of RenderLessThan: every row strictly above the bound.
+// A single-column all-NULL bound renders "col IS NOT NULL" (every non-NULL
+// row sits above the all-NULL minimum); a composite all-NULL bound excludes
+// only the all-NULL row itself.
+func RenderGreaterThan(keyCols []string, bound []driver.Value, lits []LiteralFunc) string {
+	return strictCompare(keyCols, bound, false, litAt(lits))
+}
+
+func litAt(lits []LiteralFunc) func(i int) LiteralFunc {
+	return func(i int) LiteralFunc {
+		if i < len(lits) && lits[i] != nil {
+			return lits[i]
+		}
+		return Literal
+	}
+}
+
+// strictCompare expands a STRICT lexicographic row comparison into column
+// terms, the shape Chunk.Predicate cannot express (a chunk is a closed
+// interval; "outside [min, max]" is the disjunction of two open tails):
+//
+//	"key < bound":  k1 < w1 OR (k1 = w1 AND k2 < w2 OR (...))
+//	"key > bound":  k1 > v1 OR (k1 = v1 AND k2 > v2 OR (...))
+//
+// Inner columns always use the strict operator; only the last column may
+// meet the bound. It is a sibling of rowCompare, not a reuse of it: the
+// inclusive upper-side NULL branches (k IS NULL) would include the bound
+// row itself, which a strict comparison must exclude.
+//
+// NULL bound components (nullable key columns) get their own terms: MySQL
+// orders NULLs before any value, so a NULL lower component keeps only the
+// NULL rows (plus the suffix), and a NULL upper component keeps only the
+// NULL rows of the equal prefix (the all-NULL row being the bound itself).
+func strictCompare(cols []string, bound []driver.Value, less bool, litAt func(i int) LiteralFunc) string {
+	var term func(i int) string
+	term = func(i int) string {
+		col := ident(cols[i])
+		v := bound[i]
+		last := i == len(cols)-1
+		if v == nil {
+			switch {
+			case less && last:
+				// the all-NULL (prefix) row IS the bound: nothing is
+				// strictly below it.
+				return "1=0"
+			case less:
+				// with the equal prefix only NULL rows continue into
+				// the suffix (they sort below the bound's value there).
+				return fmt.Sprintf("%s IS NULL AND %s", col, term(i+1))
+			case last:
+				// the all-NULL (prefix) row is the bound itself: every
+				// non-NULL row sits above it.
+				return fmt.Sprintf("%s IS NOT NULL", col)
+			default:
+				return fmt.Sprintf("(%s IS NULL AND %s) OR %s IS NOT NULL", col, term(i+1), col)
+			}
+		}
+		lit := litAt(i)(v)
+		if less {
+			// NULL rows sort below the bound value; a plain "col < lit"
+			// is UNKNOWN for them and would silently miss them.
+			if last {
+				return fmt.Sprintf("(%s IS NULL OR %s < %s)", col, col, lit)
+			}
+			return fmt.Sprintf("(%s IS NULL OR %s < %s) OR (%s = %s AND %s)", col, col, lit, col, lit, term(i+1))
+		}
+		if last {
+			return fmt.Sprintf("%s > %s", col, lit)
+		}
+		return fmt.Sprintf("%s > %s OR (%s = %s AND %s)", col, lit, col, lit, term(i+1))
 	}
 	return term(0)
 }
