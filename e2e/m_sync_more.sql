@@ -1,5 +1,6 @@
--- t_mut: dst gains 500 extra rows (999 vs 1499) -> sync must take the
--- TRUNCATE + full resync path (destination has more rows than source).
+-- t_mut: dst gains 499 extra rows (id 5001..5499, 1498 vs 999) -> the
+-- extra rows are addressed by their key and deleted one by one (row-level).
+-- The row counts never decide the mode: no TRUNCATE, no full resync.
 SET time_zone = '+00:00';
 SET SESSION cte_max_recursion_depth = 1000000;
 DROP TABLE IF EXISTS t_mut;

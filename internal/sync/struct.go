@@ -256,6 +256,41 @@ func indexKey(cols []string) string {
 	return strings.ToLower(strings.Join(cols, "\x00"))
 }
 
+// UsableKeyOf picks the key an introspected structure offers for chunking,
+// with the same rule as conn.SelectKey: the primary key first, then the
+// first unique index whose columns are all NOT NULL (a unique index on a
+// nullable column cannot address rows reliably). nil when no usable key
+// exists. The structure-sync path uses it to decide whether a repaired
+// (re-created) table can go back to row-level sync.
+func UsableKeyOf(s *conn.Struct) []string {
+	nullable := make(map[string]bool, len(s.Cols))
+	for _, c := range s.Cols {
+		nullable[c.Name] = c.Nullable
+	}
+	var uniques []conn.Index
+	for _, ix := range s.Indexes {
+		if ix.Name == "PRIMARY" {
+			return ix.Cols
+		}
+		if ix.Unique {
+			uniques = append(uniques, ix)
+		}
+	}
+	for _, ix := range uniques {
+		allNotNULL := true
+		for _, c := range ix.Cols {
+			if nullable[c] {
+				allNotNULL = false
+				break
+			}
+		}
+		if allNotNULL {
+			return ix.Cols
+		}
+	}
+	return nil
+}
+
 // RenderDDL renders the changes as DDL for the destination table:
 // normally one ALTER TABLE with all clauses. InnoDB executes it atomically
 // (all-or-nothing), so a failure never leaves a half-migrated structure;
@@ -339,16 +374,28 @@ func RenderDDL(table string, changes []Change) []string {
 }
 
 // renderColDef re-emits a source column definition for use in ADD/MODIFY
-// COLUMN. The default is re-emitted verbatim: information_schema stores
-// defaults as declared (0, 'x', CURRENT_TIMESTAMP), so round-tripping the
-// text is faithful. The comment is carried along even though it is not
-// diffed, so a re-defined column keeps the source's comment instead of
-// silently losing it.
+// COLUMN and CREATE TABLE. The default is re-emitted verbatim:
+// information_schema stores defaults as declared (0, 'x', CURRENT_TIMESTAMP),
+// so round-tripping the text is faithful. The comment is carried along even
+// though it is not diffed, so a re-defined column keeps the source's comment
+// instead of silently losing it.
+//
+// Clause order follows the server grammar: CHARACTER SET / COLLATE attach
+// directly to the data type and must precede NOT NULL (the server rejects
+// "varchar(16) NOT NULL CHARACTER SET …"), while COMMENT comes last.
 func renderColDef(c conn.ColMeta) string {
 	var b strings.Builder
 	b.WriteString(conn.QuoteIdent(c.Name))
 	b.WriteByte(' ')
 	b.WriteString(c.RawType)
+	if c.Charset != "" {
+		b.WriteString(" CHARACTER SET ")
+		b.WriteString(c.Charset)
+		if c.Collation != "" {
+			b.WriteString(" COLLATE ")
+			b.WriteString(c.Collation)
+		}
+	}
 	if !c.Nullable {
 		b.WriteString(" NOT NULL")
 	}
@@ -361,14 +408,6 @@ func renderColDef(c conn.ColMeta) string {
 	}
 	if c.AutoInc {
 		b.WriteString(" AUTO_INCREMENT")
-	}
-	if c.Charset != "" {
-		b.WriteString(" CHARACTER SET ")
-		b.WriteString(c.Charset)
-		if c.Collation != "" {
-			b.WriteString(" COLLATE ")
-			b.WriteString(c.Collation)
-		}
 	}
 	if c.Comment != "" {
 		b.WriteString(" COMMENT ")
@@ -414,4 +453,57 @@ func quoteSQLString(s string) string {
 	s = strings.ReplaceAll(s, `\`, `\\`)
 	s = strings.ReplaceAll(s, "'", "''")
 	return "'" + s + "'"
+}
+
+// RenderCreateTable renders a CREATE TABLE statement that reproduces the
+// source structure on the destination: the columns (in source order, via
+// the same definition renderer the ALTER path uses), the primary key and
+// the unique indexes. The optional table options carry the source's
+// storage engine and — when the source's next AUTO_INCREMENT value is
+// known — the table's starting auto-increment counter, so a freshly
+// created table already converges on the auto-increment state (see the
+// table-state reconciliation). hasAutoInc is false when the source table
+// has no auto-increment column (information_schema reports NULL): in that
+// case no AUTO_INCREMENT option is emitted (a bare value would be
+// meaningless).
+func RenderCreateTable(table string, s *conn.Struct, engine string, autoInc int64, hasAutoInc bool) string {
+	var b strings.Builder
+	b.WriteString("CREATE TABLE " + conn.QuoteIdent(table) + " (\n")
+	lines := make([]string, 0, len(s.Cols)+len(s.Indexes))
+	for _, c := range s.Cols {
+		lines = append(lines, "  "+renderColDef(c))
+	}
+	for _, ix := range s.Indexes {
+		cols := make([]string, len(ix.Cols))
+		for i, c := range ix.Cols {
+			cols[i] = conn.QuoteIdent(c)
+		}
+		list := "(" + strings.Join(cols, ", ") + ")"
+		if ix.Name == "PRIMARY" {
+			lines = append(lines, "  PRIMARY KEY "+list)
+		} else {
+			lines = append(lines, "  UNIQUE KEY "+conn.QuoteIdent(ix.Name)+" "+list)
+		}
+	}
+	b.WriteString(strings.Join(lines, ",\n"))
+	b.WriteString("\n)")
+	if engine != "" {
+		b.WriteString(" ENGINE=" + engine)
+	}
+	if hasAutoInc {
+		fmt.Fprintf(&b, " AUTO_INCREMENT=%d", autoInc)
+	}
+	b.WriteString(";")
+	return b.String()
+}
+
+// DestructiveDDL reports whether a DDL statement is irreversible or
+// lossy: it drops data (DROP TABLE, DROP COLUMN) or removes a constraint
+// (DROP PRIMARY KEY, DROP INDEX). The confirmation summary and the dry-run
+// report must surface these separately from the rest, because they are the
+// statements an operator would most want to see before an --apply.
+func DestructiveDDL(stmt string) bool {
+	u := strings.ToUpper(stmt)
+	return strings.Contains(u, "DROP TABLE") || strings.Contains(u, "DROP COLUMN") ||
+		strings.Contains(u, "DROP PRIMARY KEY") || strings.Contains(u, "DROP INDEX")
 }

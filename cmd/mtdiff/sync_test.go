@@ -1,12 +1,14 @@
 package mtdiff
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/spf13/cobra"
 
 	"mtdiff/internal/config"
+	msync "mtdiff/internal/sync"
 )
 
 // newSyncCommand builds a command carrying the sync flags with all values
@@ -43,6 +45,75 @@ func TestConfirmDecision(t *testing.T) {
 		if got := confirmDecision(c.apply, c.yes, c.tty); got != c.want {
 			t.Errorf("confirmDecision(apply=%v, yes=%v, tty=%v) = %v, want %v",
 				c.apply, c.yes, c.tty, got, c.want)
+		}
+	}
+}
+
+// TestSyncTableSets covers the whole-database table discovery: the sync
+// set is the source's base tables minus the excluded ones, and the extras
+// are the destination's tables the source lacks (which plan a DROP TABLE)
+// — unless drops are disallowed (--where), or the table is excluded.
+func TestSyncTableSets(t *testing.T) {
+	src := []string{"a", "b", "c"}
+	dst := []string{"a", "c", "x", "y"}
+
+	tables, extra := syncTableSets(src, dst, nil, true)
+	if len(tables) != 3 || tables[0] != "a" || tables[2] != "c" {
+		t.Errorf("sync set = %v, want [a b c]", tables)
+	}
+	if len(extra) != 2 || extra[0] != "x" || extra[1] != "y" {
+		t.Errorf("extras = %v, want [x y]", extra)
+	}
+
+	// exclusions remove from BOTH sets: an excluded dst-only table is
+	// neither synced nor dropped
+	tables, extra = syncTableSets(src, dst, []string{"b", "x"}, true)
+	if len(tables) != 2 || tables[0] != "a" || tables[1] != "c" {
+		t.Errorf("excluded: sync set = %v, want [a c]", tables)
+	}
+	if len(extra) != 1 || extra[0] != "y" {
+		t.Errorf("excluded: extras = %v, want [y]", extra)
+	}
+
+	// a dst-only table is NOT extra when the source has it (same name)
+	tables, extra = syncTableSets([]string{"a"}, []string{"a", "z"}, nil, true)
+	if len(tables) != 1 || len(extra) != 1 || extra[0] != "z" {
+		t.Errorf("same-name = %v extras = %v, want one table, extra z", tables, extra)
+	}
+
+	// drops disallowed (--where): no extras even with dst-only tables
+	tables, extra = syncTableSets(src, dst, nil, false)
+	if len(tables) != 3 || extra != nil {
+		t.Errorf("no drops: tables = %v extras = %v, want 3 tables, no extras", tables, extra)
+	}
+
+	// both sides empty
+	tables, extra = syncTableSets(nil, nil, nil, true)
+	if tables != nil || extra != nil {
+		t.Errorf("empty: tables = %v extras = %v, want none", tables, extra)
+	}
+}
+
+// TestAllSkipWithNewModes pins that a CREATE, DROP, STATE, FULL or
+// ROWLEVEL plan (not just a data op) means "something would be written":
+// the apply gate must prompt and open the write connection.
+func TestAllSkipWithNewModes(t *testing.T) {
+	skip := func(modes ...string) bool {
+		plans := make([]msync.TableSync, len(modes))
+		for i, m := range modes {
+			plans[i] = msync.TableSync{Name: fmt.Sprintf("t%d", i), Mode: m, Status: "PLANNED"}
+		}
+		return allSkip(plans)
+	}
+	if skip() {
+		t.Error("an empty plan list is not all-skip (there is nothing to confirm)")
+	}
+	if !skip("SKIP", "SKIP") {
+		t.Error("all SKIP must be all-skip")
+	}
+	for _, mode := range []string{"CREATE", "DROP", "STATE", "FULL", "ROWLEVEL", "ERROR"} {
+		if skip("SKIP", mode) {
+			t.Errorf("a %s plan must not be all-skip", mode)
 		}
 	}
 }

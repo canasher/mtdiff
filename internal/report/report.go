@@ -136,11 +136,35 @@ func SyncText(w io.Writer, applied bool, res []msync.TableSync) {
 		for _, s := range r.SchemaSQL {
 			fmt.Fprintf(w, "  DDL: %s\n", s)
 		}
+		for _, s := range r.StateSQL {
+			fmt.Fprintf(w, "  STATE: %s\n", s)
+		}
+		if len(r.StateSQL) == 0 && r.StateNote != "" {
+			fmt.Fprintf(w, "  STATE: %s\n", r.StateNote)
+		}
 		for _, s := range r.SampleSQL {
 			fmt.Fprintf(w, "  %s\n", s)
 		}
 	}
-	var need, failed, appliedN, verifiedOK int
+	// Destructive statements are listed in their own section: they are the
+	// irreversible ones (DROP TABLE, DROP COLUMN, DROP PRIMARY KEY, DROP
+	// INDEX) an operator must see before an --apply, not hidden among the
+	// rest of the DDL.
+	var destructive [][2]string
+	for _, r := range res {
+		for _, s := range r.SchemaSQL {
+			if msync.DestructiveDDL(s) {
+				destructive = append(destructive, [2]string{r.Name, s})
+			}
+		}
+	}
+	if len(destructive) > 0 {
+		fmt.Fprintf(w, "DESTRUCTIVE CHANGES: %d irreversible statement(s) (drop data or constraints):\n", len(destructive))
+		for _, d := range destructive {
+			fmt.Fprintf(w, "  %s: %s\n", d[0], d[1])
+		}
+	}
+	var need, failed, appliedN, verifiedOK, stateBad, stateUnfixable int
 	for _, r := range res {
 		switch r.Status {
 		case "PLANNED":
@@ -153,6 +177,12 @@ func SyncText(w io.Writer, applied bool, res []msync.TableSync) {
 				verifiedOK++
 			}
 		}
+		if r.StateVerified == "DIFFERENT" {
+			stateBad++
+			if r.StateNote != "" {
+				stateUnfixable++
+			}
+		}
 	}
 	if applied {
 		switch {
@@ -162,6 +192,12 @@ func SyncText(w io.Writer, applied bool, res []msync.TableSync) {
 		case appliedN > 0 && verifiedOK < appliedN:
 			fmt.Fprintf(w, "RESULT: %d table(s) synced but only %d verified identical (re-run mtdiff diff to inspect)\n",
 				appliedN, verifiedOK)
+		case stateBad > 0 && stateUnfixable > 0:
+			fmt.Fprintf(w, "RESULT: %d table(s) synced but %d table state(s) (AUTO_INCREMENT) did not converge; %d cannot be fixed by a row-level sync (a full resync realigns them)\n",
+				appliedN, stateBad, stateUnfixable)
+		case stateBad > 0:
+			fmt.Fprintf(w, "RESULT: %d table(s) synced but %d table state(s) (AUTO_INCREMENT) did not converge (re-run to converge)\n",
+				appliedN, stateBad)
 		case appliedN > 0:
 			fmt.Fprintf(w, "RESULT: all %d synced table(s) verified identical\n", appliedN)
 		default:
@@ -192,6 +228,15 @@ func syncDetail(r msync.TableSync) string {
 		return aligned + "truncate + full resync"
 	case "ROWLEVEL":
 		return fmt.Sprintf("row-level: %d insert, %d update, %d delete", r.Inserts, r.Updates, r.Deletes)
+	case "CREATE":
+		return "create table + data sync"
+	case "DROP":
+		return "drop table (destination-only, not in source)"
+	case "STATE":
+		if r.StateNote != "" {
+			return "state diverged, not fixable by a row-level sync (see STATE line)"
+		}
+		return "realign the next AUTO_INCREMENT value"
 	case "SKIP":
 		if r.SchemaChanged {
 			return "structure aligned"
@@ -203,7 +248,8 @@ func syncDetail(r msync.TableSync) string {
 
 // SyncJSON writes a machine-readable sync report. "ok" is true when the run
 // is clean: in a dry-run, no table needs sync (and none errored); after an
-// apply, nothing failed and every synced table verified identical.
+// apply, nothing failed, every synced table verified identical, and no
+// synced table's state (AUTO_INCREMENT) left un-converged.
 func SyncJSON(w io.Writer, applied bool, res []msync.TableSync) {
 	ok := true
 	tables := make([]map[string]any, 0, len(res))
@@ -212,29 +258,45 @@ func SyncJSON(w io.Writer, applied bool, res []msync.TableSync) {
 			if r.Status == "PLANNED" || r.Status == "FAILED" {
 				ok = false
 			}
-		} else if r.Status == "FAILED" || (r.Verified != "" && r.Verified != "OK") {
+		} else if r.Status == "FAILED" ||
+			(r.Verified != "" && r.Verified != "OK") ||
+			r.StateVerified == "DIFFERENT" {
 			ok = false
 		}
 		sample := make([]string, 0, len(r.SampleSQL))
 		sample = append(sample, r.SampleSQL...)
 		schema := make([]string, 0, len(r.SchemaSQL))
 		schema = append(schema, r.SchemaSQL...)
+		state := make([]string, 0, len(r.StateSQL))
+		state = append(state, r.StateSQL...)
+		// the irreversible DDL, called out on its own (see SyncText)
+		var destructive []string
+		for _, s := range schema {
+			if msync.DestructiveDDL(s) {
+				destructive = append(destructive, s)
+			}
+		}
 		tables = append(tables, map[string]any{
-			"name":           r.Name,
-			"mode":           r.Mode,
-			"src_rows":       r.SrcRows,
-			"dst_rows":       r.DstRows,
-			"inserts":        r.Inserts,
-			"updates":        r.Updates,
-			"deletes":        r.Deletes,
-			"chunks":         r.Chunks,
-			"truncated":      r.Truncated,
-			"status":         r.Status,
-			"error":          r.Error,
-			"verified":       r.Verified,
-			"sample_sql":     sample,
-			"schema_changed": r.SchemaChanged,
-			"schema_sql":     schema,
+			"name":            r.Name,
+			"mode":            r.Mode,
+			"src_rows":        r.SrcRows,
+			"dst_rows":        r.DstRows,
+			"inserts":         r.Inserts,
+			"updates":         r.Updates,
+			"deletes":         r.Deletes,
+			"chunks":          r.Chunks,
+			"truncated":       r.Truncated,
+			"status":          r.Status,
+			"error":           r.Error,
+			"verified":        r.Verified,
+			"sample_sql":      sample,
+			"schema_changed":  r.SchemaChanged,
+			"schema_sql":      schema,
+			"destructive_sql": destructive,
+			"state_changed":   r.StateChanged,
+			"state_sql":       state,
+			"state_note":      r.StateNote,
+			"state_verified":  r.StateVerified,
 		})
 	}
 	out := map[string]any{

@@ -23,9 +23,12 @@ docker compose version >/dev/null 2>&1 || COMPOSE="docker-compose"
 
 MTDIFF=bin/mtdiff
 [ -x "$MTDIFF" ] || { echo "build first: make build"; exit 1; }
-OUT=/tmp/mtdiff-compat.out
 CLIENT=mysql:8.0
 BACKEND=${1:?usage: run_compat.sh 57|tidb}
+# per-backend report file: the 5.7 and TiDB suites can run in parallel
+# (distinct compose projects), and a shared file would race — one suite's
+# expect() truncating the other's report mid-scenario
+OUT=/tmp/mtdiff-compat-$BACKEND.out
 EXTRA=  # per-backend extra mtdiff flags (unset backends: none)
 
 if [ "$BACKEND" = "57" ]; then
@@ -305,6 +308,84 @@ expect 0 "key drift: default sync --apply" sync --src "$SRC" --dst "$DST" --tabl
 expect 0 "diff identical after default sync" --src "$SRC" --dst "$DST" --tables t_keyless
 check "$(qdst "SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 't_keyless' AND INDEX_NAME = 'PRIMARY'")" 1 \
   "dst PRIMARY key restored by default sync"
+
+say "compat whole-database sync (create / drop / state)"
+# Whole-database mode (no --tables): the expected set is the source's BASE
+# TABLE set; a table the destination lacks is created, a table the source
+# lacks is dropped.
+expect 0 "whole-DB sync: nothing to do (identical table set)" sync --src "$SRC" --dst "$DST"
+# (a) a source-only table is created on the destination.
+sql "$SRC_P" "$SRC_PWD" srcdb m_c2_src.sql
+expect 1 "source-only table: create planned (dry-run)" sync --src "$SRC" --dst "$DST"
+if ! grep -q 'CREATE TABLE `t_c2`' "$OUT"; then
+  echo "FAIL: no CREATE TABLE for the missing table"; cat "$OUT"; exit 1
+fi
+echo "ok: dry-run shows the CREATE TABLE"
+check "$(qdst "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA='dstdb' AND TABLE_NAME='t_c2'")" 0 \
+  "the create dry-run is zero-write"
+expect 0 "source-only table: --apply creates it" sync --src "$SRC" --dst "$DST" --apply --yes
+check "$(qdst "SELECT COUNT(*) FROM t_c2")" 10 "created table carries the source data"
+expect 0 "re-run after create: nothing to do" sync --src "$SRC" --dst "$DST"
+# (b) a destination-only table is dropped (destructive, listed separately).
+sql "$DST_P" "$DST_PWD" dstdb m_c_extra.sql
+expect 1 "destination-only table: DROP planned (dry-run)" sync --src "$SRC" --dst "$DST"
+if ! grep -q 'DROP TABLE IF EXISTS `t_c_extra`' "$OUT"; then
+  echo "FAIL: no DROP TABLE for the extra table"; cat "$OUT"; exit 1
+fi
+echo "ok: dry-run plans the DROP TABLE"
+if ! grep -q 'DESTRUCTIVE' "$OUT"; then
+  echo "FAIL: the destructive change is not listed separately"; cat "$OUT"; exit 1
+fi
+echo "ok: the destructive change is listed separately"
+check "$(qdst "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA='dstdb' AND TABLE_NAME='t_c_extra'")" 1 \
+  "the drop dry-run is zero-write"
+expect 0 "destination-only table: --apply drops it" sync --src "$SRC" --dst "$DST" --apply --yes
+check "$(qdst "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA='dstdb' AND TABLE_NAME='t_c_extra'")" 0 \
+  "extra table dropped"
+expect 0 "re-run after drop: nothing to do" sync --src "$SRC" --dst "$DST"
+# (c) --tables never drops out-of-scope tables.
+sql "$DST_P" "$DST_PWD" dstdb m_c_extra.sql
+expect 0 "--tables --apply: out-of-scope table survives" sync --src "$SRC" --dst "$DST" --tables t_compat --apply --yes
+check "$(qdst "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA='dstdb' AND TABLE_NAME='t_c_extra'")" 1 \
+  "--tables spares out-of-scope tables"
+# (d) table state (AUTO_INCREMENT) convergence, capability-gated: the
+# seed pins both sides' counters to a common explicit base, the source
+# counter is then pushed to 5001, and the destination's must be raised
+# to match (a plain raise on every backend). Two capability gates mirror
+# the binary's own probes: a backend whose information_schema lacks a
+# readable AUTO_INCREMENT column degrades to a skipped reconciliation,
+# and a backend that pre-allocates ID ranges (TiDB's batch allocator:
+# the reported next value sits tens of thousands above max(id), and an
+# explicit value below the allocated range's end is silently ignored)
+# degrades the same way — both are one-shot warnings, never a failure.
+# The scenario is skipped, not faked.
+sql "$SRC_P" "$SRC_PWD" srcdb m_cai_src.sql
+set +e
+ai_is=$(qdst "SELECT AUTO_INCREMENT FROM information_schema.TABLES WHERE TABLE_SCHEMA='dstdb' AND TABLE_NAME='t_cai'" 2>/dev/null)
+ai_sh=$(qdst "SHOW CREATE TABLE t_cai\G" 2>/dev/null | grep -oE 'AUTO_INCREMENT=[0-9]+' | head -n1 | cut -d= -f2)
+mx=$(qdst "SELECT COALESCE(MAX(id), 0) + 1 FROM t_cai" 2>/dev/null)
+set -e
+ai_val=$ai_sh
+[ -n "$ai_val" ] || ai_val=$ai_is
+if [ -z "$ai_is" ]; then
+  echo "skip: backend information_schema has no readable AUTO_INCREMENT (state reconciliation degrades to skipped)"
+  expect 0 "state unreadable: the sync still runs clean" sync --src "$SRC" --dst "$DST" --apply --yes
+elif [ -n "$ai_val" ] && [ -n "$mx" ] && [ $((ai_val - mx)) -gt 10000 ]; then
+  echo "skip: backend pre-allocates auto-increment ID ranges (reported next value $ai_val vs data max+1 $mx); state reconciliation degrades to skipped"
+  expect 0 "state inexact: the sync still runs clean" sync --src "$SRC" --dst "$DST" --apply --yes
+else
+  expect 1 "state drift: AUTO_INCREMENT planned (dry-run)" sync --src "$SRC" --dst "$DST"
+  if ! grep -q 'ALTER TABLE `t_cai` AUTO_INCREMENT = ' "$OUT"; then
+    echo "FAIL: no AUTO_INCREMENT alignment planned"; cat "$OUT"; exit 1
+  fi
+  echo "ok: dry-run shows the AUTO_INCREMENT alignment"
+  expect 0 "state drift: --apply realigns the counter" sync --src "$SRC" --dst "$DST" --apply --yes
+  # read the true value (the SHOW CREATE clause): InnoDB's information_schema
+  # estimate is not refreshed after a second counter change, so assert on
+  # the value the server actually persists.
+  check "$(qdst "SHOW CREATE TABLE t_cai\G" | grep -oE 'AUTO_INCREMENT=[0-9]+' | head -n1 | cut -d= -f2)" 5001 \
+    "t_cai AUTO_INCREMENT realigned to the source's 5001"
+fi
 
 E2E_OK=1
 say "ALL $BACKEND COMPAT SCENARIOS PASSED"

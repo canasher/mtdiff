@@ -36,8 +36,12 @@ type Options struct {
 
 // TableSync is the per-table outcome of a sync run.
 type TableSync struct {
-	Name      string
-	Mode      string // "SKIP" | "FULL" | "ROWLEVEL" | "ERROR"
+	Name string
+	// Mode is the strategy: "SKIP" | "FULL" | "ROWLEVEL" | "ERROR" |
+	// "CREATE" (the destination table is missing and is created) |
+	// "DROP" (a destination-only table is dropped, whole-database mode) |
+	// "STATE" (only the table state, AUTO_INCREMENT, is realigned).
+	Mode      string
 	SrcRows   int64
 	DstRows   int64
 	Inserts   int
@@ -47,7 +51,8 @@ type TableSync struct {
 	Truncated bool
 	SampleSQL []string
 	// SchemaChanged is set when the destination's structure drifted from
-	// the source's and the DDL below aligns it before the data sync.
+	// the source's and the DDL below aligns it before the data sync (or
+	// the table is created / dropped, which is structure work too).
 	SchemaChanged bool
 	SchemaSQL     []string
 	Status        string // "SKIPPED" | "PLANNED" | "APPLIED" | "FAILED"
@@ -59,6 +64,19 @@ type TableSync struct {
 	// Verified is the post-sync verification status for tables that were
 	// synced: "OK" | "DIFFERENT" | "ERROR" ("" when not synced).
 	Verified string
+	// StateChanged is set when the table state (the next AUTO_INCREMENT
+	// value) drifted from the source's and the DDL below realigns it.
+	StateChanged bool
+	StateSQL     []string
+	// StateNote reports a table-state divergence no ALTER can fix
+	// (the destination's counter is above the source's — a counter can
+	// only be raised): no statement is planned, the run reports and
+	// exits non-zero.
+	StateNote string
+	// StateVerified is the post-apply table-state check: "OK" |
+	// "DIFFERENT" ("" when out of scope, e.g. --where or a source without
+	// an auto-increment column).
+	StateVerified string
 }
 
 // errEscalateFull signals that a ROWLEVEL plan went stale (the pre-pass
@@ -82,7 +100,24 @@ type Runner struct {
 	sdOnce sync.Once
 	sdSrc  string
 	sdDst  string
+	// aiWarned warns once per run when the AUTO_INCREMENT state cannot be
+	// read (a backend without the column): the table-state reconciliation
+	// degrades to skipped, never to a failed run.
+	aiWarned sync.Once
+	// stateGapOnce / stateExact cache the one-shot capability probe
+	// (stateReconcilable): backends that pre-allocate auto-increment ID
+	// ranges (an allocator, e.g. TiDB's batch allocation) report an
+	// estimate, not the exact next value — the table-state
+	// reconciliation degrades to skipped there too.
+	stateGapOnce sync.Once
+	stateExact   bool
 }
+
+// stateGapLimit: the largest distance a side's reported next
+// AUTO_INCREMENT value may sit above max(column)+1 before the backend is
+// taken to pre-allocate ID ranges (an allocator, e.g. TiDB) and the
+// reported value is not an exact next value.
+const stateGapLimit = 10000
 
 func NewRunner(src, dst *conn.Side, o Options) *Runner {
 	if o.Cmp.Progress == nil {
@@ -109,6 +144,184 @@ func (r *Runner) sideDefaultCollations(ctx context.Context) (src, dst string) {
 // PrePass runs the (read-only) comparison over the given tables.
 func (r *Runner) PrePass(ctx context.Context, tables []string) ([]compare.TableResult, error) {
 	return r.cmp.Compare(ctx, r.Src, r.Dst, tables)
+}
+
+// stateReconcilable resolves once per run whether the table state
+// (AUTO_INCREMENT) is exactly comparable on both sides. A side whose
+// reported next value sits more than stateGapLimit above max(column)+1
+// pre-allocates ID ranges (an allocator, e.g. TiDB's batch allocation):
+// the value it reports is an estimate, an explicit counter below the
+// allocated range's end is silently ignored, and even a full resync
+// re-allocates a new range — the state cannot be converged there, so the
+// reconciliation degrades to skipped (a one-shot warning, never a
+// failed run), like an unreadable state. An unsupported probe query
+// leaves the decision to the per-table degradation in tableAutoInc.
+func (r *Runner) stateReconcilable(ctx context.Context) bool {
+	r.stateGapOnce.Do(func() {
+		r.stateExact = true
+		for _, side := range []*conn.Side{r.Src, r.Dst} {
+			gap, probed, err := conn.AutoIncGap(ctx, side.Ctl())
+			if err != nil {
+				return
+			}
+			if probed && gap > stateGapLimit {
+				r.stateExact = false
+				fmt.Fprintf(os.Stderr, "warn: %s's auto-increment counter sits %d above the data maximum (pre-allocated ID range): the table state (AUTO_INCREMENT) is not exactly comparable on this backend and is skipped\n",
+					side.Name, gap)
+				return
+			}
+		}
+	})
+	return r.stateExact
+}
+
+// tableState is the AUTO_INCREMENT reconciliation verdict for one table.
+type tableState struct {
+	ddl    string // alignment statement ("" when aligned or not applicable)
+	srcVal int64
+	dstVal int64
+	srcHas bool // source reports a next value (has an auto-increment column)
+	dstHas bool
+	// aligned is the verdict: the source has no auto-increment column, or
+	// both sides report the same next value.
+	aligned bool
+	// note explains a divergence no ALTER can fix (the destination's
+	// counter is above the source's — a counter can only be raised):
+	// the state is reported, never planned.
+	note string
+}
+
+// checkState reads both sides' next AUTO_INCREMENT values and decides
+// whether the destination's table state drifted and what realigns it. It
+// is a no-op under --where (a table-level state has no filtered meaning),
+// on a backend that pre-allocates auto-increment ID ranges (stateReconcilable,
+// a capability degradation — see there), and when the source has no
+// auto-increment column (information_schema reports NULL — in that case
+// no ALTER is ever emitted, per the convergence contract). A destination
+// without the column cannot be set: no DDL, and the state is reported
+// unaligned (a structure drift the structure pre-step must repair first,
+// or an explicit --no-sync-schema).
+// When the destination's counter is ABOVE the source's, no DDL is
+// planned either: an auto-increment counter can only be raised, and a
+// full resync is the only thing that realigns it — the divergence is
+// reported (note) and the run exits non-zero. A backend that cannot read
+// the state degrades to (no DDL, aligned): the reconciliation is skipped
+// with a one-shot warning, never a failed run.
+func (r *Runner) checkState(ctx context.Context, table string) tableState {
+	if r.o.Cmp.Where != "" || !r.stateReconcilable(ctx) {
+		return tableState{}
+	}
+	srcVal, srcHas := r.tableAutoInc(ctx, r.Src, table)
+	if !srcHas {
+		return tableState{srcHas: srcHas}
+	}
+	dstVal, dstHas := r.tableAutoInc(ctx, r.Dst, table)
+	st := tableState{srcVal: srcVal, dstVal: dstVal, srcHas: true, dstHas: dstHas, aligned: dstHas && dstVal == srcVal}
+	if dstHas && !st.aligned {
+		if dstVal < srcVal {
+			st.ddl = fmt.Sprintf("ALTER TABLE %s AUTO_INCREMENT = %d", conn.QuoteIdent(table), srcVal)
+		} else {
+			st.note = fmt.Sprintf("destination's next AUTO_INCREMENT (%d) is above the source's (%d): the counter cannot be lowered, a full resync realigns it",
+				dstVal, srcVal)
+		}
+	}
+	return st
+}
+
+// VerifyState re-checks the table state after the sync: OK when the
+// source has no auto-increment column or both sides agree ("" when out
+// of scope: --where, a state the backend cannot read, or a backend that
+// pre-allocates auto-increment ID ranges — out of scope, never a
+// failure).
+func (r *Runner) VerifyState(ctx context.Context, table string) string {
+	if r.o.Cmp.Where != "" || !r.stateReconcilable(ctx) {
+		return ""
+	}
+	srcVal, srcHas := r.tableAutoInc(ctx, r.Src, table)
+	if !srcHas {
+		return "OK"
+	}
+	dstVal, dstHas := r.tableAutoInc(ctx, r.Dst, table)
+	if dstHas && dstVal == srcVal {
+		return "OK"
+	}
+	return "DIFFERENT"
+}
+
+// tableAutoInc reads one side's next AUTO_INCREMENT value, best-effort: a
+// failed query (a backend without the column) degrades to (0, false) with
+// a one-shot warning.
+func (r *Runner) tableAutoInc(ctx context.Context, side *conn.Side, table string) (int64, bool) {
+	v, ok, err := conn.TableAutoIncrement(ctx, side.Ctl(), table)
+	if err != nil {
+		r.aiWarned.Do(func() {
+			fmt.Fprintf(os.Stderr, "warn: cannot read the AUTO_INCREMENT state on %s (%v); table-state reconciliation is skipped\n", side.Name, err)
+		})
+		return 0, false
+	}
+	return v, ok
+}
+
+// missingOnDst reports whether the table exists on the source but not on
+// the destination: the pre-pass erred because the destination copy is
+// absent, not because of a schema mismatch or a runtime problem.
+func (r *Runner) missingOnDst(ctx context.Context, table string) bool {
+	dstOK, err := conn.TableExists(ctx, r.Dst.Ctl(), table)
+	if err != nil || dstOK {
+		return false
+	}
+	srcOK, err := conn.TableExists(ctx, r.Src.Ctl(), table)
+	return err == nil && srcOK
+}
+
+// createPlanFor builds the plan for a table the destination is missing:
+// a CREATE TABLE rendered from the source's structure (columns in order,
+// primary key, unique indexes, engine, and the source's current next
+// AUTO_INCREMENT value so the new table starts on the right counter),
+// followed by the data sync the table needs once it exists (an empty
+// destination: every source row is an INSERT — row-level when the source
+// offers a usable key, a plain full load otherwise).
+func (r *Runner) createPlanFor(ctx context.Context, table string) (*StructPlan, bool, error) {
+	srcS, err := conn.IntrospectStructure(ctx, r.Src.Ctl(), table)
+	if err != nil {
+		return nil, false, err
+	}
+	srcS = filterStruct(srcS, r.o.Cmp.Normalize.IgnoreCols)
+	autoInc, hasAuto := r.tableAutoInc(ctx, r.Src, table)
+	engine, err := conn.TableEngine(ctx, r.Src.Ctl(), table)
+	if err != nil {
+		return nil, false, err
+	}
+	keyed := len(r.o.Cmp.Key) > 0 || UsableKeyOf(srcS) != nil
+	sp := &StructPlan{
+		DDL:     []string{RenderCreateTable(table, srcS, engine, autoInc, hasAuto)},
+		Reasons: []string{"table missing on destination: create"},
+	}
+	return sp, keyed, nil
+}
+
+// applyState realigns the destination's table state (next AUTO_INCREMENT)
+// and records the verdict on ts. A failure marks the table FAILED: the
+// rows may have converged but the table state has not, and the next run
+// re-plans from the current facts and closes the gap.
+func (r *Runner) applyState(ctx context.Context, table string, ap *Applier, ts *TableSync) {
+	st := r.checkState(ctx, table)
+	if st.ddl == "" {
+		// no statement: an unfixable divergence (the destination's
+		// counter moved above the source's, e.g. by a concurrent
+		// explicit-id insert) is still reported on the table
+		if st.note != "" {
+			ts.StateNote = st.note
+		}
+		return
+	}
+	if err := ap.execDirect(ctx, st.ddl); err != nil {
+		ts.Status, ts.Error = "FAILED", fmt.Sprintf("table state: %v", err)
+		return
+	}
+	ts.StateChanged = true
+	ts.StateSQL = []string{st.ddl}
+	ts.StateNote = ""
 }
 
 // Verify re-runs the comparison (post-sync check).
@@ -480,91 +693,175 @@ const errWhereDrift = "structure drift on a --where-filtered table cannot be syn
 
 // SchemaPlanFor plans the structure pre-step for one table (read-only): it
 // introspects both sides, removes --ignore-columns entries from both, and
-// diffs columns and primary/unique indexes. It returns (nil, nil) when the
-// structure sync is disabled or the structures already match, (plan, nil)
-// when DDL is needed, and (nil, err) when the structure cannot be planned
-// (a side's table missing, or a source definition that cannot be
-// reproduced — an expression default).
-func (r *Runner) SchemaPlanFor(ctx context.Context, table string) (*StructPlan, error) {
+// diffs columns and primary/unique indexes. It returns (nil, srcS, nil)
+// when the structure sync is disabled or the structures already match
+// (srcS is the source structure, nil when it could not be read), (plan,
+// srcS, nil) when DDL is needed, and (nil, nil, err) when the structure
+// cannot be planned (a side's table missing, or a source definition that
+// cannot be reproduced — an expression default). The source structure is
+// returned because a repaired destination will have exactly this shape:
+// the post-repair data strategy (row-level vs full) is decided from it.
+func (r *Runner) SchemaPlanFor(ctx context.Context, table string) (*StructPlan, *conn.Struct, error) {
 	if !r.o.SyncSchema {
-		return nil, nil
+		return nil, nil, nil
 	}
 	srcS, err := conn.IntrospectStructure(ctx, r.Src.Ctl(), table)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	dstS, err := conn.IntrospectStructure(ctx, r.Dst.Ctl(), table)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	srcS = filterStruct(srcS, r.o.Cmp.Normalize.IgnoreCols)
 	dstS = filterStruct(dstS, r.o.Cmp.Normalize.IgnoreCols)
 	srcDef, dstDef := r.sideDefaultCollations(ctx)
 	changes, err := DiffStructure(srcS, dstS, srcDef, dstDef)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if len(changes) == 0 {
-		return nil, nil
+		return nil, srcS, nil
 	}
 	reasons := make([]string, 0, len(changes))
 	for _, ch := range changes {
 		reasons = append(reasons, ch.Why)
 	}
-	return &StructPlan{DDL: RenderDDL(table, changes), Reasons: reasons}, nil
+	return &StructPlan{DDL: RenderDDL(table, changes), Reasons: reasons}, srcS, nil
 }
 
 // ApplyStructureTable syncs a structure-drifted table: truncate the
 // destination first (so the DDL runs on an empty table and an added
 // NOT NULL column without a default is always safe), apply the DDL, then
-// re-compare (the structures now match, so the comparison — and the
-// post-sync verification — succeed) and stream every source row back in.
+// converge the data — see convergeAfterDDL for the re-read / re-plan: a
+// key the repair restores (e.g. the primary key) puts the table back on
+// row-level sync, only a still-keyless pair stays on the full load. The
+// table state (AUTO_INCREMENT) is reconciled last; the caller verifies.
 func (r *Runner) ApplyStructureTable(ctx context.Context, res compare.TableResult, sp *StructPlan, ap *Applier) TableSync {
 	ts := TableSync{Name: res.Name, SchemaChanged: true, SchemaSQL: sp.DDL, DstRows: 0}
-	fail := func(format string, args ...any) TableSync {
-		ts.Mode, ts.Status, ts.Error = "ERROR", "FAILED", fmt.Sprintf(format, args...)
-		return ts
-	}
 	if r.o.Progress != nil {
 		r.o.Progress("%-24s structure: %d DDL statement(s): %s", res.Name, len(sp.DDL), strings.Join(sp.Reasons, "; "))
 	}
 	if err := ap.execDirect(ctx, "TRUNCATE TABLE "+conn.QuoteIdent(res.Name)); err != nil {
-		return fail("truncate before structure sync: %v", err)
+		ts.Mode, ts.Status, ts.Error = "ERROR", "FAILED", fmt.Sprintf("truncate before structure sync: %v", err)
+		return ts
 	}
 	ts.Truncated = true
 	for _, stmt := range sp.DDL {
 		if err := ap.execDirect(ctx, stmt); err != nil {
-			return fail("structure sync: %v", err)
+			ts.Mode, ts.Status, ts.Error = "ERROR", "FAILED", fmt.Sprintf("structure sync: %v", err)
+			return ts
 		}
 	}
-	fresh, err := r.cmp.Compare(ctx, r.Src, r.Dst, []string{res.Name})
+	return r.convergeAfterDDL(ctx, res.Name, "structure sync", ap, &ts)
+}
+
+// convergeAfterDDL converges a table whose structure work (a CREATE, or
+// the structure-sync DDL) has just been applied on an emptied
+// destination: it re-runs the comparison, re-reads the metadata and
+// re-plans from the new structure (schema repair changes what the data
+// sync can do — a restored key goes back to row-level sync, a still-keyless
+// pair stays on the full load), writes the data, and reconciles the table
+// state (the next AUTO_INCREMENT value; TRUNCATE and a fresh CREATE both
+// reset it). The data may have converged while the table state has not:
+// any failed step leaves the table FAILED and the next run re-plans from
+// the current facts.
+func (r *Runner) convergeAfterDDL(ctx context.Context, table, label string, ap *Applier, ts *TableSync) TableSync {
+	fail := func(format string, args ...any) TableSync {
+		ts.Mode, ts.Status, ts.Error = "ERROR", "FAILED", fmt.Sprintf(format, args...)
+		return *ts
+	}
+	fresh, err := r.cmp.Compare(ctx, r.Src, r.Dst, []string{table})
 	if err != nil {
-		return fail("recompare after structure sync: %v", err)
+		return fail("recompare after %s: %v", label, err)
 	}
 	fres := fresh[0]
 	if fres.Status == "ERROR" {
-		return fail("structure sync applied but recompare failed: %s", fres.Error)
+		return fail("%s applied but recompare failed: %s", label, fres.Error)
 	}
-	srcTotal, err := r.Count(ctx, r.Src, res.Name)
-	if err != nil {
-		return fail("recount src after structure sync: %v", err)
+	if fres.Status == "OK" {
+		// An empty source table: the work alone converged it.
+		if ts.Mode != "CREATE" {
+			ts.Mode = "SKIP"
+		}
+		ts.Status = "APPLIED"
+		r.applyState(ctx, table, ap, ts)
+		return *ts
 	}
 	p, err := r.prepare(ctx, fres)
 	if err != nil {
 		ts.ArgErr = errors.Is(err, ErrMisconfigured)
 		return fail("%v", err)
 	}
-	st := &Stats{Table: res.Name, Mode: "FULL"}
-	ap.resync(ctx, st, p.b, p.srcS, compare.KeyFamilies(p.srcS), srcTotal)
-	ts.Mode = "FULL"
+	if p.plan.Mode == ModeError {
+		ts.ArgErr = p.plan.ArgErr
+		return fail("%s", p.plan.Error)
+	}
+	srcTotal, err := r.Count(ctx, r.Src, table)
+	if err != nil {
+		return fail("recount src after %s: %v", label, err)
+	}
 	ts.SrcRows = srcTotal
+	if p.plan.Mode == ModeRowLevel {
+		ops, err := r.RowOps(ctx, p, fres, srcTotal, 0)
+		if !errors.Is(err, errEscalateFull) {
+			if err != nil {
+				return fail("%v", err)
+			}
+			st := &Stats{Table: table, Mode: "ROWLEVEL"}
+			ap.ApplyOps(ctx, st, p.b, ops)
+			if ts.Mode != "CREATE" {
+				ts.Mode = "ROWLEVEL"
+			}
+			ts.Inserts, ts.Updates, ts.Deletes = st.Inserts, st.Updates, st.Deletes
+			ts.Chunks = st.Chunks
+			if st.Error != "" {
+				ts.Status, ts.Error = "FAILED", st.Error
+				return *ts
+			}
+			ts.Status = "APPLIED"
+			r.applyState(ctx, table, ap, ts)
+			return *ts
+		}
+		// A stale plan (data moved between the passes): fall through to
+		// the plain full load — the destination was emptied already, so
+		// it is inserts only.
+	}
+	st := &Stats{Table: table, Mode: "FULL"}
+	// No TRUNCATE here: the caller emptied the table (before the
+	// structure DDL, or it was just created).
+	ap.resync(ctx, st, p.b, p.srcS, compare.KeyFamilies(p.srcS), srcTotal)
+	if ts.Mode != "CREATE" {
+		ts.Mode = "FULL"
+	}
 	ts.Inserts, ts.Chunks = st.Inserts, st.Chunks
 	if st.Error != "" {
 		ts.Status, ts.Error = "FAILED", st.Error
-		return ts
+		return *ts
 	}
 	ts.Status = "APPLIED"
-	return ts
+	r.applyState(ctx, table, ap, ts)
+	return *ts
+}
+
+// applyCreate executes the CREATE plan: create the table on the
+// destination write connection, then converge the data like any other
+// table (an empty destination is all INSERTs — row-level when the source
+// offers a usable key, a plain full load otherwise). A successfully
+// created table is not a success until its data and table state have
+// converged: any failed step leaves it FAILED (the caller re-verifies).
+func (r *Runner) applyCreate(ctx context.Context, res compare.TableResult, d decision, ap *Applier) TableSync {
+	ts := d.ts
+	if r.o.Progress != nil {
+		r.o.Progress("%-24s create: %s", res.Name, strings.Join(d.sp.Reasons, "; "))
+	}
+	for _, stmt := range d.sp.DDL {
+		if err := ap.execDirect(ctx, stmt); err != nil {
+			ts.Status, ts.Error = "FAILED", fmt.Sprintf("create table: %v", err)
+			return ts
+		}
+	}
+	return r.convergeAfterDDL(ctx, res.Name, "create", ap, &ts)
 }
 
 // samples renders up to limit sample statements from the ops. Each op kind
@@ -623,6 +920,140 @@ func (r *Runner) fullSamples(b *Builder, srcTotal int64) []string {
 	}
 }
 
+// decision is the outcome of planDecision: the report-ready plan plus the
+// internals the dry-run samples and the apply path need.
+type decision struct {
+	ts     TableSync
+	p      *prep // prepared schemas and plan for data work (nil otherwise)
+	sp     *StructPlan
+	create bool // the destination table is created before the data sync
+	keyed  bool // create only: the source offers a usable key
+}
+
+// planDecision computes the sync DECISION for one pre-pass result without
+// the row-level re-scan: PlanTable adds the sample statements (and the
+// ops) on top, PlanSummary uses it as-is for the confirmation summary,
+// and ApplyTable routes on it.
+//
+// A table missing on the destination becomes a CREATE (structure sync on,
+// no --where). A structure drift becomes the DDL, and the post-repair data
+// strategy is decided from the SOURCE structure (a repaired destination
+// has exactly that shape: a usable key there restores row-level sync). An
+// identical table still gets its table state (AUTO_INCREMENT) checked. A
+// differing table goes through prepare + DecidePlan, with the table-state
+// fix appended when needed.
+func (r *Runner) planDecision(ctx context.Context, res compare.TableResult) decision {
+	d := decision{ts: TableSync{Name: res.Name, SrcRows: res.SrcRows, DstRows: res.DstRows}}
+	fail := func(argErr bool, format string, args ...any) decision {
+		d.ts.Mode, d.ts.Status, d.ts.Error = "ERROR", "FAILED", fmt.Sprintf(format, args...)
+		d.ts.ArgErr = argErr
+		return d
+	}
+	// A table missing on the destination: with the structure sync on and
+	// no --where it is created before its data is synced (the pre-pass
+	// erred on introspection, not on data); under --where (a row-level
+	// filter) or with the structure sync off it cannot be created, so it
+	// fails with a message that says why, instead of the raw
+	// introspection error.
+	if res.Status == "ERROR" && r.missingOnDst(ctx, res.Name) {
+		switch {
+		case r.o.SyncSchema && r.o.Cmp.Where == "":
+			sp, keyed, err := r.createPlanFor(ctx, res.Name)
+			if err != nil {
+				return fail(false, "create plan: %v", err)
+			}
+			srcTotal, err := r.Count(ctx, r.Src, res.Name)
+			if err != nil {
+				return fail(false, "count src: %v", err)
+			}
+			d.create, d.sp, d.keyed = true, sp, keyed
+			d.ts.Mode, d.ts.Status = "CREATE", "PLANNED"
+			d.ts.SchemaChanged = true
+			d.ts.SchemaSQL = sp.DDL
+			d.ts.SrcRows = srcTotal
+			return d
+		case r.o.Cmp.Where != "":
+			return fail(false, "table %s is missing on the destination: --where is a row-level filter and does not create tables", res.Name)
+		default:
+			return fail(false, "table %s is missing on the destination and the structure sync is off (--no-sync-schema): cannot create it", res.Name)
+		}
+	}
+	sp, srcS, err := r.SchemaPlanFor(ctx, res.Name)
+	if err != nil {
+		return fail(false, "%v", err)
+	}
+	if sp != nil {
+		if r.o.Cmp.Where != "" {
+			return fail(true, "%s", errWhereDrift)
+		}
+		// Structure repair changes what the data sync can do: the
+		// destination takes the source's shape, so a usable key the source
+		// has (primary key or NOT-NULL unique index) makes the repaired
+		// table row-addressable again and it goes back to row-level sync
+		// instead of a blind full resync. The apply path re-reads the
+		// metadata after the repair and re-decides from the actual key
+		// state (convergeAfterDDL).
+		mode := "FULL"
+		if len(r.o.Cmp.Key) > 0 || (srcS != nil && UsableKeyOf(srcS) != nil) {
+			mode = "ROWLEVEL"
+		}
+		d.sp = sp
+		d.ts.Mode, d.ts.Status = mode, "PLANNED"
+		d.ts.SchemaChanged = true
+		d.ts.SchemaSQL = sp.DDL
+		return d
+	}
+	switch res.Status {
+	case "OK":
+		st := r.checkState(ctx, res.Name)
+		if st.ddl != "" {
+			d.ts.Mode, d.ts.Status = "STATE", "PLANNED"
+			d.ts.StateChanged = true
+			d.ts.StateSQL = []string{st.ddl}
+			return d
+		}
+		if st.note != "" {
+			// a divergence no row-level operation can fix: planned (the
+			// run is non-zero) but carries no statement — nothing is
+			// written for it, the state check reports it
+			d.ts.Mode, d.ts.Status = "STATE", "PLANNED"
+			d.ts.StateNote = st.note
+			return d
+		}
+		d.ts.Mode, d.ts.Status = "SKIP", "SKIPPED"
+		return d
+	case "ERROR":
+		d.ts.Mode, d.ts.Status, d.ts.Error = "ERROR", "FAILED", res.Error
+		return d
+	}
+	p, err := r.prepare(ctx, res)
+	if err != nil {
+		return fail(errors.Is(err, ErrMisconfigured), "%v", err)
+	}
+	if p.plan.Mode == ModeError {
+		d.ts.Mode, d.ts.Status, d.ts.Error, d.ts.ArgErr = "ERROR", "FAILED", p.plan.Error, p.plan.ArgErr
+		return d
+	}
+	d.p = p
+	d.ts.Mode, d.ts.Status = string(p.plan.Mode), "PLANNED"
+	if st := r.checkState(ctx, res.Name); st.ddl != "" {
+		d.ts.StateChanged = true
+		d.ts.StateSQL = []string{st.ddl}
+	} else if st.note != "" {
+		d.ts.StateNote = st.note
+	}
+	return d
+}
+
+// createDataNote renders the dry-run note for what a created table's data
+// sync will look like.
+func createDataNote(keyed bool, rows int64, batch int) string {
+	if keyed {
+		return fmt.Sprintf("-- then row-level INSERT of all %d source rows in batches of %d", rows, batch)
+	}
+	return fmt.Sprintf("-- then INSERT all %d source rows in batches of %d", rows, batch)
+}
+
 // PlanSummary computes only the plan DECISION for one pre-pass result
 // (mode, reason, pre-pass counts, misconfiguration errors) without the
 // row-level re-scan: the --apply path uses it for the confirmation
@@ -630,146 +1061,110 @@ func (r *Runner) fullSamples(b *Builder, srcTotal int64) []string {
 // writing anyway — planning the ops here too would scan the differing
 // chunks twice for nothing the confirmation shows.
 func (r *Runner) PlanSummary(ctx context.Context, res compare.TableResult) TableSync {
-	ts := TableSync{Name: res.Name, SrcRows: res.SrcRows, DstRows: res.DstRows}
-	if sp, err := r.SchemaPlanFor(ctx, res.Name); err != nil {
-		ts.Mode, ts.Status, ts.Error = "ERROR", "FAILED", err.Error()
-		return ts
-	} else if sp != nil {
-		if r.o.Cmp.Where != "" {
-			ts.Mode, ts.Status, ts.ArgErr, ts.Error = "ERROR", "FAILED", true, errWhereDrift
-			return ts
-		}
-		// a drifted structure forces the full resync: row-level
-		// addressing is invalid once the shape of the table changes
-		ts.Mode, ts.Status, ts.SchemaChanged, ts.SchemaSQL = "FULL", "PLANNED", true, sp.DDL
-		return ts
-	}
-	switch res.Status {
-	case "OK":
-		ts.Mode, ts.Status = "SKIP", "SKIPPED"
-		return ts
-	case "ERROR":
-		ts.Mode, ts.Status, ts.Error = "ERROR", "FAILED", res.Error
-		return ts
-	}
-	p, err := r.prepare(ctx, res)
-	if err != nil {
-		ts.Mode, ts.Status, ts.Error, ts.ArgErr = "ERROR", "FAILED", err.Error(), errors.Is(err, ErrMisconfigured)
-		return ts
-	}
-	if p.plan.Mode == ModeError {
-		ts.Mode, ts.Status, ts.Error, ts.ArgErr = "ERROR", "FAILED", p.plan.Error, p.plan.ArgErr
-		return ts
-	}
-	ts.Mode, ts.Status = string(p.plan.Mode), "PLANNED"
-	return ts
+	return r.planDecision(ctx, res).ts
 }
 
 // PlanTable computes the dry-run outcome for one pre-pass result: mode,
 // counts and sample statements, without writing anything.
 func (r *Runner) PlanTable(ctx context.Context, res compare.TableResult) TableSync {
-	ts := TableSync{Name: res.Name, SrcRows: res.SrcRows, DstRows: res.DstRows}
-	if sp, err := r.SchemaPlanFor(ctx, res.Name); err != nil {
-		ts.Mode, ts.Status, ts.Error = "ERROR", "FAILED", err.Error()
+	d := r.planDecision(ctx, res)
+	if d.ts.Status == "FAILED" {
+		return d.ts
+	}
+	switch {
+	case d.create:
+		// the CREATE DDL is already shown on the DDL line: the sample is
+		// only what the data sync does once the table exists
+		ts := d.ts
+		ts.SampleSQL = []string{createDataNote(d.keyed, ts.SrcRows, r.o.Batch)}
 		return ts
-	} else if sp != nil {
-		if r.o.Cmp.Where != "" {
-			ts.Mode, ts.Status, ts.ArgErr, ts.Error = "ERROR", "FAILED", true, errWhereDrift
-			return ts
-		}
-		// structure drift: show the DDL, then the full-resync sample.
-		// The pre-pass of a structure-mismatched table never counted, so
-		// count the source fresh for the sample line.
+	case d.sp != nil:
+		// structure drift: the DDL is already shown on the DDL lines; the
+		// sample is the TRUNCATE the repair starts with, then what the
+		// data sync does after the repair. The pre-pass of a
+		// structure-mismatched table never counted, so count the source
+		// fresh for the sample line.
+		ts := d.ts
 		srcTotal, err := r.Count(ctx, r.Src, res.Name)
 		if err != nil {
 			ts.Mode, ts.Status, ts.Error = "ERROR", "FAILED", err.Error()
 			return ts
 		}
 		ts.SrcRows = srcTotal
-		ts.Mode, ts.Status, ts.SchemaChanged, ts.SchemaSQL = "FULL", "PLANNED", true, sp.DDL
-		ts.SampleSQL = append(append([]string{}, sp.DDL...),
-			"TRUNCATE TABLE "+conn.QuoteIdent(res.Name),
-			fmt.Sprintf("-- then INSERT all %d source rows in batches of %d", srcTotal, r.o.Batch))
+		ts.SampleSQL = []string{"TRUNCATE TABLE " + conn.QuoteIdent(res.Name),
+			createDataNote(ts.Mode == "ROWLEVEL", srcTotal, r.o.Batch)}
 		return ts
-	}
-	switch res.Status {
-	case "OK":
-		ts.Mode, ts.Status = "SKIP", "SKIPPED"
-		return ts
-	case "ERROR":
-		ts.Mode, ts.Status, ts.Error = "ERROR", "FAILED", res.Error
-		return ts
-	}
-	p, err := r.prepare(ctx, res)
-	if err != nil {
-		ts.Mode, ts.Status, ts.Error, ts.ArgErr = "ERROR", "FAILED", err.Error(), errors.Is(err, ErrMisconfigured)
-		return ts
-	}
-	if p.plan.Mode == ModeError {
-		ts.Mode, ts.Status, ts.Error, ts.ArgErr = "ERROR", "FAILED", p.plan.Error, p.plan.ArgErr
-		return ts
-	}
-	switch p.plan.Mode {
-	case ModeFull:
-		ts.Mode, ts.Status = "FULL", "PLANNED"
-		ts.SampleSQL = r.fullSamples(p.b, res.SrcRows)
-	case ModeRowLevel:
-		ops, err := r.RowOps(ctx, p, res, res.SrcRows, res.DstRows)
-		if errors.Is(err, errEscalateFull) {
-			// the plan went stale; the dry-run shows what apply would do
-			ts.Mode, ts.Status = "FULL", "PLANNED"
-			ts.SampleSQL = r.fullSamples(p.b, res.SrcRows)
-			return ts
+	case d.p != nil:
+		ts := d.ts
+		if d.ts.Mode == "ROWLEVEL" {
+			ops, err := r.RowOps(ctx, d.p, res, res.SrcRows, res.DstRows)
+			if errors.Is(err, errEscalateFull) {
+				// the plan went stale; the dry-run shows what apply would do
+				ts.Mode, ts.Status = "FULL", "PLANNED"
+				ts.SampleSQL = r.fullSamples(d.p.b, res.SrcRows)
+				return ts
+			}
+			if err != nil {
+				ts.Mode, ts.Status, ts.Error = "ERROR", "FAILED", err.Error()
+				return ts
+			}
+			ts.Inserts, ts.Updates, ts.Deletes = Counts(ops)
+			ts.Chunks = len(ops)
+			ts.SampleSQL = r.samples(d.p.b, ops, r.o.SampleLimit)
+		} else {
+			ts.SampleSQL = r.fullSamples(d.p.b, res.SrcRows)
 		}
-		if err != nil {
-			ts.Mode, ts.Status, ts.Error = "ERROR", "FAILED", err.Error()
-			return ts
-		}
-		ts.Mode, ts.Status = "ROWLEVEL", "PLANNED"
-		ts.Inserts, ts.Updates, ts.Deletes = Counts(ops)
-		ts.Chunks = len(ops)
-		ts.SampleSQL = r.samples(p.b, ops, r.o.SampleLimit)
+		return ts
 	}
-	return ts
+	return d.ts
 }
 
-// ApplyTable executes the sync for one pre-pass result on the destination
-// write connection. It recounts both sides right before writing and
-// escalates a ROWLEVEL plan to FULL when the fresh counts say the
-// destination now has more rows than the source (without --where; a
-// filtered table can never be truncated).
+// ApplyTable executes the sync for one pre-pass result on the
+// destination write connection. A table missing on the destination is
+// created first (structure sync on, no --where); a structure-drifted
+// table is realigned and re-planned (ApplyStructureTable); everything
+// else is re-counted right before writing and routed through DecidePlan —
+// the row counts never force a full resync: extra rows on the
+// destination are row-level DELETEs, and the only escalation is a stale
+// row plan (data moved between the pre-pass and the re-plan), which has
+// no safe row-level interpretation. The table state (AUTO_INCREMENT) is
+// reconciled last; the caller re-verifies.
 func (r *Runner) ApplyTable(ctx context.Context, res compare.TableResult, ap *Applier) TableSync {
-	ts := TableSync{Name: res.Name, SrcRows: res.SrcRows, DstRows: res.DstRows}
+	d := r.planDecision(ctx, res)
+	if d.ts.Status == "FAILED" {
+		return d.ts
+	}
+	if d.create {
+		return r.applyCreate(ctx, res, d, ap)
+	}
+	if d.sp != nil {
+		// planDecision already rejected --where (argument error).
+		return r.ApplyStructureTable(ctx, res, d.sp, ap)
+	}
+	if d.p == nil {
+		if d.ts.Mode == "STATE" {
+			// only the table state is realigned: re-check right before
+			// writing (the values may have moved since the plan)
+			r.applyState(ctx, res.Name, ap, &d.ts)
+			if d.ts.Status != "FAILED" {
+				if len(d.ts.StateSQL) > 0 {
+					d.ts.Status = "APPLIED"
+				} else {
+					// an unfixable divergence (the destination's counter
+					// is above the source's): nothing was written, the
+					// state check below reports it
+					d.ts.Status = "SKIPPED"
+				}
+			}
+			return d.ts
+		}
+		return d.ts // SKIP
+	}
+	p := d.p
+	ts := d.ts
 	fail := func(format string, args ...any) TableSync {
 		ts.Mode, ts.Status, ts.Error = "ERROR", "FAILED", fmt.Sprintf(format, args...)
 		return ts
-	}
-	if sp, err := r.SchemaPlanFor(ctx, res.Name); err != nil {
-		return fail("%v", err)
-	} else if sp != nil {
-		if r.o.Cmp.Where != "" {
-			ts.ArgErr = true
-			return fail("%s", errWhereDrift)
-		}
-		return r.ApplyStructureTable(ctx, res, sp, ap)
-	}
-	switch res.Status {
-	case "OK":
-		ts.Mode, ts.Status = "SKIP", "SKIPPED"
-		return ts
-	case "ERROR":
-		ts.Status, ts.Error = "FAILED", res.Error
-		ts.Mode = "ERROR"
-		return ts
-	}
-	p, err := r.prepare(ctx, res)
-	if err != nil {
-		ts.ArgErr = errors.Is(err, ErrMisconfigured)
-		return fail("%v", err)
-	}
-	if p.plan.Mode == ModeError {
-		ts.ArgErr = p.plan.ArgErr
-		return fail("%s", p.plan.Error)
 	}
 	mode := p.plan.Mode
 	var ops [][]op
@@ -784,20 +1179,14 @@ func (r *Runner) ApplyTable(ctx context.Context, res compare.TableResult, ap *Ap
 		}
 		// the report shows the counts as of the apply, not the pre-pass
 		ts.SrcRows, ts.DstRows = freshSrc, freshDst
-		if freshDst > freshSrc && r.o.Cmp.Where == "" {
-			// the destination grew past the source since the pre-pass:
-			// row-level deletes would not get the table to match anyway
+		ops, err = r.RowOps(ctx, p, res, freshSrc, freshDst)
+		switch {
+		case errors.Is(err, errEscalateFull) && r.o.Cmp.Where != "":
+			return fail("%v (a filtered table cannot be fully resynced)", err)
+		case errors.Is(err, errEscalateFull):
 			mode = ModeFull
-		} else {
-			ops, err = r.RowOps(ctx, p, res, freshSrc, freshDst)
-			switch {
-			case errors.Is(err, errEscalateFull) && r.o.Cmp.Where != "":
-				return fail("%v (a filtered table cannot be fully resynced)", err)
-			case errors.Is(err, errEscalateFull):
-				mode = ModeFull
-			case err != nil:
-				return fail("%v", err)
-			}
+		case err != nil:
+			return fail("%v", err)
 		}
 	}
 	switch mode {
@@ -815,7 +1204,6 @@ func (r *Runner) ApplyTable(ctx context.Context, res compare.TableResult, ap *Ap
 			ts.Status, ts.Error = "FAILED", st.Error
 			return ts
 		}
-		ts.Status = "APPLIED"
 	case ModeRowLevel:
 		st := &Stats{Table: res.Name, Mode: "ROWLEVEL"}
 		ap.ApplyOps(ctx, st, p.b, ops)
@@ -825,7 +1213,52 @@ func (r *Runner) ApplyTable(ctx context.Context, res compare.TableResult, ap *Ap
 			ts.Status, ts.Error = "FAILED", st.Error
 			return ts
 		}
-		ts.Status = "APPLIED"
 	}
+	ts.Status = "APPLIED"
+	r.applyState(ctx, res.Name, ap, &ts)
+	return ts
+}
+
+// DropPlanFor renders the (unexecuted) plan for dropping a destination-only
+// table: whole-database mode treats the destination as a disposable copy of
+// the source, so a table the source does not have is converged away. The
+// caller must only produce these plans in whole-database mode (--tables and
+// --where off): --tables scopes the run to the named tables and never
+// drops anything else, and a filtered run cannot drop whole tables.
+func DropPlanFor(table string) TableSync {
+	return TableSync{
+		Name:          table,
+		Mode:          "DROP",
+		Status:        "PLANNED",
+		SchemaChanged: true,
+		// IF EXISTS keeps a re-run convergent when the table vanished
+		// between the discovery and the drop
+		SchemaSQL: []string{"DROP TABLE IF EXISTS " + conn.QuoteIdent(table)},
+	}
+}
+
+// ApplyDrop drops one destination-only table on the destination write
+// connection, then confirms the table is gone (a DROP that reports success
+// but leaves the table is still a failure). A failure marks the table
+// FAILED: the next run re-discovers it and converges it again.
+func (r *Runner) ApplyDrop(ctx context.Context, table string, ap *Applier) TableSync {
+	ts := DropPlanFor(table)
+	if r.o.Progress != nil {
+		r.o.Progress("%-24s drop (destination-only table)", table)
+	}
+	if err := ap.execDirect(ctx, ts.SchemaSQL[0]); err != nil {
+		ts.Status, ts.Error = "FAILED", fmt.Sprintf("drop table: %v", err)
+		return ts
+	}
+	exists, err := conn.TableExists(ctx, r.Dst.Ctl(), table)
+	if err != nil {
+		ts.Status, ts.Error = "FAILED", fmt.Sprintf("verify drop: %v", err)
+		return ts
+	}
+	if exists {
+		ts.Status, ts.Error = "FAILED", "table still exists after DROP TABLE"
+		return ts
+	}
+	ts.Status, ts.Verified = "APPLIED", "OK"
 	return ts
 }

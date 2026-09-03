@@ -326,14 +326,24 @@ func TestRenderDDLColumnDef(t *testing.T) {
 		want string
 	}{
 		{
-			name: "full definition",
+			name: "full definition (timestamp)",
 			col: conn.ColMeta{
-				Column:     conn.Column{Name: "ts", RawType: "timestamp", Nullable: false, Collation: "utf8mb4_0900_ai_ci", Family: conn.FamTIMESTAMP},
-				Charset:    "utf8mb4",
+				Column:     conn.Column{Name: "ts", RawType: "timestamp", Nullable: false, Family: conn.FamTIMESTAMP},
 				HasDefault: true, Default: "CURRENT_TIMESTAMP", OnUpdate: true, Comment: "created\\'s note",
 			},
 			want: "`ts` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP " +
-				"CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci COMMENT 'created\\\\''s note'",
+				"COMMENT 'created\\\\''s note'",
+		},
+		{
+			// CHARACTER SET / COLLATE attach to the type and must precede
+			// NOT NULL (the server rejects the other order).
+			name: "full definition (varchar, charset before NOT NULL)",
+			col: conn.ColMeta{
+				Column:  conn.Column{Name: "s", RawType: "varchar(16)", Nullable: false, Collation: "utf8mb4_0900_ai_ci", Family: conn.FamSTR},
+				Charset: "utf8mb4", Comment: "created\\'s note",
+			},
+			want: "`s` varchar(16) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL " +
+				"COMMENT 'created\\\\''s note'",
 		},
 		{
 			name: "auto increment",
@@ -497,4 +507,122 @@ func TestDiffStructureCrossBackend(t *testing.T) {
 			t.Fatalf("want 1 change, got %v", changes)
 		}
 	})
+}
+
+func createTableFixture() *conn.Struct {
+	return &conn.Struct{
+		Table: "t",
+		Cols: []conn.ColMeta{
+			{Column: conn.Column{Name: "id", RawType: "int", Nullable: false, Family: conn.FamINT}, AutoInc: true},
+			{Column: conn.Column{Name: "code", RawType: "varchar(16)", Nullable: false, Family: conn.FamSTR},
+				HasDefault: true, Default: "NULL"},
+		},
+		Indexes: []conn.Index{
+			{Name: "PRIMARY", Unique: true, Cols: []string{"id"}},
+			{Name: "u_code", Unique: true, Cols: []string{"code"}},
+		},
+	}
+}
+
+// TestRenderCreateTable covers the CREATE TABLE for a missing destination
+// table: columns in source order, primary key, unique keys, the optional
+// engine and the AUTO_INCREMENT starting value (omitted when the source
+// has no auto-increment column — a bare value would be meaningless).
+func TestRenderCreateTable(t *testing.T) {
+	want := "CREATE TABLE `t` (\n" +
+		"  `id` int NOT NULL AUTO_INCREMENT,\n" +
+		"  `code` varchar(16) NOT NULL DEFAULT NULL,\n" +
+		"  PRIMARY KEY (`id`),\n" +
+		"  UNIQUE KEY `u_code` (`code`)\n" +
+		") ENGINE=InnoDB AUTO_INCREMENT=42;"
+	if got := RenderCreateTable("t", createTableFixture(), "InnoDB", 42, true); got != want {
+		t.Errorf("rendered:\n%s\nwant:\n%s", got, want)
+	}
+	// no auto-increment column on the source: no AUTO_INCREMENT option
+	got := RenderCreateTable("t", createTableFixture(), "InnoDB", 0, false)
+	if strings.Contains(got, "AUTO_INCREMENT=42") {
+		t.Errorf("no auto-increment column must not emit a value:\n%s", got)
+	}
+	if !strings.HasSuffix(got, ") ENGINE=InnoDB;") {
+		t.Errorf("missing engine suffix:\n%s", got)
+	}
+	// unknown engine: no ENGINE clause at all
+	if got := RenderCreateTable("t", createTableFixture(), "", 42, true); strings.Contains(got, "ENGINE=") {
+		t.Errorf("empty engine must not be emitted:\n%s", got)
+	}
+}
+
+// TestUsableKeyOf pins the key rule the post-repair re-plan relies on:
+// the primary key first, then the first unique index whose columns are all
+// NOT NULL (a unique index on a nullable column cannot address rows).
+func TestUsableKeyOf(t *testing.T) {
+	// primary key wins over a unique index
+	s := &conn.Struct{
+		Cols: []conn.ColMeta{metaCol("id", "int", conn.FamINT, false), metaCol("a", "int", conn.FamINT, false)},
+		Indexes: []conn.Index{
+			{Name: "u_a", Unique: true, Cols: []string{"a"}},
+			{Name: "PRIMARY", Unique: true, Cols: []string{"id"}},
+		},
+	}
+	if got := UsableKeyOf(s); len(got) != 1 || got[0] != "id" {
+		t.Errorf("primary key must win, got %v", got)
+	}
+	// a NOT NULL unique index is usable
+	s = &conn.Struct{
+		Cols:    []conn.ColMeta{metaCol("a", "int", conn.FamINT, false)},
+		Indexes: []conn.Index{{Name: "u_a", Unique: true, Cols: []string{"a"}}},
+	}
+	if got := UsableKeyOf(s); len(got) != 1 || got[0] != "a" {
+		t.Errorf("not-null unique index, got %v", got)
+	}
+	// a unique index on a nullable column is not usable
+	s = &conn.Struct{
+		Cols:    []conn.ColMeta{metaCol("a", "int", conn.FamINT, true)},
+		Indexes: []conn.Index{{Name: "u_a", Unique: true, Cols: []string{"a"}}},
+	}
+	if got := UsableKeyOf(s); got != nil {
+		t.Errorf("nullable unique index must not be usable, got %v", got)
+	}
+	// a composite unique with one nullable column is not usable either
+	s = &conn.Struct{
+		Cols: []conn.ColMeta{metaCol("a", "int", conn.FamINT, false), metaCol("b", "int", conn.FamINT, true)},
+		Indexes: []conn.Index{
+			{Name: "u_ab", Unique: true, Cols: []string{"a", "b"}},
+			{Name: "u_c", Unique: true, Cols: []string{"a"}},
+		},
+	}
+	if got := UsableKeyOf(s); len(got) != 1 || got[0] != "a" {
+		t.Errorf("first usable unique expected [a], got %v", got)
+	}
+	// no indexes at all
+	s = &conn.Struct{Cols: []conn.ColMeta{metaCol("a", "int", conn.FamINT, false)}}
+	if got := UsableKeyOf(s); got != nil {
+		t.Errorf("keyless table, got %v", got)
+	}
+}
+
+// TestDestructiveDDL covers the classifier the confirmation summary and
+// the report use to surface the irreversible statements separately.
+func TestDestructiveDDL(t *testing.T) {
+	cases := []struct {
+		stmt string
+		want bool
+	}{
+		{"DROP TABLE `x`", true},
+		{"drop table x", true}, // case-insensitive
+		{"ALTER TABLE `t` DROP COLUMN `c`", true},
+		{"ALTER TABLE `t` DROP PRIMARY KEY", true},
+		{"ALTER TABLE `t` DROP INDEX `i`", true},
+		{"ALTER TABLE `t` ADD COLUMN `c` int", false},
+		{"ALTER TABLE `t` MODIFY COLUMN `c` bigint", false},
+		{"ALTER TABLE `t` ADD UNIQUE (`a`)", false},
+		{"ALTER TABLE `t` AUTO_INCREMENT = 42", false},
+		{"CREATE TABLE `t` (id int)", false},
+		{"TRUNCATE TABLE `t`", false},
+	}
+	for _, c := range cases {
+		if got := DestructiveDDL(c.stmt); got != c.want {
+			t.Errorf("DestructiveDDL(%q) = %v, want %v", c.stmt, got, c.want)
+		}
+	}
 }

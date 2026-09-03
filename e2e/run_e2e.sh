@@ -50,6 +50,22 @@ qdst() {
   $COMPOSE -f e2e/docker-compose.yml exec -T -e MYSQL_PWD=rootpw mysql-dst \
     mysql -uroot -D dstdb -N -B -e "$1"
 }
+# qdb <side> <db> <sql> runs a query on any side's database (the whole-
+# database scenarios use the secondary srcdb2/dstdb2 pair).
+qdb() {
+  $COMPOSE -f e2e/docker-compose.yml exec -T -e MYSQL_PWD=rootpw "mysql-$1" \
+    mysql -uroot -D "$2" -N -B -e "$3"
+}
+
+# showai reads the TRUE next AUTO_INCREMENT value: the AUTO_INCREMENT=
+# clause of SHOW CREATE TABLE (empty when the counter was never set
+# explicitly, i.e. it follows max(id)+1). InnoDB's information_schema
+# estimate is not refreshed after a second counter change (a second
+# ALTER or a TRUNCATE), so the assertions read the value the server
+# actually persists.
+showai() {
+  qdb "$1" "$2" "SHOW CREATE TABLE $3\G" | grep -oE 'AUTO_INCREMENT=[0-9]+' | head -n1 | cut -d= -f2
+}
 
 wait_ready() {
   local svc="mysql-$1"
@@ -252,10 +268,21 @@ expect 1 "diff still differs after dry-run (zero writes)" --src "$SRC" --dst "$D
 # apply: row-level (same row counts) -> verified -> plain diff is clean.
 expect 0 "sync --apply --yes: row-level updates" sync --src "$SRC" --dst "$DST" --tables t_mut --apply --yes
 expect 0 "diff identical after row-level sync" --src "$SRC" --dst "$DST" --tables t_mut
-# dst has MORE rows than src (999 vs 1499) -> TRUNCATE + full resync.
+# dst has MORE rows than src (1498 vs 999): the extra rows are addressed
+# by their key and deleted one by one — the row counts never force a full
+# resync (no TRUNCATE).
 sql dst dstdb m_sync_more.sql
-expect 0 "sync: dst has more rows -> truncate + resync" sync --src "$SRC" --dst "$DST" --tables t_mut --apply --yes
-expect 0 "diff identical after full resync" --src "$SRC" --dst "$DST" --tables t_mut
+expect 1 "sync dry-run: dst has more rows -> deletes planned" sync --src "$SRC" --dst "$DST" --tables t_mut
+if ! grep -q 'DELETE FROM `t_mut`' "$OUT"; then
+  echo "FAIL: dry-run showed no DELETE sample"; cat "$OUT"; exit 1
+fi
+echo "ok: dry-run shows the DELETE sample"
+if grep -q 'TRUNCATE' "$OUT"; then
+  echo "FAIL: extra rows escalated to a full resync"; cat "$OUT"; exit 1
+fi
+echo "ok: dry-run is row-level (no TRUNCATE)"
+expect 0 "sync: dst has more rows -> row-level deletes" sync --src "$SRC" --dst "$DST" --tables t_mut --apply --yes
+expect 0 "diff identical after delete sync" --src "$SRC" --dst "$DST" --tables t_mut
 # dst is MISSING rows (899 vs 999) -> row-level inserts, no TRUNCATE.
 sql dst dstdb m_mut_reseed.sql
 sql dst dstdb m_sync_missing.sql
@@ -506,6 +533,176 @@ if [ "$pk" != "1" ]; then
   echo "FAIL: dst PRIMARY key after default sync (count=$pk, want 1)"; exit 1
 fi
 echo "ok: dst PRIMARY key restored by default sync"
+
+say "whole-database sync (create / drop / state)"
+SRC2=root:rootpw@127.0.0.1:13306/srcdb2
+DST2=root:rootpw@127.0.0.1:13307/dstdb2
+# A second, small database pair: dstdb2 starts EMPTY, so whole-database
+# mode (no --tables) must discover the source's BASE TABLE set and create
+# every table it finds there. The dst database is reset up front, so a
+# re-run after a failed run (which may have left created tables behind)
+# starts from the same state.
+qdb src srcdb2 "SELECT 1" >/dev/null 2>&1 || \
+  $COMPOSE -f e2e/docker-compose.yml exec -T -e MYSQL_PWD=rootpw mysql-src mysql -uroot -e "CREATE DATABASE IF NOT EXISTS srcdb2"
+$COMPOSE -f e2e/docker-compose.yml exec -T -e MYSQL_PWD=rootpw mysql-dst \
+  mysql -uroot -e "DROP DATABASE IF EXISTS dstdb2; CREATE DATABASE dstdb2"
+sql src srcdb2 seed_src2.sql
+# (a) empty dst database: the dry-run plans a CREATE for every source
+# table (t_new included) and writes nothing.
+expect 1 "empty dst: dry-run plans the creates" sync --src "$SRC2" --dst "$DST2"
+if ! grep -q 'CREATE TABLE `t_ai`' "$OUT"; then
+  echo "FAIL: no CREATE TABLE sample for t_ai"; cat "$OUT"; exit 1
+fi
+echo "ok: dry-run shows CREATE TABLE samples"
+if ! grep -q 'AUTO_INCREMENT=1500' "$OUT"; then
+  echo "FAIL: the create did not start on the source AUTO_INCREMENT value"; cat "$OUT"; exit 1
+fi
+echo "ok: the create carries the source AUTO_INCREMENT start value"
+if ! grep -q 'UNIQUE KEY' "$OUT"; then
+  echo "FAIL: the create did not reproduce t_new's unique key"; cat "$OUT"; exit 1
+fi
+echo "ok: the create reproduces the unique key"
+n=$(qdb dst dstdb2 "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA='dstdb2' AND TABLE_TYPE='BASE TABLE'")
+[ "$n" = "0" ] || { echo "FAIL: the create dry-run wrote to the dst ($n tables exist)"; exit 1; }
+echo "ok: the create dry-run is zero-write"
+# apply: every source table is created and the data converges; the
+# auto-increment table starts (and stays) on the source's counter.
+expect 0 "empty dst: --apply creates all source tables" sync --src "$SRC2" --dst "$DST2" --apply --yes
+expect 0 "re-run after create: nothing to do" sync --src "$SRC2" --dst "$DST2"
+# the plain index that only the source has (t_idx) must not turn into a
+# DDL: plain non-unique indexes are outside the synced structure scope.
+if grep -q "ALTER TABLE" "$OUT"; then
+  echo "FAIL: a plain-index difference must not produce DDL"; cat "$OUT"; exit 1
+fi
+echo "ok: plain-index difference causes no DDL"
+n=$(qdb dst dstdb2 "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA='dstdb2' AND TABLE_NAME='t_new' AND TABLE_TYPE='BASE TABLE'")
+[ "$n" = "1" ] || { echo "FAIL: t_new was not created on the dst"; exit 1; }
+echo "ok: t_new created on the dst"
+u=$(qdb dst dstdb2 "SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA='dstdb2' AND TABLE_NAME='t_new' AND INDEX_NAME='u_code'")
+[ "$u" = "1" ] || { echo "FAIL: t_new's unique key was not created"; exit 1; }
+echo "ok: t_new's unique key created"
+ai=$(showai dst dstdb2 t_ai)
+[ "$ai" = "1500" ] || { echo "FAIL: t_ai AUTO_INCREMENT after create ($ai, want 1500)"; exit 1; }
+echo "ok: t_ai AUTO_INCREMENT converged (1500)"
+# (b) table state only: the data is identical, only the counter drifted
+# (1200 vs 1500) -> a STATE plan, no data work, no TRUNCATE.
+sql dst dstdb2 m_dst2_ai_state.sql
+expect 1 "state drift: AUTO_INCREMENT planned (dry-run)" sync --src "$SRC2" --dst "$DST2"
+if ! grep -q 'ALTER TABLE `t_ai` AUTO_INCREMENT = 1500' "$OUT"; then
+  echo "FAIL: no AUTO_INCREMENT alignment planned"; cat "$OUT"; exit 1
+fi
+echo "ok: dry-run shows the AUTO_INCREMENT alignment"
+if grep -q 'TRUNCATE' "$OUT"; then
+  echo "FAIL: a state-only drift must not truncate"; cat "$OUT"; exit 1
+fi
+echo "ok: state-only drift plans no TRUNCATE"
+ai=$(showai dst dstdb2 t_ai)
+[ "$ai" = "1200" ] || { echo "FAIL: the state dry-run wrote to the dst ($ai)"; exit 1; }
+echo "ok: the state dry-run is zero-write"
+expect 0 "state drift: --apply realigns the counter" sync --src "$SRC2" --dst "$DST2" --apply --yes
+ai=$(showai dst dstdb2 t_ai)
+[ "$ai" = "1500" ] || { echo "FAIL: t_ai AUTO_INCREMENT after apply ($ai, want 1500)"; exit 1; }
+echo "ok: t_ai AUTO_INCREMENT realigned (1500)"
+# (c) structure drift on an auto-increment table: the repair truncates and
+# reloads (which resets the counter) -> the state is re-aligned afterwards.
+sql dst dstdb2 m_dst2_ai_struct.sql
+expect 1 "ai structure drift: DDL planned (dry-run)" sync --src "$SRC2" --dst "$DST2" --tables t_ai
+if ! grep -q 'ALTER TABLE `t_ai`' "$OUT"; then
+  echo "FAIL: no structure DDL for the drifted table"; cat "$OUT"; exit 1
+fi
+echo "ok: dry-run shows the structure DDL"
+expect 0 "ai structure drift: --apply (repaired + reloaded + state)" sync --src "$SRC2" --dst "$DST2" --tables t_ai --apply --yes
+valtype=$(qdb dst dstdb2 "SELECT DATA_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='dstdb2' AND TABLE_NAME='t_ai' AND COLUMN_NAME='val'")
+[ "$valtype" = "varchar" ] || { echo "FAIL: t_ai.val type after repair ($valtype)"; exit 1; }
+echo "ok: t_ai.val type repaired"
+ai=$(showai dst dstdb2 t_ai)
+[ "$ai" = "1500" ] || { echo "FAIL: t_ai AUTO_INCREMENT after reload ($ai, want 1500)"; exit 1; }
+echo "ok: t_ai AUTO_INCREMENT re-aligned after the reload"
+# (d) the destination loses t_plain's primary key: the structure repair
+# restores the key and the repaired table goes back to row-level sync
+# instead of an unconditional full resync.
+sql dst dstdb2 m_dst2_plain_nopk.sql
+expect 1 "pk lost: key DDL planned (dry-run)" sync --src "$SRC2" --dst "$DST2" --tables t_plain
+if ! grep -q 'ADD PRIMARY KEY' "$OUT"; then
+  echo "FAIL: the key repair DDL is missing"; cat "$OUT"; exit 1
+fi
+echo "ok: dry-run shows the ADD PRIMARY KEY DDL"
+if ! grep -q 'row-level' "$OUT"; then
+  echo "FAIL: the repaired table must go back to row-level sync"; cat "$OUT"; exit 1
+fi
+echo "ok: the repaired table is planned row-level"
+expect 0 "pk lost: --apply restores the key and the data" sync --src "$SRC2" --dst "$DST2" --tables t_plain --apply --yes
+pk=$(qdb dst dstdb2 "SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA='dstdb2' AND TABLE_NAME='t_plain' AND INDEX_NAME='PRIMARY'")
+[ "$pk" = "1" ] || { echo "FAIL: t_plain PRIMARY key after repair (count=$pk, want 1)"; exit 1; }
+echo "ok: t_plain PRIMARY key restored"
+expect 0 "re-run after pk restore: identical" sync --src "$SRC2" --dst "$DST2" --tables t_plain
+# (e) a destination-only table: whole-database mode plans a DROP TABLE for
+# it, listed under the destructive changes; the dry-run writes nothing.
+sql dst dstdb2 m_dst2_extra.sql
+expect 1 "extra dst table: DROP planned (dry-run)" sync --src "$SRC2" --dst "$DST2"
+if ! grep -q 'DROP TABLE IF EXISTS `t_extra`' "$OUT"; then
+  echo "FAIL: no DROP TABLE planned for the extra table"; cat "$OUT"; exit 1
+fi
+echo "ok: dry-run plans the DROP TABLE"
+if ! grep -q 'DESTRUCTIVE' "$OUT"; then
+  echo "FAIL: the destructive change is not listed separately"; cat "$OUT"; exit 1
+fi
+echo "ok: the destructive change is listed separately"
+n=$(qdb dst dstdb2 "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA='dstdb2' AND TABLE_NAME='t_extra'")
+[ "$n" = "1" ] || { echo "FAIL: the drop dry-run wrote to the dst (t_extra count=$n)"; exit 1; }
+echo "ok: the drop dry-run is zero-write"
+expect 0 "extra dst table: --apply drops it" sync --src "$SRC2" --dst "$DST2" --apply --yes
+n=$(qdb dst dstdb2 "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA='dstdb2' AND TABLE_NAME='t_extra'")
+[ "$n" = "0" ] || { echo "FAIL: t_extra still exists after the drop"; exit 1; }
+echo "ok: t_extra dropped"
+expect 0 "re-run after drop: nothing to do" sync --src "$SRC2" --dst "$DST2"
+# (f) --tables scopes the run strictly: an out-of-scope destination table
+# is never dropped, even with --apply.
+sql dst dstdb2 m_dst2_extra.sql
+expect 0 "--tables: in-scope table identical, nothing to do" sync --src "$SRC2" --dst "$DST2" --tables t_plain
+expect 0 "--tables --apply: out-of-scope table is not dropped" sync --src "$SRC2" --dst "$DST2" --tables t_plain --apply --yes
+n=$(qdb dst dstdb2 "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA='dstdb2' AND TABLE_NAME='t_extra'")
+[ "$n" = "1" ] || { echo "FAIL: --tables dropped an out-of-scope table (count=$n)"; exit 1; }
+echo "ok: --tables never drops out-of-scope tables"
+# (g) --exclude-tables removes a table from both the sync set and the drop
+# set: a whole-database run leaves it alone.
+sql dst dstdb2 m_dst2_extra.sql
+expect 0 "excluded table: whole-database run is clean" sync --src "$SRC2" --dst "$DST2" --exclude-tables t_extra --apply --yes
+n=$(qdb dst dstdb2 "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA='dstdb2' AND TABLE_NAME='t_extra'")
+[ "$n" = "1" ] || { echo "FAIL: --exclude-tables dropped the excluded table (count=$n)"; exit 1; }
+echo "ok: --exclude-tables spares the extra table"
+# (h) a stray row on a keyed table (3 vs 4): one row-level DELETE, never a
+# full resync.
+sql dst dstdb2 m_dst2_plain_stray.sql
+expect 1 "stray row: DELETE planned (dry-run)" sync --src "$SRC2" --dst "$DST2" --tables t_plain
+if ! grep -q 'DELETE FROM `t_plain`' "$OUT"; then
+  echo "FAIL: no DELETE sample for the stray row"; cat "$OUT"; exit 1
+fi
+echo "ok: dry-run shows the DELETE sample"
+if grep -q 'TRUNCATE' "$OUT"; then
+  echo "FAIL: a stray row escalated to a full resync"; cat "$OUT"; exit 1
+fi
+echo "ok: stray row stays row-level (no TRUNCATE)"
+expect 0 "stray row: --apply deletes it" sync --src "$SRC2" --dst "$DST2" --tables t_plain --apply --yes
+n=$(qdb dst dstdb2 "SELECT COUNT(*) FROM t_plain")
+[ "$n" = "3" ] || { echo "FAIL: stray row not deleted (count=$n, want 3)"; exit 1; }
+echo "ok: stray row deleted, count back to 3"
+# (i) a missing table under --where (a row filter) or with the structure
+# sync off is not created: a clear failure, not a silent skip.
+sql dst dstdb2 m_dst2_drop_new.sql
+expect 2 "missing table with --where: not created" sync --src "$SRC2" --dst "$DST2" --tables t_new --where "id >= 1"
+if ! grep -q "does not create tables" "$OUT"; then
+  echo "FAIL: missing the --where explanation"; cat "$OUT"; exit 1
+fi
+echo "ok: --where explains why the table is not created"
+expect 2 "missing table with --no-sync-schema: not created" sync --src "$SRC2" --dst "$DST2" --tables t_new --no-sync-schema
+if ! grep -q "no-sync-schema" "$OUT"; then
+  echo "FAIL: missing the --no-sync-schema explanation"; cat "$OUT"; exit 1
+fi
+echo "ok: --no-sync-schema explains why the table is not created"
+# ...and the plain default (structure sync on, no --where) creates it.
+expect 0 "missing table: created by the default sync" sync --src "$SRC2" --dst "$DST2" --tables t_new --apply --yes
+expect 0 "diff identical after re-create" --src "$SRC2" --dst "$DST2" --tables t_new
 
 E2E_OK=1
 say "ALL E2E SCENARIOS PASSED"

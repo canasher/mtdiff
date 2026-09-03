@@ -32,7 +32,7 @@ var (
 
 var syncCmd = &cobra.Command{
 	Use:   "sync",
-	Short: "Make the destination match the source (default: dry-run; --apply writes, destination only)",
+	Short: "Make the destination match the source: missing tables created, extra tables dropped, data and AUTO_INCREMENT state converged (dry-run; --apply writes, destination only)",
 	RunE:  syncRunE,
 }
 
@@ -147,7 +147,7 @@ func syncRunE(cmd *cobra.Command, _ []string) error {
 	defer dst.Close()
 	cancelConnect()
 
-	tables, err := resolveTables(ctx, cfg, src, dst)
+	tables, extra, err := resolveSyncTables(ctx, cfg, src, dst)
 	if err != nil {
 		return err
 	}
@@ -168,13 +168,21 @@ func syncRunE(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return failf(ExitRuntimeErr, "%v", err)
 	}
+	// Destination-only tables (whole-database mode only): the destination
+	// is a disposable copy of the source, so they are converged away with
+	// a DROP TABLE. In dry runs they are listed, never executed.
+	dropPlans := make([]msync.TableSync, 0, len(extra))
+	for _, t := range extra {
+		dropPlans = append(dropPlans, msync.DropPlanFor(t))
+	}
 
 	// Dry-run: show the plan for every table, write nothing.
 	if !syncOpt.apply {
-		syncResults := make([]msync.TableSync, 0, len(results))
+		syncResults := make([]msync.TableSync, 0, len(results)+len(dropPlans))
 		for _, r := range results {
 			syncResults = append(syncResults, runner.PlanTable(ctx, r))
 		}
+		syncResults = append(syncResults, dropPlans...)
 		// a misconfiguration (keyless + --where, ignoring a key column) is
 		// an argument error in the dry run too, not a runtime failure
 		if err := planArgErr(syncResults); err != nil {
@@ -189,22 +197,23 @@ func syncRunE(cmd *cobra.Command, _ []string) error {
 	// exists. Only the decision is computed here (no row re-scan):
 	// ApplyTable re-plans and rescans right before writing, so planning
 	// the ops now would scan the differing chunks twice for nothing.
-	plans := make([]msync.TableSync, len(results))
+	dataPlans := make([]msync.TableSync, len(results))
 	for i, r := range results {
-		plans[i] = runner.PlanSummary(ctx, r)
+		dataPlans[i] = runner.PlanSummary(ctx, r)
 	}
+	allPlans := append(append([]msync.TableSync{}, dataPlans...), dropPlans...)
 	// a plan that is an argument error (e.g. keyless + --where) stops the
 	// run before any write
-	if err := planArgErr(plans); err != nil {
+	if err := planArgErr(allPlans); err != nil {
 		return err
 	}
-	if allSkip(plans) {
+	if allSkip(allPlans) {
 		// nothing to write: no confirmation prompt and no write
 		// connection at all
-		printSyncReport(plans, false)
+		printSyncReport(allPlans, false)
 		return nil
 	}
-	proceed, err := confirmApply(syncOpt.apply, syncOpt.yes, syncSummary(plans))
+	proceed, err := confirmApply(syncOpt.apply, syncOpt.yes, syncSummary(allPlans))
 	if err != nil {
 		return err
 	}
@@ -224,11 +233,11 @@ func syncRunE(cmd *cobra.Command, _ []string) error {
 		MaxBytes: batchByteBudget(cfg.Opts.MaxAllowedPacket),
 		Progress: progressLog,
 	}
-	syncResults := make([]msync.TableSync, 0, len(plans))
+	syncResults := make([]msync.TableSync, 0, len(allPlans))
 	synced := make([]string, 0)
 	for i, r := range results {
-		if plans[i].Mode == "SKIP" {
-			syncResults = append(syncResults, plans[i])
+		if dataPlans[i].Mode == "SKIP" {
+			syncResults = append(syncResults, dataPlans[i])
 			continue
 		}
 		ts := runner.ApplyTable(ctx, r, ap)
@@ -236,6 +245,12 @@ func syncRunE(cmd *cobra.Command, _ []string) error {
 		if ts.Status == "APPLIED" {
 			synced = append(synced, ts.Name)
 		}
+	}
+	// Drop the destination-only tables (whole-database mode). A dropped
+	// table is verified by its absence, not by a re-comparison.
+	for _, p := range dropPlans {
+		ts := runner.ApplyDrop(ctx, p.Name, ap)
+		syncResults = append(syncResults, ts)
 	}
 	// verify: re-compare exactly the tables that were written
 	if len(synced) > 0 {
@@ -253,8 +268,79 @@ func syncRunE(cmd *cobra.Command, _ []string) error {
 			}
 		}
 	}
+	// and the table state (the next AUTO_INCREMENT value): of every
+	// table that was written, and of STATE plans that write nothing
+	// (an unfixable divergence — the destination's counter above the
+	// source's — is reported through the check, not skipped). A
+	// backend without the column reports "" — out of scope, never a
+	// failure.
+	for i := range syncResults {
+		s := &syncResults[i]
+		if s.Mode == "DROP" {
+			continue
+		}
+		if s.Status == "APPLIED" || s.Mode == "STATE" {
+			s.StateVerified = runner.VerifyState(ctx, s.Name)
+		}
+	}
 	printSyncReport(syncResults, true)
 	return syncApplyExit(syncResults)
+}
+
+// resolveSyncTables picks the tables the sync converges. With --tables it
+// is strictly those (and nothing else — that mode never plans drops,
+// even for tables the destination has extra). Otherwise it is
+// whole-database mode: the expected set is the source's BASE TABLE set,
+// and the destination's base tables the source lacks (minus the
+// excluded ones) come back as extras, each planning a DROP TABLE.
+// --where disables drop planning: a row-level filter must not drop
+// whole tables.
+func resolveSyncTables(ctx context.Context, cfg *config.Config, src, dst *conn.Side) (tables, extra []string, err error) {
+	if len(cfg.Opts.Tables) > 0 {
+		return cfg.Opts.Tables, nil, nil
+	}
+	srcTables, err := conn.ListBaseTables(ctx, src.Ctl())
+	if err != nil {
+		return nil, nil, failf(ExitRuntimeErr, "src: %v", err)
+	}
+	dstTables, err := conn.ListBaseTables(ctx, dst.Ctl())
+	if err != nil {
+		return nil, nil, failf(ExitRuntimeErr, "dst: %v", err)
+	}
+	tables, extra = syncTableSets(srcTables, dstTables, cfg.Opts.ExcludeTables, cfg.Opts.Where == "")
+	if len(tables) == 0 && len(extra) == 0 {
+		return nil, nil, failf(ExitArgErr, "no tables to sync (the source database is empty; use --tables to specify)")
+	}
+	return tables, extra, nil
+}
+
+// syncTableSets splits the two databases' base-table lists into the set
+// to sync (the source's tables minus the excluded) and the extras (the
+// destination's tables the source lacks, minus the excluded). allowDrops
+// is false under --where: a filtered run never plans whole-table drops.
+func syncTableSets(srcTables, dstTables, exclude []string, allowDrops bool) (tables, extra []string) {
+	excl := make(map[string]bool, len(exclude))
+	for _, t := range exclude {
+		excl[t] = true
+	}
+	srcSet := make(map[string]bool, len(srcTables))
+	for _, t := range srcTables {
+		srcSet[t] = true
+	}
+	for _, t := range srcTables {
+		if !excl[t] {
+			tables = append(tables, t)
+		}
+	}
+	if !allowDrops {
+		return tables, nil
+	}
+	for _, t := range dstTables {
+		if !srcSet[t] && !excl[t] {
+			extra = append(extra, t)
+		}
+	}
+	return tables, extra
 }
 
 // batchByteBudget is the rendered-bytes limit for one multi-row INSERT:
@@ -293,9 +379,14 @@ func allSkip(plans []msync.TableSync) bool {
 	return true
 }
 
+// syncSummary renders the pre-write confirmation: the count of what the
+// sync would do, and the destructive statements (DROP TABLE, DROP
+// COLUMN, DROP INDEX, DROP PRIMARY KEY) listed separately — they are the
+// irreversible ones and must not be hidden behind "N statements will be
+// executed".
 func syncSummary(plans []msync.TableSync) string {
-	var full, row, skip, fail int
-	var names []string
+	var full, row, skip, create, drop, state, stateNote, fail int
+	var names, destructive []string
 	for _, p := range plans {
 		switch p.Mode {
 		case "SKIP":
@@ -310,14 +401,42 @@ func syncSummary(plans []msync.TableSync) string {
 		case "ROWLEVEL":
 			row++
 			names = append(names, p.Name)
+		case "CREATE":
+			create++
+			names = append(names, p.Name+" (create table)")
+		case "DROP":
+			drop++
+		case "STATE":
+			state++
+			if p.StateNote != "" {
+				// an unfixable divergence: reported, but nothing is written
+				stateNote++
+				names = append(names, p.Name+" (state diverged, not fixable by a row-level sync)")
+			} else {
+				names = append(names, p.Name+" (auto-increment state)")
+			}
 		default:
 			fail++
 		}
+		for _, s := range p.SchemaSQL {
+			if msync.DestructiveDDL(s) {
+				destructive = append(destructive, s)
+			}
+		}
 	}
-	summary := fmt.Sprintf("sync would modify %d of %d tables (%d truncate+resync, %d row-level, %d failed)",
-		full+row, len(plans), full, row, fail)
+	summary := fmt.Sprintf("sync would modify %d of %d tables (%d truncate+resync, %d row-level, %d create, %d drop, %d state, %d failed)",
+		full+row+create+drop+state-stateNote, len(plans), full, row, create, drop, state, fail)
+	if stateNote > 0 {
+		summary += fmt.Sprintf("; %d table state divergence(s) reported but not fixable by a row-level sync", stateNote)
+	}
 	if len(names) > 0 {
 		summary += ": " + strings.Join(names, ", ")
+	}
+	if len(destructive) > 0 {
+		summary += fmt.Sprintf("\nDESTRUCTIVE: %d irreversible statement(s) will be executed:", len(destructive))
+		for _, s := range destructive {
+			summary += "\n  " + s
+		}
 	}
 	return summary
 }
@@ -356,6 +475,9 @@ func syncApplyExit(res []msync.TableSync) error {
 		case r.Status == "FAILED":
 			anyFailed = true
 		case r.Verified == "DIFFERENT" || r.Verified == "ERROR":
+			anyDiff = true
+		// the rows converged but the table state (AUTO_INCREMENT) did not
+		case r.StateVerified == "DIFFERENT":
 			anyDiff = true
 		}
 	}

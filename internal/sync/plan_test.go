@@ -31,7 +31,9 @@ func TestDecidePlan(t *testing.T) {
 		{"error passes through", result("ERROR", 0, 0), true, true, "", ModeError, true},
 		{"keyless with where is an error", result("DIFFERENT", 10, 10), false, true, "x=1", ModeError, true},
 		{"keyless differs: full resync", result("DIFFERENT", 10, 10, 0), false, true, "", ModeFull, false},
-		{"dst more rows: full resync", result("DIFFERENT", 10, 12), true, true, "", ModeFull, false},
+		// extra rows on the destination are addressed by key and deleted:
+		// the row counts never force a full resync
+		{"dst more rows: row-level deletes", result("DIFFERENT", 10, 12), true, true, "", ModeRowLevel, false},
 		{"dst more rows but filtered: row-level", result("DIFFERENT", 10, 12, 1), true, true, "x=1", ModeRowLevel, false},
 		{"dst fewer rows: row-level", result("DIFFERENT", 12, 10), true, true, "", ModeRowLevel, false},
 		{"equal counts: row-level with chunk list", result("DIFFERENT", 10, 10, 1, 3), true, true, "", ModeRowLevel, false},

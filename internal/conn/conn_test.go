@@ -126,3 +126,96 @@ func TestCompatible(t *testing.T) {
 		t.Error("strict mode must reject INT vs UINT")
 	}
 }
+
+func TestParseShowCreateAutoInc(t *testing.T) {
+	cases := []struct {
+		name         string
+		create       string
+		wantCol      string
+		wantExplicit int64
+		wantHasExp   bool
+	}{
+		{
+			name: "explicit counter, backticked auto-inc column",
+			create: "CREATE TABLE `t` (\n" +
+				"  `id` int NOT NULL AUTO_INCREMENT,\n" +
+				"  `code` varchar(16) NOT NULL,\n" +
+				"  PRIMARY KEY (`id`)\n" +
+				") ENGINE=InnoDB AUTO_INCREMENT=12001 DEFAULT CHARSET=utf8mb4",
+			wantCol: "id", wantExplicit: 12001, wantHasExp: true,
+		},
+		{
+			name: "no explicit counter (default follows max(id)+1)",
+			create: "CREATE TABLE `t` (\n" +
+				"  `id` int NOT NULL AUTO_INCREMENT,\n" +
+				"  PRIMARY KEY (`id`)\n" +
+				") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+			wantCol: "id", wantExplicit: 0, wantHasExp: false,
+		},
+		{
+			name: "no auto-increment column at all",
+			create: "CREATE TABLE `t` (\n" +
+				"  `id` int NOT NULL,\n" +
+				"  PRIMARY KEY (`id`)\n" +
+				") ENGINE=InnoDB",
+			wantCol: "", wantExplicit: 0, wantHasExp: false,
+		},
+		{
+			name: "varchar auto-inc column with comment (paren in the type)",
+			create: "CREATE TABLE `t` (\n" +
+				"  `id` varchar(16) NOT NULL AUTO_INCREMENT COMMENT 'the id',\n" +
+				"  PRIMARY KEY (`id`)\n" +
+				") ENGINE=InnoDB AUTO_INCREMENT=7",
+			wantCol: "id", wantExplicit: 7, wantHasExp: true,
+		},
+		{
+			name:    "single-line output",
+			create:  "CREATE TABLE `t` (`id` int NOT NULL AUTO_INCREMENT) ENGINE=InnoDB AUTO_INCREMENT=42 DEFAULT CHARSET=utf8mb4",
+			wantCol: "id", wantExplicit: 42, wantHasExp: true,
+		},
+		{
+			name: "bare (unbackticked) column definition",
+			create: "CREATE TABLE t (\n" +
+				"  id int NOT NULL AUTO_INCREMENT,\n" +
+				"  PRIMARY KEY (id)\n" +
+				") ENGINE=InnoDB AUTO_INCREMENT=5",
+			wantCol: "id", wantExplicit: 5, wantHasExp: true,
+		},
+		{
+			name: "explicit counter below the data maximum still parsed",
+			create: "CREATE TABLE `t` (\n" +
+				"  `id` bigint NOT NULL AUTO_INCREMENT,\n" +
+				"  PRIMARY KEY (`id`)\n" +
+				") ENGINE=InnoDB AUTO_INCREMENT=3 DEFAULT CHARSET=utf8mb4",
+			wantCol: "id", wantExplicit: 3, wantHasExp: true,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			col, explicit, hasExplicit := parseShowCreateAutoInc(c.create)
+			if col != c.wantCol {
+				t.Errorf("col = %q, want %q", col, c.wantCol)
+			}
+			if explicit != c.wantExplicit {
+				t.Errorf("explicit = %d, want %d", explicit, c.wantExplicit)
+			}
+			if hasExplicit != c.wantHasExp {
+				t.Errorf("hasExplicit = %v, want %v", hasExplicit, c.wantHasExp)
+			}
+		})
+	}
+}
+
+func TestFirstIdent(t *testing.T) {
+	cases := map[string]string{
+		"  `id` int NOT NULL AUTO_INCREMENT,": "id",
+		"`my col` int AUTO_INCREMENT":         "my col",
+		"  id bigint NOT NULL AUTO_INCREMENT": "id",
+		"_under int AUTO_INCREMENT":           "_under",
+	}
+	for in, want := range cases {
+		if got := firstIdent(in); got != want {
+			t.Errorf("firstIdent(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

@@ -4,6 +4,14 @@
 -- _n is kept for the mutation scripts (they reseed drifted tables).
 SET time_zone = '+00:00';
 
+-- t_c_extra (destination-only, m_c_extra.sql) and t_c2 (source-only,
+-- m_c2_src.sql — the whole-DB scenario also creates it on the
+-- destination) are scenario artifacts, not seed tables: drop them up
+-- front so a re-run over the containers left running after a failed
+-- run starts from the same baseline (no-ops where absent).
+DROP TABLE IF EXISTS t_c_extra;
+DROP TABLE IF EXISTS t_c2;
+
 DROP TABLE IF EXISTS _n;
 CREATE TABLE _n (d INT) ENGINE=InnoDB;
 INSERT INTO _n VALUES (0), (1), (2), (3), (4), (5), (6), (7), (8), (9);
@@ -92,3 +100,21 @@ CREATE TABLE t_nopk (
 INSERT INTO t_nopk (id, val)
 SELECT a.d * 2 + b.d + 1, CONCAT('p', a.d * 2 + b.d + 1)
 FROM _n a, _n b WHERE b.d < 2;
+
+-- t_cai: 10 rows, auto-increment PK; the table-STATE (AUTO_INCREMENT)
+-- scenario converges the destination's counter to the source's (the source
+-- counter is pushed to 5001 by m_cai_src.sql). The seed pins BOTH sides'
+-- counters to an explicit base (1001): a freshly seeded table is not
+-- state-identical across backends — TiDB's ID allocator pre-allocates a
+-- batch (its reported next value lands ~30000, while MySQL's is max+1),
+-- and an explicit base makes the baseline aligned everywhere. The suite's
+-- scenario is then a plain raise (1001 -> 5001), valid on every backend.
+DROP TABLE IF EXISTS t_cai;
+CREATE TABLE t_cai (
+  id  INT PRIMARY KEY AUTO_INCREMENT,
+  val VARCHAR(20)
+) ENGINE=InnoDB;
+INSERT INTO t_cai (id, val)
+SELECT b.d + 1, CONCAT('k', b.d + 1)
+FROM _n b WHERE b.d < 10;
+ALTER TABLE t_cai AUTO_INCREMENT = 1001;

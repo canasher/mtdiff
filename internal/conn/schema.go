@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -443,4 +444,230 @@ func ListTables(ctx context.Context, db *sql.DB) ([]string, error) {
 		tables = append(tables, t)
 	}
 	return tables, rows.Err()
+}
+
+// ListBaseTables returns the BASE TABLE names of the current database (views
+// and other object types are excluded: the sync reconciles regular tables
+// only). Sorted for deterministic ordering.
+func ListBaseTables(ctx context.Context, db *sql.DB) ([]string, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT TABLE_NAME FROM information_schema.TABLES
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_TYPE = 'BASE TABLE'
+		ORDER BY TABLE_NAME`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var tables []string
+	for rows.Next() {
+		var t string
+		if err := rows.Scan(&t); err != nil {
+			return nil, err
+		}
+		tables = append(tables, t)
+	}
+	return tables, rows.Err()
+}
+
+// TableExists reports whether the table exists in the current database.
+func TableExists(ctx context.Context, db *sql.DB, table string) (bool, error) {
+	var n int
+	err := db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM information_schema.TABLES
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?`, table).Scan(&n)
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// informationSchemaAutoInc reads the AUTO_INCREMENT estimate from
+// information_schema.TABLES: present is false when the backend reports
+// NULL (the table has no auto-increment column); err when the query
+// itself is not supported (the caller degrades to skipping the table-
+// state reconciliation; see the sync package).
+func informationSchemaAutoInc(ctx context.Context, db *sql.DB, table string) (value int64, present bool, err error) {
+	var v sql.NullInt64
+	if err := db.QueryRowContext(ctx, `
+		SELECT AUTO_INCREMENT FROM information_schema.TABLES
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?`, table).Scan(&v); err != nil {
+		if err == sql.ErrNoRows {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	return v.Int64, v.Valid, nil
+}
+
+// showCreateAutoIncValue matches the table-level option
+// ") ENGINE=InnoDB AUTO_INCREMENT=12001 ..." — present only when the
+// counter was set explicitly (CREATE/ALTER with an initial value).
+var showCreateAutoIncValueRe = regexp.MustCompile(`AUTO_INCREMENT=(\d+)`)
+
+// TableAutoIncrement returns the value the server will assign to the
+// table's next auto-increment row: the explicit counter (the
+// AUTO_INCREMENT= clause of SHOW CREATE TABLE) when it exceeds
+// max(column), otherwise max(column)+1 (1 for an empty table). The
+// information_schema.TABLES estimate is not a reliable source — InnoDB
+// does not refresh it when the counter changes a second time (a second
+// ALTER TABLE ... AUTO_INCREMENT, or a TRUNCATE that resets it), and it
+// stays stale until the table is dropped, so the explicit value and the
+// column maximum are read directly. present is false when the backend
+// reports NULL (the table has no auto-increment column); err when the
+// state cannot be read at all (the caller degrades to skipping the
+// table-state reconciliation; see the sync package).
+func TableAutoIncrement(ctx context.Context, db *sql.DB, table string) (value int64, present bool, err error) {
+	est, present, err := informationSchemaAutoInc(ctx, db, table)
+	if err != nil || !present {
+		return 0, present, err
+	}
+	col, explicit, hasExplicit, ok := showCreateAutoInc(ctx, db, table)
+	if ok && col != "" {
+		var m sql.NullInt64
+		if err := db.QueryRowContext(ctx,
+			"SELECT MAX("+QuoteIdent(col)+") FROM "+QuoteIdent(table)).Scan(&m); err == nil {
+			next := int64(1)
+			if m.Valid {
+				next = m.Int64 + 1
+			}
+			if hasExplicit && explicit > next {
+				next = explicit
+			}
+			return next, true, nil
+		}
+		if hasExplicit {
+			return explicit, true, nil
+		}
+	} else if ok && hasExplicit {
+		return explicit, true, nil
+	}
+	// The backend does not render a parseable SHOW CREATE (or the column
+	// maximum could not be read): fall back to the estimate.
+	return est, true, nil
+}
+
+// showCreateAutoIncCol matches the AUTO_INCREMENT column attribute in a
+// column definition (the table option is excluded — it carries '='):
+// "`id` int NOT NULL AUTO_INCREMENT". The span between the name and the
+// attribute may not cross a backtick, so a match cannot run past the
+// next column definition.
+var showCreateAutoIncColRe = regexp.MustCompile("`([^`]*)`[^`\n]*?\\bAUTO_INCREMENT\\b(?:[^=]|$)")
+
+// showCreateAutoInc parses the auto-increment facts out of SHOW CREATE
+// TABLE: the auto-increment column name (from the column definition)
+// and the explicit counter (the table-level AUTO_INCREMENT= clause).
+// ok is false when the query fails or the output is unparseable.
+func showCreateAutoInc(ctx context.Context, db *sql.DB, table string) (col string, explicit int64, hasExplicit, ok bool) {
+	var name, create string
+	if err := db.QueryRowContext(ctx, "SHOW CREATE TABLE "+QuoteIdent(table)).Scan(&name, &create); err != nil {
+		return "", 0, false, false
+	}
+	col, explicit, hasExplicit = parseShowCreateAutoInc(create)
+	return col, explicit, hasExplicit, true
+}
+
+// parseShowCreateAutoInc extracts, from a SHOW CREATE TABLE body, the
+// auto-increment column name and the explicit counter (the table-level
+// AUTO_INCREMENT= clause, present only when the counter was set
+// explicitly).
+func parseShowCreateAutoInc(create string) (col string, explicit int64, hasExplicit bool) {
+	for _, line := range strings.Split(create, "\n") {
+		if m := showCreateAutoIncValueRe.FindStringSubmatch(line); m != nil {
+			if v, err := strconv.ParseInt(m[1], 10, 64); err == nil {
+				explicit, hasExplicit = v, true
+			}
+		}
+	}
+	if m := showCreateAutoIncColRe.FindStringSubmatch(create); m != nil {
+		col = m[1]
+	} else {
+		// bare (unbackticked) column definitions: the line starts with
+		// the identifier itself and carries the attribute without '='
+		for _, line := range strings.Split(create, "\n") {
+			trimmed := strings.TrimLeft(line, " \t")
+			if strings.Contains(line, "AUTO_INCREMENT") && !strings.Contains(line, "AUTO_INCREMENT=") &&
+				len(trimmed) > 0 && (trimmed[0] == '_' || trimmed[0] >= 'a' || trimmed[0] >= 'A') {
+				col = firstIdent(line)
+				break
+			}
+		}
+	}
+	return col, explicit, hasExplicit
+}
+
+// firstIdent extracts the leading identifier of a column definition line
+// (backticked or bare).
+func firstIdent(line string) string {
+	line = strings.TrimLeft(line, " \t")
+	if strings.HasPrefix(line, "`") {
+		if end := strings.Index(line[1:], "`"); end >= 0 {
+			return line[1 : 1+end]
+		}
+	}
+	if i := strings.IndexAny(line, " ("); i > 0 {
+		return line[:i]
+	}
+	return strings.TrimSpace(line)
+}
+
+// AutoIncGap probes one side's auto-increment reporting behavior with a
+// read-only check: it finds the first table with an auto-increment
+// column and returns how far the reported next value sits above
+// max(column)+1. A large gap means the backend pre-allocates ID ranges
+// (an allocator, e.g. TiDB's batch allocation): its reported next value
+// is then an estimate that a plain INSERT history cannot explain, and an
+// explicit counter below the allocated range's end is silently ignored —
+// the table state is not exactly comparable. probed is false when the
+// side has no auto-increment table (the check is inconclusive, not a
+// degradation).
+func AutoIncGap(ctx context.Context, db *sql.DB) (gap int64, probed bool, err error) {
+	row := db.QueryRowContext(ctx, `
+		SELECT TABLE_NAME, COLUMN_NAME FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA = DATABASE() AND EXTRA LIKE '%auto_increment%'
+		LIMIT 1`)
+	var table, col string
+	if err := row.Scan(&table, &col); err != nil {
+		if err == sql.ErrNoRows {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	v, present, err := TableAutoIncrement(ctx, db, table)
+	if err != nil {
+		return 0, false, err
+	}
+	if !present {
+		return 0, false, nil
+	}
+	var m sql.NullInt64
+	if err := db.QueryRowContext(ctx,
+		"SELECT MAX("+QuoteIdent(col)+") FROM "+QuoteIdent(table)).Scan(&m); err != nil {
+		return 0, false, err
+	}
+	next := int64(1)
+	if m.Valid {
+		next = m.Int64 + 1
+	}
+	if v < next {
+		gap = 0
+	} else {
+		gap = v - next
+	}
+	return gap, true, nil
+}
+
+// TableEngine returns the table's storage engine from information_schema
+// (empty when the backend reports none).
+func TableEngine(ctx context.Context, db *sql.DB, table string) (string, error) {
+	var e string
+	err := db.QueryRowContext(ctx, `
+		SELECT ENGINE FROM information_schema.TABLES
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?`, table).Scan(&e)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return e, nil
 }
