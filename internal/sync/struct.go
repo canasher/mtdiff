@@ -45,7 +45,8 @@ type Change struct {
 // default" — see colDiffers.
 //
 // It returns an error when a source definition cannot be reproduced on the
-// destination (an expression default): the caller then fails the table
+// destination (a generated column — the expression is a cross-backend
+// promise; or an expression default): the caller then fails the table
 // instead of guessing.
 func DiffStructure(src, dst *conn.Struct, srcDef, dstDef string) ([]Change, error) {
 	srcCols := make(map[string]bool, len(src.Cols))
@@ -133,6 +134,14 @@ func colDiffers(sc, dc conn.ColMeta, srcDef, dstDef string) bool {
 		(sc.Family == conn.FamTIMESTAMP && dc.Family == conn.FamDATETIME) {
 		return false
 	}
+	// A column becoming generated (or ceasing to be) is a semantic change
+	// the raw type alone would not reveal: the generated-ness is part of
+	// the definition. (A re-defined generated column is then refused by
+	// addable — the expression cannot be reproduced.)
+	if sc.Generated != dc.Generated ||
+		(sc.Generated && !strings.EqualFold(sc.GenStorage, dc.GenStorage)) {
+		return true
+	}
 	if normalizeIntType(sc.RawType) != normalizeIntType(dc.RawType) {
 		return true
 	}
@@ -192,6 +201,8 @@ func defaultCollationsMatch(sc, dc conn.ColMeta, srcDef, dstDef string) bool {
 // colWhy renders a short drift description for the report.
 func colWhy(sc, dc conn.ColMeta) string {
 	switch {
+	case sc.Generated != dc.Generated:
+		return fmt.Sprintf("generated column %v -> %v", dc.Generated, sc.Generated)
 	case !strings.EqualFold(sc.RawType, dc.RawType):
 		return fmt.Sprintf("type %s -> %s", dc.RawType, sc.RawType)
 	case sc.Nullable != dc.Nullable:
@@ -209,16 +220,44 @@ func colWhy(sc, dc conn.ColMeta) string {
 }
 
 // addable rejects source definitions the destination cannot be given
-// faithfully. An expression default ("(expr)", MySQL 8.0.13+) is stored in
-// information_schema unevaluated; re-emitting it would mean trusting the
-// expression to still exist on the other server, so the table fails the
-// structure sync instead of guessing.
+// faithfully. A generated column is the first case (P0-2): the generation
+// expression is a cross-backend promise (it may reference other columns or
+// server functions that do not exist, or do not behave alike, on the other
+// side), and a re-defined column would silently LOSE the expression — so
+// the structure sync refuses instead of guessing; the operator aligns the
+// schema manually or turns the structure sync off. An expression default
+// ("(expr)", MySQL 8.0.13+) is stored in information_schema unevaluated;
+// re-emitting it would mean trusting the expression to still exist on the
+// other server, so the table fails the structure sync instead of guessing.
 func addable(c conn.ColMeta) error {
+	if c.Generated {
+		storage := c.GenStorage
+		if storage == "" {
+			storage = "GENERATED"
+		}
+		return fmt.Errorf("column %s is a generated column (%s) that the structure sync cannot reproduce on the destination; align the schema manually or use --no-sync-schema",
+			c.Name, storage)
+	}
 	if c.HasDefault && strings.HasPrefix(c.Default, "(") {
 		return fmt.Errorf("column %s has an expression default (%s) that cannot be reproduced on the destination; re-run with --no-sync-schema",
 			c.Name, c.Default)
 	}
 	return nil
+}
+
+// generatedCols lists a structure's generated columns ("" when none). The
+// CREATE path uses it: a table with a generated column cannot be created
+// on the destination faithfully (see addable), so the create plan is
+// refused instead of emitting a structure that silently lacks the
+// expression.
+func generatedCols(s *conn.Struct) []string {
+	var out []string
+	for _, c := range s.Cols {
+		if c.Generated {
+			out = append(out, c.Name)
+		}
+	}
+	return out
 }
 
 // filterStruct removes ignored columns from a structure (and any index that

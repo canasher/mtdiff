@@ -63,7 +63,7 @@ func TestQuoteIdent(t *testing.T) {
 func TestBuildDSN(t *testing.T) {
 	ep := config.Endpoint{Host: "10.0.0.1", Port: 3307, User: "root", Password: "s3:cret", Database: "dbA"}
 	dsn := BuildDSN(ep, 0)
-	want := "root:s3%3Acret@tcp(10.0.0.1:3307)/dbA?parseTime=true&loc=UTC&charset=utf8mb4&timeout=10s&readTimeout=10m&writeTimeout=10s"
+	want := "root:s3%3Acret@tcp(10.0.0.1:3307)/dbA?parseTime=true&loc=UTC&charset=utf8mb4&timeout=10s&readTimeout=10m&writeTimeout=10s&interpolateParams=false"
 	if dsn != want {
 		t.Errorf("BuildDSN = %q, want %q", dsn, want)
 	}
@@ -79,7 +79,7 @@ func TestBuildDSN(t *testing.T) {
 	// The writer DSN only differs in a longer network write timeout: a
 	// multi-row INSERT batch can take far longer to send than a query.
 	epw := config.Endpoint{Host: "10.0.0.1", Port: 3307, User: "root", Password: "s3:cret", Database: "dbA"}
-	if wdsn := BuildWriterDSN(epw, 0); wdsn != "root:s3%3Acret@tcp(10.0.0.1:3307)/dbA?parseTime=true&loc=UTC&charset=utf8mb4&timeout=10s&readTimeout=10m&writeTimeout=600s" {
+	if wdsn := BuildWriterDSN(epw, 0); wdsn != "root:s3%3Acret@tcp(10.0.0.1:3307)/dbA?parseTime=true&loc=UTC&charset=utf8mb4&timeout=10s&readTimeout=10m&writeTimeout=600s&interpolateParams=false" {
 		t.Errorf("BuildWriterDSN = %q", wdsn)
 	}
 }

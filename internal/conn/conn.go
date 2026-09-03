@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 
 	_ "github.com/go-sql-driver/mysql"
 
@@ -19,17 +20,38 @@ import (
 
 // Side is one endpoint (source or destination) under comparison.
 //
-// It holds two pools: a control pool (MaxOpenConns=1) for introspection and
-// planning queries, and a scan pool (MaxOpenConns=parallel) whose dedicated
-// connections are pinned to workers so the session safety policy stays in
-// effect for the whole scan. OpenSide pre-warms the scan pool (the policy
-// is applied once per connection there), so AcquireScan is a plain checkout.
+// It holds two pools: a control pool (MaxOpenConns=1) for introspection
+// and planning queries, and a scan pool (MaxOpenConns=parallel) whose
+// dedicated connections are pinned to workers so the session safety policy
+// stays in effect for the whole scan.
+//
+// The policy (applySession) is applied per PHYSICAL connection, tracked in
+// inited: the pre-warm in OpenSide cannot guarantee it — database/sql
+// hands the same idle connection back to consecutive Conn() calls, so a
+// parallel=4 pre-warm may have touched far fewer than four physical
+// connections, and any connection opened lazily later (or replacing a
+// dead one) would run without the read-only session. AcquireScan therefore
+// applies the policy (idempotent, see applySession) on the first checkout
+// of every connection it has not initialized, and only then returns it.
+//
+// The map is keyed by the server-assigned CONNECTION_ID, not by the
+// *sql.Conn pointer: database/sql allocates a FRESH *sql.Conn wrapper on
+// every DB.Conn() call (the pooled object is an internal driverConn), so
+// pointer identity never matches and the memo would be dead — the SET
+// batch would re-run on every checkout and the map would grow without
+// bound. The connection ID is stable for the life of the physical
+// connection (and, on a server restart during a run, a recycled ID can at
+// worst skip the idempotent re-set on a connection mtdiff still only
+// issues SELECTs on).
 type Side struct {
-	Name    string
-	Version string
-	ep      config.Endpoint
-	scan    *sql.DB
-	ctl     *sql.DB
+	Name          string
+	Version       string
+	ep            config.Endpoint
+	scan          *sql.DB
+	ctl           *sql.DB
+	allowUnforced bool
+	initMu        *sync.Mutex
+	inited        map[int64]bool
 }
 
 // BuildDSN assembles the driver DSN. parseTime=true&loc=UTC is mandatory:
@@ -57,7 +79,12 @@ func buildDSN(ep config.Endpoint, maxAllowedPacket, writeTimeoutSec int) string 
 	b.WriteString(hostport)
 	b.WriteString(")/")
 	b.WriteString(ep.Database)
-	fmt.Fprintf(&b, "?parseTime=true&loc=UTC&charset=utf8mb4&timeout=10s&readTimeout=10m&writeTimeout=%ds", writeTimeoutSec)
+	// interpolateParams=false (the driver default, stated deliberately):
+	// parameters travel to the server and are bound as DATA there, so a
+	// value is never rendered into the statement text on the client — the
+	// only way string values with backslashes/quotes stay intact under
+	// NO_BACKSLASH_ESCAPES (P0-3).
+	fmt.Fprintf(&b, "?parseTime=true&loc=UTC&charset=utf8mb4&timeout=10s&readTimeout=10m&writeTimeout=%ds&interpolateParams=false", writeTimeoutSec)
 	if maxAllowedPacket > 0 {
 		fmt.Fprintf(&b, "&maxAllowedPacket=%d", maxAllowedPacket)
 	}
@@ -65,15 +92,17 @@ func buildDSN(ep config.Endpoint, maxAllowedPacket, writeTimeoutSec int) string 
 }
 
 // OpenSide opens both pools, preconditions the control connection and
-// pre-warms the scan pool with the session policy applied, then verifies the
-// server answers.
+// pre-warms the scan pool, then verifies the server answers.
 //
-// The scan pool is pre-warmed (one policy application per connection) so
-// that AcquireScan is a plain checkout. Re-applying the policy on every
-// checkout cost a full SET round-trip per chunk, and the sql_mode append is
-// not idempotent: re-applying it grew the session sql_mode by 31 characters
-// per checkout until it exceeded sql_max_mode_size (255 on 8.0) and every
-// subsequent chunk printed a stderr warning.
+// The pre-warm is a latency optimization, NOT the correctness mechanism:
+// database/sql hands the same idle connection back to consecutive Conn()
+// calls, so the loop may have initialized far fewer than `parallel`
+// physical connections, and connections opened lazily later never get the
+// policy from it. The per-connection guarantee lives in AcquireScan (the
+// inited map): every connection is policy-applied before first use. That
+// application is cheap — it runs once per physical connection (the maps
+// remember), and applySession is idempotent (the sql_mode flags are added
+// at most once, the read-only SET is a no-op when already ON).
 //
 // allowUnenforcedReadOnly is config.Options.AllowUnenforcedReadOnly; see
 // applySession for what it relaxes.
@@ -98,6 +127,21 @@ func OpenSide(ctx context.Context, name string, ep config.Endpoint, maxAllowedPa
 	ctlDB.SetMaxOpenConns(1)
 	ctlDB.SetConnMaxLifetime(0)
 
+	inited := make(map[int64]bool)
+	var initMu sync.Mutex
+	// remember marks a physical connection as policy-applied, keyed by
+	// its server-assigned CONNECTION_ID (the *sql.Conn wrapper cannot
+	// identify it — see the Side.inited doc).
+	remember := func(ctx context.Context, c *sql.Conn) error {
+		var id int64
+		if err := c.QueryRowContext(ctx, "SELECT CONNECTION_ID()").Scan(&id); err != nil {
+			return fmt.Errorf("connection id: %w", err)
+		}
+		initMu.Lock()
+		inited[id] = true
+		initMu.Unlock()
+		return nil
+	}
 	c, err := ctlDB.Conn(ctx)
 	if err != nil {
 		scanDB.Close()
@@ -105,6 +149,12 @@ func OpenSide(ctx context.Context, name string, ep config.Endpoint, maxAllowedPa
 		return nil, fmt.Errorf("%s: connect to %s: %w", name, ep.MaskedDSN(), err)
 	}
 	if err := applySession(ctx, c, allowUnenforcedReadOnly); err != nil {
+		c.Close()
+		scanDB.Close()
+		ctlDB.Close()
+		return nil, fmt.Errorf("%s: %s: %w", name, ep.MaskedDSN(), err)
+	}
+	if err := remember(ctx, c); err != nil {
 		c.Close()
 		scanDB.Close()
 		ctlDB.Close()
@@ -142,9 +192,24 @@ func OpenSide(ctx context.Context, name string, ep config.Endpoint, maxAllowedPa
 			ctlDB.Close()
 			return nil, fmt.Errorf("%s: pre-warm scan pool: %s: %w", name, ep.MaskedDSN(), err)
 		}
+		if err := remember(ctx, sc); err != nil {
+			sc.Close()
+			scanDB.Close()
+			ctlDB.Close()
+			return nil, fmt.Errorf("%s: pre-warm scan pool: %s: %w", name, ep.MaskedDSN(), err)
+		}
 		sc.Close() // back to the idle pool, policy already in effect
 	}
-	return &Side{Name: name, Version: version, ep: ep, scan: scanDB, ctl: ctlDB}, nil
+	return &Side{
+		Name:          name,
+		Version:       version,
+		ep:            ep,
+		scan:          scanDB,
+		ctl:           ctlDB,
+		allowUnforced: allowUnenforcedReadOnly,
+		initMu:        &initMu,
+		inited:        inited,
+	}, nil
 }
 
 // applySession enforces the read-only safety net and best-effort guardrails
@@ -220,14 +285,40 @@ func bestEffort(ctx context.Context, c *sql.Conn, stmt string) {
 	}
 }
 
-// AcquireScan returns a dedicated scan connection. The session policy is
-// applied exactly once per connection, during the pool pre-warm in
-// OpenSide, so this is a plain checkout (no SET round-trip per chunk).
-// Callers must Close it when done.
+// AcquireScan returns a dedicated scan connection whose session safety
+// policy (read-only enforcement and guardrails) has been applied. The
+// policy is applied once per PHYSICAL connection (the inited map
+// remembers it by CONNECTION_ID), so a warm checkout costs one small
+// CONNECTION_ID() lookup and the first use of a freshly opened
+// connection costs one SET batch. A connection the map does not know
+// (opened lazily by database/sql, or replacing a dead one) is
+// initialized here before it may be used: this is what makes "every
+// connection that actually scans is read-only" hold for parallel > 1,
+// regardless of how the pre-warm interleaved. Callers must Close it
+// when done.
 func (s *Side) AcquireScan(ctx context.Context) (*sql.Conn, error) {
 	c, err := s.scan.Conn(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("%s: acquire scan connection: %w", s.Name, err)
+	}
+	var id int64
+	if err := c.QueryRowContext(ctx, "SELECT CONNECTION_ID()").Scan(&id); err != nil {
+		c.Close()
+		return nil, fmt.Errorf("%s: connection id: %w", s.Name, err)
+	}
+	s.initMu.Lock()
+	first := !s.inited[id]
+	if first {
+		s.inited[id] = true
+	}
+	s.initMu.Unlock()
+	if first {
+		// Outside the lock: the SET batch must not hold the map mutex
+		// (another worker may wait on it while this round trip runs).
+		if err := applySession(ctx, c, s.allowUnforced); err != nil {
+			c.Close()
+			return nil, fmt.Errorf("%s: init scan connection: %w", s.Name, err)
+		}
 	}
 	return c, nil
 }

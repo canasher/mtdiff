@@ -2,6 +2,7 @@ package compare
 
 import (
 	"context"
+	"database/sql"
 	"database/sql/driver"
 	"fmt"
 	"sort"
@@ -38,7 +39,12 @@ type RowDiff struct {
 // is a key-set difference (CHANGED / MISSING_IN_*); for keyless tables it
 // is a multiset difference (COUNT_DIFF, or MISSING_IN_* when a row exists
 // on only one side).
-type DrillDown struct{}
+type DrillDown struct {
+	// Optional per-side dedicated connections (snapshot mode): when set,
+	// the scans run on them — the caller's still-open, uncommitted
+	// snapshot transactions — instead of acquiring pool connections.
+	srcCN, dstCN *sql.Conn
+}
 
 type rowRec struct {
 	keys  string // rendered key values (keyed tables)
@@ -57,17 +63,23 @@ const drillMaxRows = 100_000
 // was truncated to drillMaxRows: the row-level results are then a sample of
 // that many rows per side, not the exact multiset difference.
 func (d *DrillDown) Diff(ctx context.Context, src, dst *conn.Side, srcSchema, dstSchema *conn.Schema, srcNorm, dstNorm *normalize.Normalizer, ch chunk.Chunk, where string, limit int) ([]RowDiff, bool, error) {
-	// Keyed matching only makes sense when both sides agree on a key.
-	// With a keyed source and a keyless destination (structure drift,
-	// --no-sync-schema) the row maps have different shapes, so buffer
-	// both sides as multisets: the key columns stay in Cols on both
-	// sides, so the canonical rows are still comparable.
-	bothKeyed := len(srcSchema.Key) > 0 && len(dstSchema.Key) > 0
-	srcRows, srcTrunc, err := d.scanRows(ctx, src, srcSchema, srcNorm, ch, where, bothKeyed)
+	// Keyed matching only makes sense when both sides agree on a key:
+	// the same columns in the same order. With a keyed source and a
+	// keyless destination (structure drift, --no-sync-schema) the row
+	// maps have different shapes, so buffer both sides as multisets:
+	// the key columns stay in Cols on both sides, so the canonical
+	// rows are still comparable. The same fallback applies when both
+	// sides are keyed but the keys differ (PK (a,b) vs (b,a)): the key
+	// columns of the two maps would name different row identities, so a
+	// keyed join would pair the wrong rows — order-independent
+	// multisets stay correct.
+	bothKeyed := len(srcSchema.Key) > 0 && len(dstSchema.Key) > 0 &&
+		sameKeySequence(srcSchema.Key, dstSchema.Key)
+	srcRows, srcTrunc, err := d.scanRows(ctx, src, d.srcCN, srcSchema, srcNorm, ch, where, bothKeyed)
 	if err != nil {
 		return nil, false, fmt.Errorf("src: %w", err)
 	}
-	dstRows, dstTrunc, err := d.scanRows(ctx, dst, dstSchema, dstNorm, ch, where, bothKeyed)
+	dstRows, dstTrunc, err := d.scanRows(ctx, dst, d.dstCN, dstSchema, dstNorm, ch, where, bothKeyed)
 	if err != nil {
 		return nil, false, fmt.Errorf("dst: %w", err)
 	}
@@ -83,12 +95,15 @@ func (d *DrillDown) Diff(ctx context.Context, src, dst *conn.Side, srcSchema, ds
 // result set (closing it early would kill the dedicated pool connection,
 // which is pre-conditioned and not cheaply replaceable) but stops
 // buffering, and reports truncated=true.
-func (d *DrillDown) scanRows(ctx context.Context, side *conn.Side, schema *conn.Schema, norm *normalize.Normalizer, ch chunk.Chunk, where string, keyed bool) (map[string]*rowRec, bool, error) {
-	cn, err := side.AcquireScan(ctx)
-	if err != nil {
-		return nil, false, err
+func (d *DrillDown) scanRows(ctx context.Context, side *conn.Side, cn *sql.Conn, schema *conn.Schema, norm *normalize.Normalizer, ch chunk.Chunk, where string, keyed bool) (map[string]*rowRec, bool, error) {
+	if cn == nil {
+		acquired, err := side.AcquireScan(ctx)
+		if err != nil {
+			return nil, false, err
+		}
+		cn = acquired
+		defer cn.Close()
 	}
-	defer cn.Close()
 
 	cols := make([]string, 0, len(schema.Key)+len(schema.Cols))
 	for _, k := range schema.Key {

@@ -21,7 +21,7 @@ func PrepareSchemas(ctx context.Context, src, dst *conn.Side, table string, key 
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("dst introspection: %w", err)
 	}
-	keyWarns := applyKey(srcSchema, dstSchema, key)
+	keyWarns := applyKey(srcSchema, dstSchema, key, resolveKeyUniqueness(ctx, src, dst, table, key))
 	srcSchema, dstSchema, err = filterIgnored(srcSchema, dstSchema, ignore)
 	if err != nil {
 		return nil, nil, nil, err
@@ -31,6 +31,21 @@ func PrepareSchemas(ctx context.Context, src, dst *conn.Side, table string, key 
 		return nil, nil, nil, fmt.Errorf("schema mismatch: %w", err)
 	}
 	return srcSchema, dstSchema, append(keyWarns, warns...), nil
+}
+
+// resolveKeyUniqueness returns the per-side resolver for an explicit
+// --key: it asks each side's index catalog whether the key is a unique row
+// address there (conn.ExplicitKeyIsUnique). Both sides are introspected
+// under the same table name, so the resolver is keyed by side, not by
+// table.
+func resolveKeyUniqueness(ctx context.Context, src, dst *conn.Side, table string, key []string) func(string) (bool, error) {
+	return func(side string) (bool, error) {
+		ctl := src.Ctl()
+		if side == "dst" {
+			ctl = dst.Ctl()
+		}
+		return conn.ExplicitKeyIsUnique(ctx, ctl, table, key)
+	}
 }
 
 // KeyFamilies returns the column families of the schema's key columns, in key

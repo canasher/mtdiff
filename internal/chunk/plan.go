@@ -14,6 +14,14 @@ import (
 	"mtdiff/internal/normalize"
 )
 
+// Querier is the read seam the planner runs on: a *sql.DB (the pool's
+// control connection) or a dedicated *sql.Conn (snapshot mode, where the
+// extremes must be read on the same connection — and transaction — as
+// the chunk scans).
+type Querier interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
 // Planner splits a table into key ranges.
 type Planner struct {
 	Table       string
@@ -25,7 +33,7 @@ type Planner struct {
 
 // Plan returns the chunks covering the table (total rows must come from
 // COUNT(*) on the same side, with the same WHERE filter).
-func (p *Planner) Plan(ctx context.Context, db *sql.DB, total int64) ([]Chunk, error) {
+func (p *Planner) Plan(ctx context.Context, db Querier, total int64) ([]Chunk, error) {
 	if total <= 0 {
 		return nil, nil
 	}
@@ -61,7 +69,7 @@ func (p *Planner) integerLeadKey() bool {
 // (the planner's WHERE is applied to both). Both are nil and err is nil
 // when the table has no rows. The planner must be keyed
 // (len(KeyCols) > 0).
-func (p *Planner) Extremes(ctx context.Context, db *sql.DB) ([]driver.Value, []driver.Value, error) {
+func (p *Planner) Extremes(ctx context.Context, db Querier) ([]driver.Value, []driver.Value, error) {
 	return p.extremesMaybe(ctx, db)
 }
 
@@ -70,7 +78,7 @@ func (p *Planner) Extremes(ctx context.Context, db *sql.DB) ([]driver.Value, []d
 // row in key order rather than MIN/MAX: MIN and MAX skip NULLs, which
 // would drop NULL key rows (which sort first in MySQL order) out of the
 // plan.
-func (p *Planner) extremes(ctx context.Context, db *sql.DB) ([]driver.Value, []driver.Value, error) {
+func (p *Planner) extremes(ctx context.Context, db Querier) ([]driver.Value, []driver.Value, error) {
 	lo, hi, err := p.extremesMaybe(ctx, db)
 	if err != nil {
 		return nil, nil, err
@@ -84,7 +92,7 @@ func (p *Planner) extremes(ctx context.Context, db *sql.DB) ([]driver.Value, []d
 // extremesMaybe reads the first and last key row in key order (see
 // extremes for why not MIN/MAX), returning (nil, nil, nil) instead of an
 // error when the table holds no rows.
-func (p *Planner) extremesMaybe(ctx context.Context, db *sql.DB) ([]driver.Value, []driver.Value, error) {
+func (p *Planner) extremesMaybe(ctx context.Context, db Querier) ([]driver.Value, []driver.Value, error) {
 	where := p.whereClause()
 	lo, err := p.keyRow(ctx, db, "ASC", where)
 	if err != nil {
@@ -117,7 +125,7 @@ func keyOrder(idents []string, dir string) string {
 }
 
 // keyRow returns the first/last row in key order as driver values.
-func (p *Planner) keyRow(ctx context.Context, db *sql.DB, dir, where string) ([]driver.Value, error) {
+func (p *Planner) keyRow(ctx context.Context, db Querier, dir, where string) ([]driver.Value, error) {
 	idents := p.keyIdents()
 	// Scan into []any, not []driver.Value: database/sql cannot store a NULL
 	// into a *driver.Value ("unsupported Scan"), and a key row may
@@ -168,8 +176,9 @@ func (p *Planner) whereClause() string {
 // every row has exactly one lead value, so contiguous lead ranges form an
 // exact partition and the bound applies to the lead column only (prefix
 // bounds, not lexicographic). Returns ok=false when the lead values are
-// NULL or do not fit int64 (huge uint64 keys); the caller falls back to
-// sampling (which also handles NULL leads).
+// NULL or do not fit int64 (huge uint64 keys), or when the span is too
+// wide for int64 arithmetic (a BIGINT range wider than MaxInt64 values)
+// — the caller falls back to sampling (which also handles NULL leads).
 func (p *Planner) planInt(minV, maxV []driver.Value, n int64) ([]Chunk, bool) {
 	var lo, hi int64
 	var ok bool
@@ -183,10 +192,22 @@ func (p *Planner) planInt(minV, maxV []driver.Value, n int64) ([]Chunk, bool) {
 			lo, hi, ok = int64(x), int64(y), true
 		}
 	}
-	if !ok {
+	if !ok || !spanSafe(lo, hi) || n > math.MaxInt32 {
 		return nil, false
 	}
 	return intBoundaries(lo, hi, n, len(p.KeyCols) > 1), true
+}
+
+// spanSafe reports whether [lo, hi] can be split by intBoundaries: the
+// splitter's arithmetic is exact for spans of at most 2^64-1 values, so a
+// full MinInt64..MaxInt64 span (2^64 values) and a hi-lo that overflows
+// int64 (a negative lo with the range wider than MaxInt64) go to the
+// sampling fallback instead.
+func spanSafe(lo, hi int64) bool {
+	if lo == math.MinInt64 && hi == math.MaxInt64 {
+		return false
+	}
+	return !(lo < 0 && hi > math.MaxInt64+lo)
 }
 
 // intBoundaries splits [lo, hi] into at most n contiguous, non-overlapping
@@ -196,6 +217,13 @@ func (p *Planner) planInt(minV, maxV []driver.Value, n int64) ([]Chunk, bool) {
 // ceil((hi-lo)/n) (the tempting formula) is one short whenever (hi-lo) is
 // divisible by n, leaving the maximum key value in no chunk — both sides
 // then miss the same rows and an inconsistent table reports "identical".
+//
+// Overflow-safe (P1): the span can hold up to 2^63 values (a BIGINT key
+// from 0 to MaxInt64), so the old "hi-lo+n" must not be computed in
+// int64. All the math runs in uint64 (exact: spanSafe keeps the span
+// below 2^64), offsets are compared against the exact hi-lo distance, and
+// a boundary is emitted only after being clamped into [lo, hi], where its
+// uint64 image converts back to int64 exactly.
 //
 // leadPrefix marks the ranges as lead-column-only bounds (composite key
 // split on its integer lead): the boundary vectors hold just the lead
@@ -212,22 +240,32 @@ func intBoundaries(lo, hi int64, n int64, leadPrefix bool) []Chunk {
 	if hi == lo {
 		return []Chunk{{ID: 0, Lo: []driver.Value{lo}, LoIncl: true, Hi: []driver.Value{hi}, LoPrefix: prefix, HiPrefix: prefix}}
 	}
-	step := (hi - lo + n) / n
+	// A chunk count past 2^31 would let i*step wrap the uint64 ring;
+	// such a table (and no sane chunk size) is better served by sampling.
+	if n > math.MaxInt32 {
+		return nil
+	}
+	uLo, uHi := uint64(lo), uint64(hi)
+	// the exact hi-lo distance (the uint64 difference is the true
+	// distance even across the signed boundary, spanSafe < 2^64)
+	diff := uHi - uLo
+	span := diff + 1
+	step := (span + uint64(n) - 1) / uint64(n)
 	chunks := make([]Chunk, 0, n)
 	for i := int64(0); i < n; i++ {
-		loV := lo + i*step
-		if loV > hi {
+		off := uint64(i) * step // < 2^64 (span < 2^64, n <= MaxInt32)
+		if off > diff {
 			break // remaining ranges are empty
 		}
-		hiV := lo + (i+1)*step - 1
-		if hiV > hi {
-			hiV = hi
+		endOff := off + step - 1
+		if endOff > diff {
+			endOff = diff
 		}
-		c := Chunk{ID: len(chunks), Hi: []driver.Value{hiV}, LoPrefix: prefix, HiPrefix: prefix}
+		c := Chunk{ID: len(chunks), Hi: []driver.Value{int64(uLo + endOff)}, LoPrefix: prefix, HiPrefix: prefix}
 		if i == 0 {
-			c.Lo, c.LoIncl = []driver.Value{loV}, true
+			c.Lo, c.LoIncl = []driver.Value{int64(uLo + off)}, true
 		} else {
-			c.Lo, c.LoIncl = []driver.Value{loV - 1}, false
+			c.Lo, c.LoIncl = []driver.Value{int64(uLo + off - 1)}, false
 		}
 		chunks = append(chunks, c)
 	}
@@ -237,7 +275,7 @@ func intBoundaries(lo, hi int64, n int64, leadPrefix bool) []Chunk {
 // planSample splits non-integer or composite keys by binary sampling: each
 // split point is a real key value read from the data, so adjacent chunks form
 // an exact partition with no overlap and no gap.
-func (p *Planner) planSample(ctx context.Context, db *sql.DB, minV, maxV []driver.Value, n int64) ([]Chunk, error) {
+func (p *Planner) planSample(ctx context.Context, db Querier, minV, maxV []driver.Value, n int64) ([]Chunk, error) {
 	if n < 1 {
 		n = 1
 	}
@@ -273,7 +311,7 @@ func (p *Planner) planSample(ctx context.Context, db *sql.DB, minV, maxV []drive
 }
 
 // sample picks an interior key value at roughly the off-th row of (lo, hi].
-func (p *Planner) sample(ctx context.Context, db *sql.DB, lo, hi []driver.Value, loIncl bool, off int64) ([]driver.Value, error) {
+func (p *Planner) sample(ctx context.Context, db Querier, lo, hi []driver.Value, loIncl bool, off int64) ([]driver.Value, error) {
 	c := Chunk{Lo: lo, LoIncl: loIncl, Hi: hi}
 	pred := c.Predicate(p.KeyCols, "")
 	var where string

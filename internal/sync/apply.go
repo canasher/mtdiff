@@ -118,11 +118,14 @@ func (a *Applier) ApplyOps(ctx context.Context, st *Stats, b *Builder, chunked [
 				if len(pending) == 0 {
 					return nil
 				}
-				stmt, err := b.InsertBatch(pending)
+				// the executable INSERT is parameterized (P0-3): the
+				// values travel as bound arguments, never rendered into
+				// the statement text
+				stmt, args, err := b.InsertBatchExec(pending)
 				if err != nil {
 					return err
 				}
-				if _, err := tx.ExecContext(ctx, stmt); err != nil {
+				if _, err := tx.ExecContext(ctx, stmt, args...); err != nil {
 					return err
 				}
 				ins += len(pending)
@@ -130,31 +133,58 @@ func (a *Applier) ApplyOps(ctx context.Context, st *Stats, b *Builder, chunked [
 				pendingBytes = 0
 				return nil
 			}
+			addInsert := func(row []any) error {
+				rb := b.rowBytes(row)
+				if a.MaxBytes > 0 && len(pending) == 0 && rb > a.MaxBytes {
+					return fmt.Errorf("a single row renders to %d bytes, over the %d-byte budget: raise --max-allowed-packet", rb, a.MaxBytes)
+				}
+				if len(pending) > 0 && (len(pending) >= a.Batch || (a.MaxBytes > 0 && pendingBytes+rb > a.MaxBytes)) {
+					if err := flush(); err != nil {
+						return err
+					}
+				}
+				pending = append(pending, row)
+				pendingBytes += rb
+				return nil
+			}
 			for _, o := range ops {
 				switch o.kind {
 				case opDelete:
-					if _, err := tx.ExecContext(ctx, b.Delete(o.key)); err != nil {
+					stmt, args := b.DeleteExec(o.key)
+					if _, err := tx.ExecContext(ctx, stmt, args...); err != nil {
 						return err
 					}
 					del++
 				case opUpdate:
-					if _, err := tx.ExecContext(ctx, b.Update(o.key, o.rows[0])); err != nil {
+					stmt, args := b.UpdateExec(o.key, o.rows[0])
+					if _, err := tx.ExecContext(ctx, stmt, args...); err != nil {
 						return err
 					}
 					upd++
-				case opInsert:
-					row := o.rows[0]
-					rb := b.rowBytes(row)
-					if a.MaxBytes > 0 && len(pending) == 0 && rb > a.MaxBytes {
-						return fmt.Errorf("a single row renders to %d bytes, over the %d-byte budget: raise --max-allowed-packet", rb, a.MaxBytes)
+				case opRewrite:
+					// the unique-value-swap protection rewrites a no-op
+					// holder: delete the whole destination group, then
+					// re-insert the same rows (carried in the op, read
+					// from the source). Every row's raw key is deleted —
+					// the group's rows can carry distinct raw keys that
+					// only fold together under the normalizer, so a
+					// single-key delete would leave the rest behind.
+					for _, k := range o.delKeys {
+						stmt, args := b.DeleteExec(k)
+						if _, err := tx.ExecContext(ctx, stmt, args...); err != nil {
+							return err
+						}
+						del++
 					}
-					if len(pending) > 0 && (len(pending) >= a.Batch || (a.MaxBytes > 0 && pendingBytes+rb > a.MaxBytes)) {
-						if err := flush(); err != nil {
+					for _, row := range o.rows {
+						if err := addInsert(row); err != nil {
 							return err
 						}
 					}
-					pending = append(pending, row)
-					pendingBytes += rb
+				case opInsert:
+					if err := addInsert(o.rows[0]); err != nil {
+						return err
+					}
 				}
 			}
 			return flush()
@@ -209,11 +239,12 @@ func (a *Applier) streamChunk(ctx context.Context, tx *sql.Tx, st *Stats, b *Bui
 		if len(pending) == 0 {
 			return nil
 		}
-		stmt, err := b.InsertBatch(pending)
+		// parameterized: the streamed rows travel as bound arguments
+		stmt, args, err := b.InsertBatchExec(pending)
 		if err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+		if _, err := tx.ExecContext(ctx, stmt, args...); err != nil {
 			return err
 		}
 		st.Inserts += len(pending)

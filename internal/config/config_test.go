@@ -206,7 +206,7 @@ func TestValidateAndDefaults(t *testing.T) {
 		t.Fatalf("valid config rejected: %v", err)
 	}
 	c.ApplyDefaults()
-	if c.Src.Port != 3306 || c.Opts.Parallel != 4 || c.Opts.ChunkSize != 10000 || c.Opts.DrillLimit != 10 || c.Opts.BatchSize != 1000 || c.Opts.SampleLimit != 5 {
+	if c.Src.Port != 3306 || c.Opts.Parallel != 4 || c.Opts.ChunkSize != 10000 || c.Opts.DrillLimit != 10 || c.Opts.BatchSize != 1000 || c.SampleLimitOr(0) != 5 {
 		t.Errorf("defaults wrong: %+v", c)
 	}
 	c2 := &Config{Src: Endpoint{Host: "a"}}
@@ -242,9 +242,24 @@ func TestValidateAndDefaults(t *testing.T) {
 		t.Error("negative batch_size must fail validation")
 	}
 	c3.Opts.BatchSize = 0
-	c3.Opts.SampleLimit = -1
+	neg := -1
+	c3.Opts.SampleLimit = &neg
 	if err := c3.Validate(); err == nil {
 		t.Error("negative sample_limit must fail validation")
+	}
+
+	// explicit sample_limit 0 means "show no samples": it is legal and
+	// must survive ApplyDefaults (unlike every other zero, it is not
+	// "unset")
+	c5 := &Config{Src: Endpoint{Host: "a"}, Dst: Endpoint{Host: "b"}}
+	zero := 0
+	c5.Opts.SampleLimit = &zero
+	if err := c5.Validate(); err != nil {
+		t.Errorf("explicit sample_limit 0 must be accepted: %v", err)
+	}
+	c5.ApplyDefaults()
+	if c5.SampleLimitOr(-1) != 0 {
+		t.Errorf("explicit sample_limit 0 must survive ApplyDefaults, got %d", c5.SampleLimitOr(-1))
 	}
 
 	// P3-#17: a positive but tiny chunk_size is rejected (0 is still

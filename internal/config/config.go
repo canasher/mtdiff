@@ -56,9 +56,18 @@ type Options struct {
 	// other statements.
 	AllowUnenforcedReadOnly bool `yaml:"allow_unenforced_readonly"`
 	// Sync options (used by the sync subcommand).
-	BatchSize    int  `yaml:"batch_size"`     // rows per multi-row INSERT / commit granularity
-	SampleLimit  int  `yaml:"sample_limit"`   // sample SQL statements shown per table in a dry-run
+	BatchSize int `yaml:"batch_size"` // rows per multi-row INSERT / commit granularity
+	// SampleLimit is a pointer so an explicit 0 ("show no samples") is
+	// distinguishable from unset (nil, receives the default of 5): the
+	// CLI's --sample-limit 0 and a YAML sample_limit: 0 must both survive
+	// ApplyDefaults, while an absent value takes the default.
+	SampleLimit  *int `yaml:"sample_limit"`
 	NoSyncSchema bool `yaml:"no_sync_schema"` // skip the structure pre-step (default: align the destination structure first)
+	// AllowStructureTruncate: when the in-place structure ALTER fails,
+	// truncate the destination and re-apply the DDL (the pre-P1-3
+	// behavior as a fallback). Default false: the failure stops the table
+	// with its data preserved.
+	AllowStructureTruncate bool `yaml:"allow_structure_truncate"`
 }
 
 // Config is the fully-resolved configuration.
@@ -163,10 +172,19 @@ func (c *Config) Validate() error {
 	if c.Opts.BatchSize < 0 {
 		return fmt.Errorf("batch_size must be >= 0, got %d", c.Opts.BatchSize)
 	}
-	if c.Opts.SampleLimit < 0 {
-		return fmt.Errorf("sample_limit must be >= 0, got %d", c.Opts.SampleLimit)
+	if c.Opts.SampleLimit != nil && *c.Opts.SampleLimit < 0 {
+		return fmt.Errorf("sample_limit must be >= 0, got %d", *c.Opts.SampleLimit)
 	}
 	return nil
+}
+
+// SampleLimitOr dereferences SampleLimit, filling unset (nil) values with
+// the default. An explicit 0 is preserved (it means "show no samples").
+func (c *Config) SampleLimitOr(def int) int {
+	if c.Opts.SampleLimit == nil {
+		return def
+	}
+	return *c.Opts.SampleLimit
 }
 
 // ApplyDefaults fills unset positive options with their defaults.
@@ -189,7 +207,8 @@ func (c *Config) ApplyDefaults() {
 	if c.Opts.BatchSize <= 0 {
 		c.Opts.BatchSize = 1000
 	}
-	if c.Opts.SampleLimit <= 0 {
-		c.Opts.SampleLimit = 5
+	if c.Opts.SampleLimit == nil {
+		v := 5
+		c.Opts.SampleLimit = &v // explicit 0 (show none) is preserved
 	}
 }

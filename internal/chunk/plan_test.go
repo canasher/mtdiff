@@ -2,8 +2,11 @@ package chunk
 
 import (
 	"database/sql/driver"
+	"math"
 	"testing"
 	"time"
+
+	"mtdiff/internal/conn"
 )
 
 func TestIntBoundaries(t *testing.T) {
@@ -103,6 +106,90 @@ func TestIntBoundariesDivisible(t *testing.T) {
 	}
 	if cs[0].Hi[0] != int64(9001) {
 		t.Errorf("first chunk must end at 9001, got %d", cs[0].Hi[0])
+	}
+}
+
+// TestIntBoundariesOverflow covers P1: a BIGINT span wider than MaxInt64
+// values (the old "hi-lo+n" overflowed int64). The split must still be an
+// exact partition, including across the signed boundary.
+func TestIntBoundariesOverflow(t *testing.T) {
+	// (driver.Value is an interface: comparisons must go through typed
+	// variables, or constant conversions change the dynamic type)
+	maxInt64 := int64(math.MaxInt64)
+	minInt64 := int64(math.MinInt64)
+	halfSpan := int64(4611686018427387903)    // 2^62-1
+	quarterSpan := int64(4611686018427387904) // 2^62
+
+	// 0..MaxInt64: 2^63 values in 2 chunks (span 2^63, step 2^62)
+	cs := intBoundaries(0, maxInt64, 2, false)
+	assertCover(t, 0, maxInt64, 2, cs)
+	if len(cs) != 2 {
+		t.Fatalf("want 2 chunks, got %d: %+v", len(cs), cs)
+	}
+	if cs[0].Hi[0] != halfSpan {
+		t.Errorf("first chunk must end at 2^62-1, got %v", cs[0].Hi[0])
+	}
+	if last := cs[1].Hi[0]; last != maxInt64 {
+		t.Errorf("last chunk must end at MaxInt64, got %v (max key unscanned)", last)
+	}
+
+	// MinInt64..0: 2^63 values across the signed boundary
+	cs = intBoundaries(minInt64, int64(0), 2, false)
+	assertCover(t, minInt64, int64(0), 2, cs)
+	if len(cs) != 2 {
+		t.Fatalf("want 2 chunks, got %d: %+v", len(cs), cs)
+	}
+	if cs[0].Hi[0] != -quarterSpan {
+		t.Errorf("first chunk must end at -2^62, got %v", cs[0].Hi[0])
+	}
+	if last := cs[len(cs)-1].Hi[0]; last != int64(0) {
+		t.Errorf("last chunk must end at 0, got %v", last)
+	}
+
+	// a small negative range (the old formula's negative hi-lo case)
+	cs = intBoundaries(-100, -90, 3, false)
+	assertCover(t, -100, -90, 3, cs)
+	if len(cs) != 3 {
+		t.Fatalf("want 3 chunks, got %d: %+v", len(cs), cs)
+	}
+
+	// the old overflow case: span MaxInt64+6 (hi-lo overflows int64) —
+	// spanSafe must refuse it so the planner falls back to sampling
+	if spanSafe(-5, math.MaxInt64) {
+		t.Error("a negative lo with a range wider than MaxInt64 must be unsafe")
+	}
+	if spanSafe(math.MinInt64, math.MaxInt64) {
+		t.Error("the full int64 span (2^64 values) must be unsafe")
+	}
+	if !spanSafe(0, math.MaxInt64) {
+		t.Error("0..MaxInt64 (span 2^63) must be safe")
+	}
+	if !spanSafe(-5, math.MaxInt64-10) {
+		t.Error("a negative lo with a narrow range must be safe")
+	}
+}
+
+// TestPlanIntOverflowGuard pins the planner-level guard: out-of-int64 or
+// overflow-wide spans fall back to sampling instead of arithmetic.
+func TestPlanIntOverflowGuard(t *testing.T) {
+	p := &Planner{KeyCols: []string{"id"}, KeyFamilies: []string{conn.FamINT}}
+	cases := []struct {
+		name   string
+		minV   []driver.Value
+		maxV   []driver.Value
+		wantOK bool
+	}{
+		{"wide signed span", []driver.Value{int64(-5)}, []driver.Value{int64(math.MaxInt64)}, false},
+		{"full int64 range", []driver.Value{int64(math.MinInt64)}, []driver.Value{int64(math.MaxInt64)}, false},
+		{"0..MaxInt64", []driver.Value{int64(0)}, []driver.Value{int64(math.MaxInt64)}, true},
+		{"ordinary span", []driver.Value{int64(3)}, []driver.Value{int64(300)}, true},
+		{"uint64 past MaxInt64", []driver.Value{uint64(math.MaxUint64)}, []driver.Value{uint64(math.MaxUint64)}, false},
+	}
+	for _, c := range cases {
+		_, ok := p.planInt(c.minV, c.maxV, 4)
+		if ok != c.wantOK {
+			t.Errorf("%s: planInt ok = %v, want %v", c.name, ok, c.wantOK)
+		}
 	}
 }
 

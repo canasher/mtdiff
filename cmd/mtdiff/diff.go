@@ -284,7 +284,7 @@ func bindCmpFlags(cmd *cobra.Command, o *diffOpts) {
 	f.IntVar(&o.drillLimit, "drill-limit", 0, "max example rows per differing chunk (default 10)")
 	f.IntVar(&o.maxAllowedPacket, "max-allowed-packet", 0, "max packet size in bytes (default: driver limit)")
 	f.Float64Var(&o.tolerance, "tolerance", 0, "float/double comparison tolerance (0 = exact)")
-	f.BoolVar(&o.snapshot, "snapshot", false, "scan each table under a consistent snapshot (slower, stable under writes)")
+	f.BoolVar(&o.snapshot, "snapshot", false, "read each table side at one point in time: per side, the count, key extremes and all row scans run on one connection in one read transaction (slower, stable under concurrent writes; consistency is per side, not across the pair)")
 	f.BoolVar(&o.drill, "drill", false, "show example differing rows (uses --drill-limit)")
 	f.BoolVar(&o.noTrim, "no-trim", false, "do not trim trailing spaces from strings")
 	f.BoolVar(&o.foldCase, "fold-case", false, "compare strings case-insensitively")

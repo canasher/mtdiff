@@ -30,12 +30,19 @@ func colsFor(cols []conn.Column, names ...string) []conn.Column {
 
 func newTestEngine(t *testing.T, opts normalize.Options, unique bool, cols []conn.Column) *Engine {
 	t.Helper()
+	return newTestEngineWithUnique(t, opts, unique, cols, cols, nil)
+}
+
+// newTestEngineWithUnique builds an engine over possibly different
+// source/destination schemas and a set of unique (non-key) columns.
+func newTestEngineWithUnique(t *testing.T, opts normalize.Options, unique bool, cols, dstCols []conn.Column, uniqueCols map[string]bool) *Engine {
+	t.Helper()
 	return NewEngine(
 		normalize.NewNormalizer(cols, opts),
-		normalize.NewNormalizer(cols, opts),
+		normalize.NewNormalizer(dstCols, opts),
 		normalize.NewNormalizer(colsFor(cols, "id"), opts),
-		normalize.NewNormalizer(colsFor(cols, "id"), opts),
-		unique, colsFor(cols, "id"), cols)
+		normalize.NewNormalizer(colsFor(dstCols, "id"), opts),
+		unique, colsFor(cols, "id"), cols, dstCols, uniqueCols)
 }
 
 // nextOf adapts a row slice to the iterator seam (mirrors the DB scan
@@ -166,5 +173,198 @@ func TestDiffNULLKeyComponent(t *testing.T) {
 	}
 	if !reflect.DeepEqual(ops[0].rows[0], []any{nil, "a", int64(10)}) {
 		t.Errorf("update payload = %v, want source row", ops[0].rows[0])
+	}
+}
+
+// uniqueColsTest is the swap-protection test shape: id (PK), code (a
+// UNIQUE non-key column), n.
+func uniqueColsTest(t *testing.T) []conn.Column {
+	t.Helper()
+	return []conn.Column{
+		{Name: "id", Family: conn.FamINT, RawType: "int"},
+		{Name: "code", Family: conn.FamSTR, RawType: "varchar(10)"},
+		{Name: "n", Family: conn.FamINT, RawType: "int"},
+	}
+}
+
+// TestDiffUniqueValueSwap is the P1-4 regression: src (1,B)(2,A) vs
+// dst (1,A)(2,B) with code unique. No order of per-row UPDATEs can apply
+// this (each UPDATE collides with the other row's still-current value),
+// so the chunk must come back as deletes-first, then inserts — never as
+// two bare updates.
+func TestDiffUniqueValueSwap(t *testing.T) {
+	cols := uniqueColsTest(t)
+	e := newTestEngineWithUnique(t, normalize.DefaultOptions(), true, cols, cols,
+		map[string]bool{"code": true})
+	src := [][]any{
+		{int64(1), "B", int64(10)},
+		{int64(2), "A", int64(20)},
+	}
+	dst := [][]any{
+		{int64(1), "A", int64(10)},
+		{int64(2), "B", int64(20)},
+	}
+	srcM, _ := e.buffer(e.srcRow, e.srcKey, nextOf(src))
+	dstM, _ := e.buffer(e.dstRow, e.dstKey, nextOf(dst))
+	ops := e.Diff(srcM, dstM)
+	if ins, upd, del := Counts([][]op{ops}); ins != 2 || upd != 0 || del != 2 {
+		t.Fatalf("swap must be delete+insert per row: ins/upd/del = %d/%d/%d, want 2/0/2", ins, upd, del)
+	}
+	// every delete must precede every insert (unique slots freed first)
+	lastDel, firstIns := -1, len(ops)
+	for i, o := range ops {
+		switch o.kind {
+		case opDelete:
+			lastDel = i
+		case opInsert:
+			if i < firstIns {
+				firstIns = i
+			}
+		}
+	}
+	if lastDel >= firstIns {
+		t.Errorf("a delete must not follow an insert in a swapped chunk: %+v", ops)
+	}
+}
+
+// TestDiffUniqueOneWayMoveStaysUpdate: values move one way (row 1 takes
+// "B", row 2 takes "D") and nothing else in the chunk holds them: no
+// collision, so the classic per-row UPDATEs stay in force (no
+// over-conversion).
+func TestDiffUniqueOneWayMoveStaysUpdate(t *testing.T) {
+	cols := uniqueColsTest(t)
+	e := newTestEngineWithUnique(t, normalize.DefaultOptions(), true, cols, cols,
+		map[string]bool{"code": true})
+	src := [][]any{
+		{int64(1), "B", int64(10)},
+		{int64(2), "D", int64(20)},
+		{int64(3), "C", int64(30)},
+	}
+	dst := [][]any{
+		{int64(1), "A", int64(10)},
+		{int64(2), "C", int64(20)},
+		{int64(3), "C", int64(30)},
+	}
+	srcM, _ := e.buffer(e.srcRow, e.srcKey, nextOf(src))
+	dstM, _ := e.buffer(e.dstRow, e.dstKey, nextOf(dst))
+	ops := e.Diff(srcM, dstM)
+	if ins, upd, del := Counts([][]op{ops}); ins != 0 || upd != 2 || del != 0 {
+		t.Fatalf("no collision: keep two plain updates, got ins/upd/del = %d/%d/%d", ins, upd, del)
+	}
+}
+
+// TestDiffUniqueHolderRewrite: row 1 takes the value "B" that the
+// UNCHANGED row 2 currently holds. The hot path must rewrite row 2
+// (delete + re-insert of the identical row) so its slot is freed before
+// row 1's insert runs.
+func TestDiffUniqueHolderRewrite(t *testing.T) {
+	cols := uniqueColsTest(t)
+	e := newTestEngineWithUnique(t, normalize.DefaultOptions(), true, cols, cols,
+		map[string]bool{"code": true})
+	src := [][]any{
+		{int64(1), "B", int64(10)},
+		{int64(2), "B", int64(20)},
+	}
+	dst := [][]any{
+		{int64(1), "A", int64(10)},
+		{int64(2), "B", int64(20)},
+	}
+	srcM, _ := e.buffer(e.srcRow, e.srcKey, nextOf(src))
+	dstM, _ := e.buffer(e.dstRow, e.dstKey, nextOf(dst))
+	ops := e.Diff(srcM, dstM)
+	var rewrites, dels, ins int
+	for _, o := range ops {
+		switch o.kind {
+		case opRewrite:
+			rewrites++
+		case opDelete:
+			dels++
+		case opInsert:
+			ins++
+		}
+	}
+	// row 1: converted update (delete+insert); row 2: rewritten no-op —
+	// the rewrite is ONE op (delete the key, re-insert the identical row),
+	// so by op kind the chunk is: 1 delete (row 1), 1 rewrite (row 2,
+	// counted once), 1 insert (row 1). No plain update survives a hot
+	// chunk.
+	if rewrites != 1 || dels != 1 || ins != 1 {
+		t.Fatalf("want 1 rewrite, 1 delete, 1 insert; got rewrites=%d dels=%d ins=%d: %+v", rewrites, dels, ins, ops)
+	}
+}
+
+// TestDiffThreeCycleSwap: a 3-cycle (A->B->C->A) is unorderable like the
+// 2-cycle and must come back fully converted (no updates).
+func TestDiffThreeCycleSwap(t *testing.T) {
+	cols := uniqueColsTest(t)
+	e := newTestEngineWithUnique(t, normalize.DefaultOptions(), true, cols, cols,
+		map[string]bool{"code": true})
+	src := [][]any{
+		{int64(1), "B", int64(10)},
+		{int64(2), "C", int64(20)},
+		{int64(3), "A", int64(30)},
+	}
+	dst := [][]any{
+		{int64(1), "A", int64(10)},
+		{int64(2), "B", int64(20)},
+		{int64(3), "C", int64(30)},
+	}
+	srcM, _ := e.buffer(e.srcRow, e.srcKey, nextOf(src))
+	dstM, _ := e.buffer(e.dstRow, e.dstKey, nextOf(dst))
+	ops := e.Diff(srcM, dstM)
+	if ins, upd, del := Counts([][]op{ops}); ins != 3 || upd != 0 || del != 3 {
+		t.Fatalf("3-cycle must be 3 deletes + 3 inserts, got ins/upd/del = %d/%d/%d", ins, upd, del)
+	}
+}
+
+// newTestEngineKeyed is newTestEngineWithUnique with a selectable
+// addressing key: a non-PK unique key makes the PK a unique NON-key
+// column, whose values can collide across groups.
+func newTestEngineKeyed(t *testing.T, unique bool, cols []conn.Column, uniqueCols map[string]bool, keyName string) *Engine {
+	t.Helper()
+	return NewEngine(
+		normalize.NewNormalizer(cols, normalize.DefaultOptions()),
+		normalize.NewNormalizer(cols, normalize.DefaultOptions()),
+		normalize.NewNormalizer(colsFor(cols, keyName), normalize.DefaultOptions()),
+		normalize.NewNormalizer(colsFor(cols, keyName), normalize.DefaultOptions()),
+		unique, colsFor(cols, keyName), cols, cols, uniqueCols)
+}
+
+// TestDiffUniqueNonPKKeyPKCollision is the e2e t_swap regression: PK id +
+// UNIQUE code, addressed by --key code. src (1,'B'),(2,'A') vs dst
+// (1,'B'),(2,'Z'): the 'A' insert needs PK value 2, currently held by the
+// dst row (2,'Z') that a LATER group deletes — classic group-order
+// emission would hit the PK (duplicate key). The protection must treat
+// the PK like any unique column and emit deletes before inserts.
+func TestDiffUniqueNonPKKeyPKCollision(t *testing.T) {
+	cols := uniqueColsTest(t)
+	e := newTestEngineKeyed(t, true, cols, map[string]bool{"id": true, "code": true}, "code")
+	src := [][]any{
+		{int64(1), "B", int64(10)},
+		{int64(2), "A", int64(20)},
+	}
+	dst := [][]any{
+		{int64(1), "B", int64(10)},
+		{int64(2), "Z", int64(30)},
+	}
+	srcM, _ := e.buffer(e.srcRow, e.srcKey, nextOf(src))
+	dstM, _ := e.buffer(e.dstRow, e.dstKey, nextOf(dst))
+	ops := e.Diff(srcM, dstM)
+	if ins, upd, del := Counts([][]op{ops}); ins != 1 || upd != 0 || del != 1 {
+		t.Fatalf("want 1 insert + 1 delete, got ins/upd/del = %d/%d/%d: %+v", ins, upd, del, ops)
+	}
+	lastDel, firstIns := -1, len(ops)
+	for i, o := range ops {
+		switch o.kind {
+		case opDelete:
+			lastDel = i
+		case opInsert:
+			if i < firstIns {
+				firstIns = i
+			}
+		}
+	}
+	if lastDel >= firstIns {
+		t.Errorf("the delete of the PK-holding row must precede the insert: %+v", ops)
 	}
 }

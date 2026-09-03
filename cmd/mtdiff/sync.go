@@ -17,12 +17,13 @@ import (
 )
 
 type syncOpts struct {
-	cmp          diffOpts // shared comparison flags (own instance, not the global diff)
-	apply        bool
-	yes          bool
-	batchSize    int
-	sampleLimit  int
-	noSyncSchema bool
+	cmp            diffOpts // shared comparison flags (own instance, not the global diff)
+	apply          bool
+	yes            bool
+	batchSize      int
+	sampleLimit    int
+	noSyncSchema   bool
+	structTruncate bool
 }
 
 var (
@@ -45,6 +46,7 @@ func init() {
 	f.IntVar(&syncOpt.batchSize, "batch-size", 0, "rows per multi-row INSERT / commit granularity (default 1000)")
 	f.IntVar(&syncOpt.sampleLimit, "sample-limit", 0, "sample SQL statements shown per table in a dry-run (default 5)")
 	f.BoolVar(&syncOpt.noSyncSchema, "no-sync-schema", false, "do not align the destination table structure before the data sync (default: structure is synced first, shown in the dry run)")
+	f.BoolVar(&syncOpt.structTruncate, "allow-structure-truncate", false, "if the in-place structure ALTER fails, truncate the destination table and re-apply the DDL on it (default: the failure stops the table with its data preserved)")
 	rootCmd.AddCommand(syncCmd)
 }
 
@@ -66,10 +68,16 @@ func applySyncOpts(cmd *cobra.Command, o *syncOpts, c *config.Config) error {
 		if o.sampleLimit < 0 {
 			return fmt.Errorf("--sample-limit must be >= 0 (got %d)", o.sampleLimit)
 		}
-		c.Opts.SampleLimit = o.sampleLimit
+		// explicit: 0 is legal (show no samples) and must survive
+		// ApplyDefaults
+		v := o.sampleLimit
+		c.Opts.SampleLimit = &v
 	}
 	if cmd.Flags().Changed("no-sync-schema") {
 		c.Opts.NoSyncSchema = o.noSyncSchema
+	}
+	if cmd.Flags().Changed("allow-structure-truncate") {
+		c.Opts.AllowStructureTruncate = o.structTruncate
 	}
 	return nil
 }
@@ -157,12 +165,13 @@ func syncRunE(cmd *cobra.Command, _ []string) error {
 	}
 
 	runner := msync.NewRunner(src, dst, msync.Options{
-		Cmp:         buildComparerOpts(cfg),
-		Batch:       cfg.Opts.BatchSize,
-		SampleLimit: cfg.Opts.SampleLimit,
-		MaxPacket:   cfg.Opts.MaxAllowedPacket,
-		SyncSchema:  !cfg.Opts.NoSyncSchema,
-		Progress:    progressLog, // forwarded to the comparer (pre-pass + verification) by NewRunner
+		Cmp:                    buildComparerOpts(cfg),
+		Batch:                  cfg.Opts.BatchSize,
+		SampleLimit:            cfg.SampleLimitOr(5),
+		MaxPacket:              cfg.Opts.MaxAllowedPacket,
+		SyncSchema:             !cfg.Opts.NoSyncSchema,
+		AllowStructureTruncate: cfg.Opts.AllowStructureTruncate,
+		Progress:               progressLog, // forwarded to the comparer (pre-pass + verification) by NewRunner
 	})
 	results, err := runner.PrePass(ctx, tables)
 	if err != nil {

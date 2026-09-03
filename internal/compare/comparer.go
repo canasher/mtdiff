@@ -4,8 +4,10 @@ package compare
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"sync/atomic"
 
 	"golang.org/x/sync/errgroup"
@@ -18,8 +20,16 @@ import (
 
 // Options control comparison behavior.
 type Options struct {
-	Parallel   int
-	ChunkSize  int
+	Parallel  int
+	ChunkSize int
+	// Snapshot reads each side of each table at one point in time (P1-5):
+	// per side, the COUNT, the key extremes (the chunk plan), every chunk
+	// scan and the drill-down scans run on ONE dedicated connection inside
+	// ONE read transaction (serial; slower, but stable under concurrent
+	// writes). Consistency is per side: the two sides take their
+	// snapshots at different instants, which protects each side from
+	// concurrent writes but does not make the pair point-in-time with
+	// respect to each other.
 	Snapshot   bool
 	Secure     bool
 	Drill      bool // produce example rows for differing chunks
@@ -95,11 +105,35 @@ func (c *Comparer) compareTable(ctx context.Context, src, dst *conn.Side, name s
 	srcNorm := normalize.NewNormalizer(srcSchema.Cols, c.opts.Normalize)
 	dstNorm := normalize.NewNormalizer(dstSchema.Cols, c.opts.Normalize)
 
-	srcTotal, err := c.count(ctx, src, name)
+	// Snapshot mode (P1-5): each side takes its snapshot on one dedicated
+	// connection — the COUNT, the key extremes (the chunk plan), the
+	// chunk scans and the drill-downs all run on it, so the whole table is
+	// read at one point in time per side (see Options.Snapshot for the
+	// per-side caveat).
+	var srcSnap, dstSnap *sql.Conn
+	if c.opts.Snapshot {
+		srcSnap, err = c.beginSnapshotTx(ctx, src, name)
+		if err != nil {
+			return fail("src snapshot: %v", err)
+		}
+		defer c.endSnapshotTx(ctx, srcSnap)
+		dstSnap, err = c.beginSnapshotTx(ctx, dst, name)
+		if err != nil {
+			return fail("dst snapshot: %v", err)
+		}
+		defer c.endSnapshotTx(ctx, dstSnap)
+	}
+	countOn := func(side *conn.Side, snap *sql.Conn) (int64, error) {
+		if snap != nil {
+			return c.countQ(ctx, snap, side.Name, name)
+		}
+		return c.count(ctx, side, name)
+	}
+	srcTotal, err := countOn(src, srcSnap)
 	if err != nil {
 		return fail("src count: %v", err)
 	}
-	dstTotal, err := c.count(ctx, dst, name)
+	dstTotal, err := countOn(dst, dstSnap)
 	if err != nil {
 		return fail("dst count: %v", err)
 	}
@@ -131,6 +165,17 @@ func (c *Comparer) compareTable(ctx context.Context, src, dst *conn.Side, name s
 	if keyMismatch {
 		res.Warnings = append(res.Warnings,
 			"usable keys disagree (one side keyed, the other keyless): comparing as keyless whole-table multisets")
+	} else if len(srcSchema.Key) > 0 && !sameKeySequence(srcSchema.Key, dstSchema.Key) {
+		// Both sides are keyed, but the keys differ (names or order —
+		// e.g. PK (a,b) vs (b,a) under --no-sync-schema): the planner
+		// renders the source's key bounds into predicates that run
+		// against the destination's key columns, so a crossed key shape
+		// partitions the destination rows wrong. Same fallback as the
+		// keyless case: order-independent whole-table multisets.
+		keyMismatch = true
+		res.Warnings = append(res.Warnings,
+			fmt.Sprintf("usable keys differ between the sides (src %s vs dst %s): comparing as keyless whole-table multisets",
+				strings.Join(srcSchema.Key, ","), strings.Join(dstSchema.Key, ",")))
 	}
 
 	var chunks []chunk.Chunk
@@ -146,7 +191,11 @@ func (c *Comparer) compareTable(ctx context.Context, src, dst *conn.Side, name s
 			p.KeyCols = nil
 			p.KeyFamilies = nil
 		}
-		chunks, err = p.Plan(ctx, src.Ctl(), srcTotal)
+		var planQ chunk.Querier = src.Ctl()
+		if srcSnap != nil {
+			planQ = srcSnap // the extremes must come from the snapshot read
+		}
+		chunks, err = p.Plan(ctx, planQ, srcTotal)
 		if err != nil {
 			return fail("plan: %v", err)
 		}
@@ -171,11 +220,11 @@ func (c *Comparer) compareTable(ctx context.Context, src, dst *conn.Side, name s
 	)
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() error {
-		srcDigests, srcErr = c.scanSide(gctx, src, sc, srcSchema, chunks, name)
+		srcDigests, srcErr = c.scanSide(gctx, src, srcSnap, sc, srcSchema, chunks, name)
 		return srcErr
 	})
 	g.Go(func() error {
-		dstDigests, dstErr = c.scanSide(gctx, dst, dc, dstSchema, chunks, name)
+		dstDigests, dstErr = c.scanSide(gctx, dst, dstSnap, dc, dstSchema, chunks, name)
 		return dstErr
 	})
 	_ = g.Wait()
@@ -185,7 +234,10 @@ func (c *Comparer) compareTable(ctx context.Context, src, dst *conn.Side, name s
 
 	byID := foldDigests(&res, chunks, srcDigests, dstDigests, srcTotal, dstTotal, ordered, c.opts.Secure)
 	if c.opts.Drill && len(res.DiffChunks) > 0 {
-		dd := &DrillDown{}
+		// snapshot mode: the drill-down scans ride the still-open
+		// snapshot transactions, so the example rows show the same
+		// point in time the digest was computed at
+		dd := &DrillDown{srcCN: srcSnap, dstCN: dstSnap}
 		truncatedReported := false
 		for _, dc := range res.DiffChunks {
 			if len(res.Rows) >= c.opts.DrillLimit {
@@ -206,10 +258,11 @@ func (c *Comparer) compareTable(ctx context.Context, src, dst *conn.Side, name s
 	return res
 }
 
-// scanSide streams every chunk of one side, in parallel. In snapshot mode the
-// whole table is scanned on one connection inside a consistent-snapshot
-// transaction (serial, but immune to concurrent writes).
-func (c *Comparer) scanSide(ctx context.Context, side *conn.Side, sc *chunk.Scanner, schema *conn.Schema, chunks []chunk.Chunk, table string) (map[int]mhash.ChunkDigest, error) {
+// scanSide streams every chunk of one side, in parallel. When snapConn is
+// set (snapshot mode) the whole table is scanned serially on that one
+// connection, inside the read transaction the caller opened (and still
+// holds): every read of the table happens at one point in time (P1-5).
+func (c *Comparer) scanSide(ctx context.Context, side *conn.Side, snapConn *sql.Conn, sc *chunk.Scanner, schema *conn.Schema, chunks []chunk.Chunk, table string) (map[int]mhash.ChunkDigest, error) {
 	out := make(map[int]mhash.ChunkDigest, len(chunks))
 	if len(chunks) == 0 {
 		return out, nil
@@ -230,26 +283,17 @@ func (c *Comparer) scanSide(ctx context.Context, side *conn.Side, sc *chunk.Scan
 			c.opts.Progress("  %-24s %s scan %3d%% (%d/%d chunks)", table, side.Name, 100*n/int64(len(chunks)), n, len(chunks))
 		}
 	}
-	if c.opts.Snapshot {
-		cn, err := side.AcquireScan(ctx)
-		if err != nil {
-			return nil, err
-		}
-		defer cn.Close()
-		if _, err := cn.ExecContext(ctx, "START TRANSACTION WITH CONSISTENT SNAPSHOT"); err != nil {
-			return nil, fmt.Errorf("%s %s: snapshot: %w", side.Name, table, err)
-		}
+	if snapConn != nil {
 		for _, ch := range chunks {
-			d, err := sc.Scan(ctx, cn, schema, ch, c.opts.Where)
+			d, err := sc.Scan(ctx, snapConn, schema, ch, c.opts.Where)
 			if err != nil {
 				return nil, err
 			}
 			out[ch.ID] = d
 			report()
 		}
-		if _, err := cn.ExecContext(ctx, "COMMIT"); err != nil {
-			return nil, fmt.Errorf("%s %s: commit: %w", side.Name, table, err)
-		}
+		// the transaction (and its release) is the caller's: the
+		// drill-down may still be reading on it
 		return out, nil
 	}
 	parallel := c.opts.Parallel
@@ -328,15 +372,55 @@ func pickScanError(srcErr, dstErr error) error {
 }
 
 func (c *Comparer) count(ctx context.Context, side *conn.Side, table string) (int64, error) {
-	q := fmt.Sprintf("SELECT COUNT(*) FROM %s", conn.QuoteIdent(table))
+	return c.countQ(ctx, side.Ctl(), side.Name, table)
+}
+
+// countQ is the COUNT on an arbitrary read seam (snapshot mode runs it on
+// the snapshot connection, not the control connection).
+func (c *Comparer) countQ(ctx context.Context, q chunk.Querier, sideName, table string) (int64, error) {
+	qry := fmt.Sprintf("SELECT COUNT(*) FROM %s", conn.QuoteIdent(table))
 	if c.opts.Where != "" {
-		q += " WHERE (" + c.opts.Where + ")"
+		qry += " WHERE (" + c.opts.Where + ")"
 	}
 	var n int64
-	if err := side.Ctl().QueryRowContext(ctx, q).Scan(&n); err != nil {
-		return 0, fmt.Errorf("%s %s: %w", side.Name, table, err)
+	if err := q.QueryRowContext(ctx, qry).Scan(&n); err != nil {
+		return 0, fmt.Errorf("%s %s: %w", sideName, table, err)
 	}
 	return n, nil
+}
+
+// beginSnapshotTx takes one dedicated scan connection and opens a read
+// transaction on it: that connection becomes the side's snapshot scope
+// for one table — the COUNT, the key extremes, the chunk scans and the
+// drill-downs all run on it, so the whole table is read at one point in
+// time. A plain START TRANSACTION (not MySQL's "WITH CONSISTENT
+// SNAPSHOT") works on both backends: MySQL's default REPEATABLE READ
+// pins the snapshot on the first read, and TiDB pins a transaction's
+// read timestamp on its first statement. (A session deliberately running
+// a non-snapshot isolation level, e.g. READ COMMITTED, weakens the
+// guarantee to per-statement — the snapshot is then only as consistent as
+// that session's isolation level.)
+func (c *Comparer) beginSnapshotTx(ctx context.Context, side *conn.Side, table string) (*sql.Conn, error) {
+	cn, err := side.AcquireScan(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := cn.ExecContext(ctx, "START TRANSACTION"); err != nil {
+		cn.Close()
+		return nil, fmt.Errorf("%s %s: snapshot: %w", side.Name, table, err)
+	}
+	return cn, nil
+}
+
+// endSnapshotTx ends the snapshot scope: the transaction was read-only,
+// so a rollback is a no-op that only releases the connection. Best
+// effort — a broken connection still closes.
+func (c *Comparer) endSnapshotTx(ctx context.Context, cn *sql.Conn) {
+	if cn == nil {
+		return
+	}
+	_, _ = cn.ExecContext(ctx, "ROLLBACK")
+	_ = cn.Close()
 }
 
 // digestsEqual compares the statistics relevant to each digest's path.
@@ -392,17 +476,68 @@ func foldDigests(res *TableResult, chunks []chunk.Chunk, srcDigests, dstDigests 
 	return byID
 }
 
-// applyKey overrides the selected key with an explicit --key on both sides.
-// It returns warnings for key columns that are nullable: NULL key rows are
-// handled by the special NULL-bound predicates, but the operator should know
-// they are in play (and a NOT NULL key would be more robust).
-func applyKey(src, dst *conn.Schema, key []string) []string {
+// applyKey overrides the selected key with an explicit --key on both
+// sides. The explicit key's UNIQUENESS is resolved against each side's
+// index catalog (conn.ExplicitKeyIsUnique): an exact ordered match of the
+// primary key or of a unique index whose columns are all NOT NULL is
+// unique — the row-level sync can UPDATE by it (P1-1: an explicit --key
+// naming a real PK is recognized, not silently downgraded to group
+// replacement). Anything else (a non-unique column, a prefix of a
+// composite unique index, a unique index with a nullable column) is
+// non-unique: the sync engine replaces key groups instead of updating
+// single rows, and a --where row-level sync is refused outright (see
+// sync.DecidePlan). A catalog query that cannot be resolved is treated as
+// non-unique with a warning — conservative, never assumed.
+//
+// It returns warnings for key columns that are nullable: NULL key rows
+// are handled by the special NULL-bound predicates, but the operator
+// should know they are in play (and a NOT NULL key would be more robust).
+// applyKey overrides the selected key with an explicit --key on both
+// sides. resolve reports, per side ("src"/"dst"), whether the explicit key
+// is a unique row address there (in production: conn.ExplicitKeyIsUnique
+// against that side's index catalog; nil in unit tests, where the key
+// stays the conservative non-unique default). An exact ordered match of
+// the primary key or of a unique index whose columns are all NOT NULL is
+// unique — the row-level sync can UPDATE by it (P1-1: an explicit --key
+// naming a real PK is recognized, not silently downgraded to group
+// replacement). Anything else (a non-unique column, a prefix of a
+// composite unique index, a unique index with a nullable column), or a
+// resolution that fails, is non-unique: the sync engine replaces key
+// groups instead of updating single rows, and a --where row-level sync is
+// refused outright (see sync.DecidePlan).
+//
+// It returns warnings for key columns that are nullable: NULL key rows
+// are handled by the special NULL-bound predicates, but the operator
+// should know they are in play (and a NOT NULL key would be more robust).
+func applyKey(src, dst *conn.Schema, key []string, resolve func(side string) (bool, error)) []string {
 	if len(key) == 0 {
 		return nil
 	}
-	src.Key, src.KeySource, src.KeyIsUnique = key, "explicit", false
-	dst.Key, dst.KeySource, dst.KeyIsUnique = key, "explicit", false
-	return append(keyNullabilityWarns(src), keyNullabilityWarns(dst)...)
+	src.Key, src.KeySource = key, "explicit"
+	dst.Key, dst.KeySource = key, "explicit"
+	var warns []string
+	for _, side := range []struct {
+		name   string
+		schema *conn.Schema
+	}{{"src", src}, {"dst", dst}} {
+		unique := false
+		if resolve != nil {
+			var err error
+			unique, err = resolve(side.name)
+			if err != nil {
+				// unresolvable: not proven unique → group replacement, warn
+				warns = append(warns, fmt.Sprintf(
+					"explicit key (%s) uniqueness could not be resolved on the %s side (%v): the key is treated as NON-unique",
+					strings.Join(key, ","), side.name, err))
+			} else if !unique {
+				warns = append(warns, fmt.Sprintf(
+					"explicit key (%s) is not a PRIMARY KEY or NOT NULL UNIQUE index on the %s side: rows may share it, the sync replaces key groups instead of updating rows",
+					strings.Join(key, ","), side.name))
+			}
+		}
+		side.schema.KeyIsUnique = unique
+	}
+	return append(warns, append(keyNullabilityWarns(src), keyNullabilityWarns(dst)...)...)
 }
 
 func keyNullabilityWarns(s *conn.Schema) []string {
@@ -466,4 +601,22 @@ func filterIgnored(src, dst *conn.Schema, ignore map[string]bool) (*conn.Schema,
 	dst2 := *dst
 	dst2.Cols = dstKeep
 	return &src2, &dst2, nil
+}
+
+// sameKeySequence reports whether both sides' usable keys are the same
+// columns in the same order. A mere presence check (both keyed) is not
+// enough: with --no-sync-schema the sides may legally drift into
+// different key shapes (PK (a,b) vs (b,a), or a PK vs a UNIQUE index on
+// different columns), and a keyed row match rendered against the wrong
+// key shape pairs the wrong rows.
+func sameKeySequence(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

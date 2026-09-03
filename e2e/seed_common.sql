@@ -228,3 +228,120 @@ WITH RECURSIVE seq(n) AS (
   SELECT n + 1 FROM seq WHERE n < 50
 )
 SELECT n, CONCAT('v', n) FROM seq;
+
+-- ---- data-safety regression tables (identical on both sides) ----
+
+-- t_swap: NOT NULL UNIQUE v. The swap scenarios (m_swap.sql) exchange
+-- the two rows' values: converging needs an intermediate state that
+-- would violate the unique index, so the sync must convert the pair to
+-- delete+insert instead of updating it in place. (v must be NOT NULL:
+-- a unique index on a nullable column is deliberately NOT treated as
+-- unique, same rule as the t_nullkey auto-key rejection.)
+DROP TABLE IF EXISTS t_swap;
+CREATE TABLE t_swap (
+  id INT PRIMARY KEY,
+  v  VARCHAR(16) NOT NULL UNIQUE
+) ENGINE=InnoDB;
+INSERT INTO t_swap VALUES (1, 'B'), (2, 'A');
+
+-- t_bigint: BIGINT keys at the extreme ends (MinInt64, MaxInt64, ...):
+-- the span is wider than MaxInt64 values, so the arithmetic chunking
+-- must refuse and the sampler must split the range instead.
+DROP TABLE IF EXISTS t_bigint;
+CREATE TABLE t_bigint (
+  id  BIGINT PRIMARY KEY,
+  val VARCHAR(16)
+) ENGINE=InnoDB;
+-- Plain literals, no arithmetic: MySQL constant-folds expressions like
+-- -9223372036854775807 - 2 and rejects them as out of range; the literal
+-- -9223372036854775808 itself is accepted (the sign applies to the
+-- unsigned literal).
+INSERT INTO t_bigint VALUES
+  (-9223372036854775808, 'min'),
+  (-9223372036854775807, 'min2'),
+  (1, 'mid'),
+  (9223372036854775806, 'max2'),
+  (9223372036854775807, 'max');
+
+-- t_gen: val plus a STORED generated column. The generated column is
+-- compared but NEVER written, and a drifted generated column is refused
+-- by the structure sync (the expression cannot be reproduced).
+DROP TABLE IF EXISTS t_gen;
+CREATE TABLE t_gen (
+  id      INT PRIMARY KEY,
+  val     INT,
+  doubled INT GENERATED ALWAYS AS (val * 2) STORED
+) ENGINE=InnoDB;
+INSERT INTO t_gen (id, val)
+WITH RECURSIVE seq(n) AS (
+  SELECT 1
+  UNION ALL
+  SELECT n + 1 FROM seq WHERE n < 10
+)
+SELECT n, n * 10 FROM seq;
+
+-- t_structfail: DECIMAL(4,2) on both sides. The drift script widens the
+-- dst column and stores a value that does not fit the src type, so the
+-- in-place structure ALTER must fail and the existing data must survive.
+DROP TABLE IF EXISTS t_structfail;
+CREATE TABLE t_structfail (
+  id  INT PRIMARY KEY,
+  amt DECIMAL(4,2)
+) ENGINE=InnoDB;
+INSERT INTO t_structfail
+WITH RECURSIVE seq(n) AS (
+  SELECT 1
+  UNION ALL
+  SELECT n + 1 FROM seq WHERE n < 10
+)
+SELECT n, n * 0.5 FROM seq;
+
+-- t_snap: the snapshot/concurrency scenarios churn it from a background
+-- client while mtdiff reads it with --snapshot.
+DROP TABLE IF EXISTS t_snap;
+CREATE TABLE t_snap (
+  id INT PRIMARY KEY,
+  v  VARCHAR(16)
+) ENGINE=InnoDB;
+INSERT INTO t_snap (id, v)
+WITH RECURSIVE seq(n) AS (
+  SELECT 1
+  UNION ALL
+  SELECT n + 1 FROM seq WHERE n < 100
+)
+SELECT n, CONCAT('s', n) FROM seq;
+
+-- t_wk: a NON-UNIQUE index on k (auto key selection ignores it; an
+-- explicit --key k with --where must be refused, since a filtered row
+-- sync would address whole key groups).
+DROP TABLE IF EXISTS t_wk;
+CREATE TABLE t_wk (
+  id INT PRIMARY KEY,
+  k  INT,
+  KEY idx_k (k)
+) ENGINE=InnoDB;
+INSERT INTO t_wk
+WITH RECURSIVE seq(n) AS (
+  SELECT 1
+  UNION ALL
+  SELECT n + 1 FROM seq WHERE n < 20
+)
+SELECT n, MOD(n, 5) FROM seq;
+
+-- t_esc: strings with backslashes and quotes. Seeded with
+-- NO_BACKSLASH_ESCAPES so the literals below stay literal (the file ends
+-- here, so the session-mode change affects no later statement). The sync
+-- write path must round-trip these values byte-exact under any sql_mode.
+SET SESSION sql_mode = CONCAT(@@SESSION.sql_mode, ',NO_BACKSLASH_ESCAPES');
+DROP TABLE IF EXISTS t_esc;
+CREATE TABLE t_esc (
+  id  INT PRIMARY KEY,
+  val VARCHAR(128)
+) ENGINE=InnoDB;
+INSERT INTO t_esc VALUES
+  (1, 'C:\abc\def'),
+  (2, 'a\b'),
+  (3, ''''),
+  (4, 'a''b'),
+  (5, '{"path":"C:\\abc"}'),
+  (6, '中文\测试');

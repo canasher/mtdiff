@@ -704,5 +704,234 @@ echo "ok: --no-sync-schema explains why the table is not created"
 expect 0 "missing table: created by the default sync" sync --src "$SRC2" --dst "$DST2" --tables t_new --apply --yes
 expect 0 "diff identical after re-create" --src "$SRC2" --dst "$DST2" --tables t_new
 
+say "explicit --key uniqueness (P0-1 / P1-1)"
+# t_wk.k has only a plain (non-unique) index. With --where, a row-level
+# sync would delete whole key groups on the rows the filter excluded:
+# an argument error, in the dry run and under --apply alike, before any
+# write connection exists.
+sql dst dstdb m_wk_change.sql
+expect 3 "non-unique --key + --where: arg error (dry-run)" sync --src "$SRC" --dst "$DST" --tables t_wk --key k --where "id < 5"
+if ! grep -q 'not PRIMARY KEY or NOT NULL UNIQUE' "$OUT"; then
+  echo "FAIL: missing the uniqueness rejection"; cat "$OUT"; exit 1
+fi
+echo "ok: the rejection names the requirement"
+expect 3 "non-unique --key + --where: arg error (--apply)" sync --src "$SRC" --dst "$DST" --tables t_wk --key k --where "id < 5" --apply --yes
+n=$(qdst "SELECT COUNT(*) FROM t_wk WHERE k = 99")
+[ "$n" = "1" ] || { echo "FAIL: the rejected sync wrote to the dst (k=99 count=$n, want 1)"; exit 1; }
+echo "ok: the rejected sync wrote nothing"
+# t_swap.v is NOT NULL UNIQUE: an explicit --key on it is recognized as
+# unique. With the key value stable and the other column changed, a
+# recognized-unique key converges with a plain row-level UPDATE — group
+# replace (non-unique semantics) would delete + re-insert instead.
+sql dst dstdb m_swap_change.sql
+expect 1 "unique --key: row-level UPDATE planned" sync --src "$SRC" --dst "$DST" --tables t_swap --key v
+if ! grep -q 'UPDATE `t_swap`' "$OUT"; then
+  echo "FAIL: the unique --key must yield a plain update (group replace would delete+insert)"; cat "$OUT"; exit 1
+fi
+if grep -q 'TRUNCATE' "$OUT"; then
+  echo "FAIL: the unique --key escalated to a full resync"; cat "$OUT"; exit 1
+fi
+echo "ok: the unique --key yields row-level updates"
+expect 0 "unique --key --apply: converged" sync --src "$SRC" --dst "$DST" --tables t_swap --key v --apply --yes
+# Address change: when the unique key's OWN value changes, the row address
+# moved — delete + insert is the only correct shape (never an UPDATE).
+# The 'Z' row is OUTSIDE the source's key span (src has 'A','B'), so it
+# converges via the out-of-range scan: that delete must commit BEFORE the
+# insert, or the insert duplicates the PK the out-of-range row still holds
+# (regression: duplicate entry for PRIMARY at apply time).
+sql dst dstdb m_swap_addr.sql
+expect 1 "unique --key, changed key value: delete+insert" sync --src "$SRC" --dst "$DST" --tables t_swap --key v
+if ! grep -q 'INSERT INTO `t_swap`' "$OUT" || ! grep -q 'DELETE FROM `t_swap`' "$OUT"; then
+  echo "FAIL: a changed unique key value must convert to delete+insert"; cat "$OUT"; exit 1
+fi
+dl=$(grep -n 'DELETE FROM `t_swap`' "$OUT" | head -1 | cut -d: -f1)
+il=$(grep -n 'INSERT INTO `t_swap`' "$OUT" | head -1 | cut -d: -f1)
+if [ -z "$dl" ] || [ -z "$il" ] || [ "$dl" -gt "$il" ]; then
+  echo "FAIL: the out-of-range delete must precede the insert (dl=$dl il=$il)"; cat "$OUT"; exit 1
+fi
+echo "ok: the changed key value is delete+insert, delete first (no TRUNCATE)"
+expect 0 "unique --key, changed key value --apply" sync --src "$SRC" --dst "$DST" --tables t_swap --key v --apply --yes
+expect 0 "unique --key + --where: allowed (identical)" --src "$SRC" --dst "$DST" --tables t_swap --key v --where "id < 5"
+
+say "unique value swap: delete+insert, not a full resync (P1-4)"
+sql dst dstdb m_swap.sql
+expect 1 "swap dry-run: row-level plan" sync --src "$SRC" --dst "$DST" --tables t_swap
+if grep -q 'TRUNCATE' "$OUT"; then
+  echo "FAIL: the swap escalated to a full resync"; cat "$OUT"; exit 1
+fi
+if ! grep -q 'DELETE FROM `t_swap`' "$OUT"; then
+  echo "FAIL: the swap must convert to delete+insert"; cat "$OUT"; exit 1
+fi
+if ! grep -q 'INSERT INTO `t_swap`' "$OUT"; then
+  echo "FAIL: the swap must convert to delete+insert"; cat "$OUT"; exit 1
+fi
+echo "ok: the swap is planned as delete+insert (no TRUNCATE)"
+expect 0 "swap --apply --yes: values exchanged" sync --src "$SRC" --dst "$DST" --tables t_swap --apply --yes
+expect 0 "swap identical after sync" --src "$SRC" --dst "$DST" --tables t_swap
+v=$(qdst "SELECT v FROM t_swap WHERE id = 1")
+[ "$v" = "B" ] || { echo "FAIL: swapped value not restored (id=1 v=$v, want B)"; exit 1; }
+echo "ok: the swapped values are back"
+
+say "generated columns: compared, never written (P0-2)"
+sql dst dstdb m_gen_change.sql
+expect 1 "gen: val drift detected (doubled re-derives)" --src "$SRC" --dst "$DST" --tables t_gen
+expect 1 "gen dry-run: UPDATE planned" sync --src "$SRC" --dst "$DST" --tables t_gen
+if ! grep -q 'UPDATE `t_gen`' "$OUT"; then
+  echo "FAIL: no UPDATE sample for the generated-column table"; cat "$OUT"; exit 1
+fi
+echo "ok: dry-run shows the UPDATE sample"
+if grep '^UPDATE' "$OUT" | grep -q 'doubled'; then
+  echo "FAIL: the generated column must never be written"; cat "$OUT"; exit 1
+fi
+echo "ok: the generated column is out of the write path"
+expect 0 "gen --apply --yes: val converged, doubled re-derived" sync --src "$SRC" --dst "$DST" --tables t_gen --apply --yes
+expect 0 "gen identical after sync" --src "$SRC" --dst "$DST" --tables t_gen
+d=$(qdst "SELECT doubled FROM t_gen WHERE id = 1")
+# Sync restores the SOURCE row (val=10): the generated column must have
+# re-derived from the restored base value (doubled=20), i.e. the whole
+# row now matches src exactly — and it got there without mtdiff ever
+# writing `doubled` (the sample above is asserted free of it).
+[ "$d" = "20" ] || { echo "FAIL: the generated column did not re-derive (doubled=$d, want 20)"; exit 1; }
+v=$(qdst "SELECT val FROM t_gen WHERE id = 1")
+[ "$v" = "10" ] || { echo "FAIL: val not restored to the source value (val=$v, want 10)"; exit 1; }
+echo "ok: the row matches src exactly (val=10, doubled re-derived to 20)"
+# structure drift: the dst lost the generated column. The structure sync
+# must REFUSE the table (the expression cannot be reproduced) and write
+# nothing — in the dry run and under --apply alike.
+sql dst dstdb m_gen_drift.sql
+expect 2 "gen drift (col dropped): sync refuses (dry-run)" sync --src "$SRC" --dst "$DST" --tables t_gen
+if ! grep -q 'generated column' "$OUT"; then
+  echo "FAIL: missing the generated-column refusal"; cat "$OUT"; exit 1
+fi
+if ! grep -q -- '--no-sync-schema' "$OUT"; then
+  echo "FAIL: missing the --no-sync-schema hint"; cat "$OUT"; exit 1
+fi
+echo "ok: the refusal names the column and the escape hatch"
+expect 2 "gen drift: --apply refuses before any write" sync --src "$SRC" --dst "$DST" --tables t_gen --apply --yes
+# After the convergence apply above, the dst row matches the source
+# (val=10); the drift script only dropped the column. A refusing sync
+# must leave even that alone — val still at the source value.
+v=$(qdst "SELECT val FROM t_gen WHERE id = 1")
+[ "$v" = "10" ] || { echo "FAIL: the refused sync wrote to the dst (val=$v, want 10)"; exit 1; }
+echo "ok: the refused sync left the data untouched"
+
+say "structure ALTER failure keeps the data (P1-3)"
+sql dst dstdb m_structfail_drift.sql
+expect 1 "structfail dry-run: in-place ALTER planned" sync --src "$SRC" --dst "$DST" --tables t_structfail
+if ! grep -q 'ALTER TABLE `t_structfail`' "$OUT"; then
+  echo "FAIL: no structure DDL for the drifted table"; cat "$OUT"; exit 1
+fi
+if grep -q 'TRUNCATE' "$OUT"; then
+  echo "FAIL: the default structure sync must not truncate"; cat "$OUT"; exit 1
+fi
+echo "ok: the dry run plans the in-place ALTER (no TRUNCATE)"
+expect 2 "structfail --apply: the ALTER fails, data preserved" sync --src "$SRC" --dst "$DST" --tables t_structfail --apply --yes
+if ! grep -q -- '--allow-structure-truncate' "$OUT"; then
+  echo "FAIL: the failure must point at the opt-in flag"; cat "$OUT"; exit 1
+fi
+n=$(qdst "SELECT COUNT(*) FROM t_structfail WHERE amt = 12345.67")
+[ "$n" = "1" ] || { echo "FAIL: the failed in-place ALTER lost the data (count=$n, want 1)"; exit 1; }
+echo "ok: the wide value survived the failed in-place ALTER"
+expect 0 "structfail --allow-structure-truncate: reloaded" sync --src "$SRC" --dst "$DST" --tables t_structfail --allow-structure-truncate --apply --yes
+expect 0 "structfail identical after reload" --src "$SRC" --dst "$DST" --tables t_structfail
+n=$(qdst "SELECT COUNT(*) FROM t_structfail WHERE amt > 99.99")
+[ "$n" = "0" ] || { echo "FAIL: the wide value survived the reload (count=$n, want 0)"; exit 1; }
+echo "ok: the table was reloaded from the src (opt-in truncate)"
+
+say "write-path escaping under NO_BACKSLASH_ESCAPES (P0-3)"
+# Flip the dst server into NO_BACKSLASH_ESCAPES: every session mtdiff
+# opens (including its write connection) inherits the mode, so a
+# client-side interpolated literal would store the backslash values
+# mangled. The parameterized write path must round-trip them byte-exact.
+qdb dst dstdb "SET GLOBAL sql_mode = CONCAT(@@GLOBAL.sql_mode, ',NO_BACKSLASH_ESCAPES')"
+sql dst dstdb m_esc_change.sql
+expect 1 "esc dry-run: updates planned" sync --src "$SRC" --dst "$DST" --tables t_esc
+expect 1 "diff still differs after esc dry-run (zero writes)" --src "$SRC" --dst "$DST" --tables t_esc
+expect 0 "esc --apply --yes: backslash rows converge" sync --src "$SRC" --dst "$DST" --tables t_esc --apply --yes
+# byte-exact: the full HEX of both sides must match row for row.
+sh=$(qdb src srcdb "SELECT id, HEX(val) FROM t_esc ORDER BY id")
+dh=$(qdb dst dstdb "SELECT id, HEX(val) FROM t_esc ORDER BY id")
+if [ "$sh" != "$dh" ]; then
+  echo "FAIL: t_esc bytes differ after the sync (src: $sh; dst: $dh)"; exit 1
+fi
+echo "ok: the backslash/quote values round-tripped byte-exact under NO_BACKSLASH_ESCAPES"
+qdb dst dstdb "SET GLOBAL sql_mode = REPLACE(@@GLOBAL.sql_mode, ',NO_BACKSLASH_ESCAPES', '')"
+
+say "snapshot mode under concurrent writes (P1-5)"
+sql dst dstdb m_snap_drift.sql
+# churn the dst from a background client while the snapshot diff runs:
+# the run must finish cleanly (0/1), never with a runtime error.
+(
+  i=0
+  while [ "$i" -lt 30 ]; do
+    qdb dst dstdb "UPDATE t_snap SET v = 'x1' WHERE id = 1" >/dev/null 2>&1 || true
+    i=$((i+1))
+    sleep 0.2
+  done
+) &
+churn=$!
+set +e
+timeout 300 "$MTDIFF" --src "$SRC" --dst "$DST" --tables t_snap --snapshot > "$OUT" 2>&1
+rc=$?
+set -e
+wait "$churn"
+if [ "$rc" -ne 0 ] && [ "$rc" -ne 1 ]; then
+  echo "FAIL: --snapshot diff under churn exit $rc (want 0 or 1)"; cat "$OUT"; exit 1
+fi
+echo "ok: --snapshot diff survived the concurrent writes (exit $rc)"
+sql dst dstdb m_snap_reset.sql
+expect 0 "snapshot: identical after reset" --src "$SRC" --dst "$DST" --tables t_snap --snapshot
+
+say "read connections stay read-only under load (P1-2)"
+# MySQL cannot read another session's variables, so the policy is verified
+# from the src server's general log (TABLE output): every connection that
+# scanned t_large must show its read-only session setup (applySession's
+# SET SESSION TRANSACTION READ ONLY, the tier that lands on MySQL 8) in
+# the log. The log is snapshotted into a temp table and the general log
+# switched off BEFORE the analysis queries run, so the analysis cannot
+# match itself (its own text contains the patterns).
+qdb src srcdb "SET GLOBAL general_log = OFF; SET GLOBAL log_output = 'TABLE'; TRUNCATE TABLE mysql.general_log; SET GLOBAL general_log = ON"
+set +e
+timeout 600 "$MTDIFF" --src "$SRC" --dst "$DST" --tables t_large --parallel 4 --chunk-size 100 > "$OUT" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 0 ] || { echo "FAIL: the probe diff itself exited $rc"; cat "$OUT"; exit 1; }
+qdb src srcdb "CREATE TABLE mysql.mtdiff_probe_gl AS SELECT * FROM mysql.general_log; SET GLOBAL general_log = OFF; SET GLOBAL log_output = 'FILE'"
+scan_threads=$(qdb src srcdb "SELECT COUNT(DISTINCT thread_id) FROM mysql.mtdiff_probe_gl WHERE command_type = 'Query' AND argument LIKE '%FROM \`t_large\`%'")
+unenforced=$(qdb src srcdb "SELECT COUNT(*) FROM (SELECT DISTINCT thread_id AS tid FROM mysql.mtdiff_probe_gl WHERE command_type = 'Query' AND argument LIKE '%FROM \`t_large\`%') sc LEFT JOIN (SELECT DISTINCT thread_id AS tid FROM mysql.mtdiff_probe_gl WHERE argument LIKE '%TRANSACTION READ ONLY%' OR argument LIKE 'SET SESSION read_only%') po ON po.tid = sc.tid WHERE po.tid IS NULL")
+qdb src srcdb "DROP TABLE mysql.mtdiff_probe_gl"
+case "$scan_threads" in ''|*[!0-9]*) scan_threads=0;; esac
+case "$unenforced" in ''|*[!0-9]*) unenforced=1;; esac
+if [ "$scan_threads" -lt 2 ]; then
+  echo "FAIL: only $scan_threads connection(s) scanned t_large (want >= 2)"; exit 1
+fi
+if [ "$unenforced" -ne 0 ]; then
+  echo "FAIL: $unenforced scanning connection(s) never set the read-only session policy"; exit 1
+fi
+echo "ok: all $scan_threads scanning connections set the read-only session policy"
+
+say "BIGINT extremes: overflow-safe chunking"
+# The key span (MinInt64..MaxInt64) is wider than MaxInt64 values: the
+# arithmetic split must refuse and the sampler must partition the range
+# instead; the extreme rows must still be diffed and converged.
+expect 0 "bigint extremes identical" --src "$SRC" --dst "$DST" --tables t_bigint
+sql dst dstdb m_bigint_max.sql
+expect 1 "bigint extremes: the max row changed" --src "$SRC" --dst "$DST" --tables t_bigint
+expect 0 "bigint extremes: sync restores the max row" sync --src "$SRC" --dst "$DST" --tables t_bigint --apply --yes
+expect 0 "bigint extremes identical after sync" --src "$SRC" --dst "$DST" --tables t_bigint
+
+say "--sample-limit 0 shows no sample SQL (P2-1)"
+sql dst dstdb m_mut_reseed.sql
+sql dst dstdb m_update.sql
+set +e
+timeout 600 "$MTDIFF" sync --src "$SRC" --dst "$DST" --tables t_mut --sample-limit 0 > "$OUT" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 1 ] || { echo "FAIL: the sample-limit 0 dry-run exited $rc (want 1)"; cat "$OUT"; exit 1; }
+if grep -q 'UPDATE `t_mut`' "$OUT"; then
+  echo "FAIL: --sample-limit 0 still showed sample SQL"; cat "$OUT"; exit 1
+fi
+echo "ok: --sample-limit 0 keeps the plan, drops the samples"
+
 E2E_OK=1
 say "ALL E2E SCENARIOS PASSED"

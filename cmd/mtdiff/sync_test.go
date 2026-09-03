@@ -11,6 +11,8 @@ import (
 	msync "mtdiff/internal/sync"
 )
 
+func intPtr(v int) *int { return &v }
+
 // newSyncCommand builds a command carrying the sync flags with all values
 // reset to their defaults, mirroring newDiffCommand.
 func newSyncCommand(t *testing.T) *cobra.Command {
@@ -125,14 +127,14 @@ func TestApplySyncOpts(t *testing.T) {
 	cmd := newSyncCommand(t)
 	cfg := &config.Config{}
 	cfg.Opts.BatchSize = 500
-	cfg.Opts.SampleLimit = 3
+	cfg.Opts.SampleLimit = intPtr(3)
 	cfg.Opts.Tolerance = 0.5
 
 	// no flags given: YAML values survive, no error
 	if err := applySyncOpts(cmd, &syncOpt, cfg); err != nil {
 		t.Fatalf("no flags: %v", err)
 	}
-	if cfg.Opts.BatchSize != 500 || cfg.Opts.SampleLimit != 3 || cfg.Opts.Tolerance != 0.5 {
+	if cfg.Opts.BatchSize != 500 || cfg.SampleLimitOr(-1) != 3 || cfg.Opts.Tolerance != 0.5 {
 		t.Errorf("unset flags must not touch YAML values: %+v", cfg.Opts)
 	}
 
@@ -160,13 +162,13 @@ func TestApplySyncOpts(t *testing.T) {
 	cmd4 := newSyncCommand(t)
 	cfg4 := &config.Config{}
 	cfg4.Opts.BatchSize = 500
-	cfg4.Opts.SampleLimit = 3
+	cfg4.Opts.SampleLimit = intPtr(3)
 	cmd4.Flags().Set("batch-size", "250")
 	cmd4.Flags().Set("sample-limit", "0")
 	if err := applySyncOpts(cmd4, &syncOpt, cfg4); err != nil {
 		t.Fatalf("valid overrides: %v", err)
 	}
-	if cfg4.Opts.BatchSize != 250 || cfg4.Opts.SampleLimit != 0 {
+	if cfg4.Opts.BatchSize != 250 || cfg4.SampleLimitOr(-1) != 0 {
 		t.Errorf("explicit values must override YAML: %+v", cfg4.Opts)
 	}
 

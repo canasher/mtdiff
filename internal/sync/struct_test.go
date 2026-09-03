@@ -272,6 +272,111 @@ func TestDiffStructureExpressionDefaultRefused(t *testing.T) {
 	}
 }
 
+// genCol is a generated-column ColMeta (the EXTRA-detected flag plus its
+// storage type).
+func genCol(name, typ, fam, storage string) conn.ColMeta {
+	c := metaCol(name, typ, fam, false)
+	c.Generated, c.GenStorage = true, storage
+	return c
+}
+
+// TestDiffStructureGeneratedColumnRefused pins P0-2: the structure sync
+// refuses to (re-)define a generated column — the expression is a
+// cross-backend promise, and re-defining would silently drop it — while
+// an identical generated column is left alone and a destination-only one
+// is simply dropped.
+func TestDiffStructureGeneratedColumnRefused(t *testing.T) {
+	// A source generated column the destination lacks: refused, not
+	// emitted (an ADD COLUMN would silently lose the expression).
+	src := &conn.Struct{Cols: []conn.ColMeta{
+		metaCol("id", "int", conn.FamINT, false),
+		genCol("total", "decimal(12,2)", conn.FamDECIMAL, "STORED"),
+	}}
+	dst := &conn.Struct{Cols: []conn.ColMeta{metaCol("id", "int", conn.FamINT, false)}}
+	changes, err := DiffStructure(src, dst, "", "")
+	if err == nil || changes != nil {
+		t.Fatalf("missing generated column: changes=%v err=%v, want the refusal", changes, err)
+	}
+	if !strings.Contains(err.Error(), "generated column") || !strings.Contains(err.Error(), "--no-sync-schema") {
+		t.Fatalf("refusal message = %q", err)
+	}
+
+	// A DRIFTED generated column (its definition moved) is refused the
+	// same way: a MODIFY would re-define it as a plain column.
+	srcDrift := &conn.Struct{Cols: []conn.ColMeta{
+		metaCol("id", "int", conn.FamINT, false),
+		genCol("total", "decimal(14,2)", conn.FamDECIMAL, "STORED"),
+	}}
+	dstDrift := &conn.Struct{Cols: []conn.ColMeta{
+		metaCol("id", "int", conn.FamINT, false),
+		genCol("total", "decimal(12,2)", conn.FamDECIMAL, "STORED"),
+	}}
+	if _, err := DiffStructure(srcDrift, dstDrift, "", ""); err == nil {
+		t.Fatal("drifted generated column must be refused")
+	}
+
+	// A storage-type drift (STORED vs VIRTUAL) is a drift on its own and
+	// is refused as well.
+	srcStore := &conn.Struct{Cols: []conn.ColMeta{
+		metaCol("id", "int", conn.FamINT, false),
+		genCol("total", "decimal(12,2)", conn.FamDECIMAL, "STORED"),
+	}}
+	dstVirt := &conn.Struct{Cols: []conn.ColMeta{
+		metaCol("id", "int", conn.FamINT, false),
+		genCol("total", "decimal(12,2)", conn.FamDECIMAL, "VIRTUAL"),
+	}}
+	if _, err := DiffStructure(srcStore, dstVirt, "", ""); err == nil {
+		t.Fatal("a generated-column storage drift must be refused")
+	}
+
+	// An IDENTICAL generated column on both sides is not a change: the
+	// expression is neither re-emitted nor refused.
+	dstSame := &conn.Struct{Cols: []conn.ColMeta{
+		metaCol("id", "int", conn.FamINT, false),
+		genCol("total", "decimal(12,2)", conn.FamDECIMAL, "STORED"),
+	}}
+	if changes, err := DiffStructure(src, dstSame, "", ""); err != nil || len(changes) != 0 {
+		t.Fatalf("identical generated column: changes=%v err=%v", changes, err)
+	}
+
+	// A destination-ONLY generated column is dropped (dropping works on
+	// generated columns), not refused.
+	srcPlain := &conn.Struct{Cols: []conn.ColMeta{metaCol("id", "int", conn.FamINT, false)}}
+	dstGen := &conn.Struct{Cols: []conn.ColMeta{
+		metaCol("id", "int", conn.FamINT, false),
+		genCol("total", "decimal(12,2)", conn.FamDECIMAL, "STORED"),
+	}}
+	changes, err = DiffStructure(srcPlain, dstGen, "", "")
+	if err != nil {
+		t.Fatalf("dropping a destination-only generated column: %v", err)
+	}
+	if len(changes) != 1 || changes[0].Kind != ChangeDropColumn || changes[0].Col.Name != "total" {
+		t.Fatalf("want the single DROP COLUMN, got %v", changes)
+	}
+
+	// A column the source reverted to PLAIN is re-defined: the source
+	// definition is reproducible, so the change (which removes the
+	// expression) is planned, not refused.
+	srcPlain2 := &conn.Struct{Cols: []conn.ColMeta{
+		metaCol("id", "int", conn.FamINT, false),
+		metaCol("total", "decimal(12,2)", conn.FamDECIMAL, false),
+	}}
+	changes, err = DiffStructure(srcPlain2, dstGen, "", "")
+	if err != nil {
+		t.Fatalf("un-generating a column: %v", err)
+	}
+	if len(changes) != 1 || changes[0].Kind != ChangeModifyColumn || changes[0].Col.Name != "total" {
+		t.Fatalf("want the single MODIFY COLUMN, got %v", changes)
+	}
+
+	if g := generatedCols(src); len(g) != 1 || g[0] != "total" {
+		t.Fatalf("generatedCols = %v, want [total]", g)
+	}
+	if g := generatedCols(srcPlain); len(g) != 0 {
+		t.Fatalf("generatedCols(plain) = %v, want none", g)
+	}
+}
+
 func TestFilterStruct(t *testing.T) {
 	s := &conn.Struct{
 		Table: "t",
