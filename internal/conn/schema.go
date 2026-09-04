@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -61,13 +62,23 @@ type Schema struct {
 	// deterministic, and the sync engine replaces key groups instead of
 	// updating single rows.
 	KeyIsUnique bool
-	// UniqueCols is the set of columns covered by a primary or unique
-	// index: a value of such a column occurs in at most one row (per
-	// single-column index; a composite index reports all of its members,
-	// a conservative superset). The sync engine uses it to detect
-	// unique-value swaps that a per-row UPDATE could not apply in any
-	// order.
-	UniqueCols map[string]bool
+	// UniqueConstraints is the primary key (first, Name "PRIMARY") and
+	// every unique index, each as an ORDERED column tuple (index order).
+	// The sync engine uses them to detect unique-value swaps that a
+	// per-row UPDATE could not apply in any order: a conflict is a whole
+	// TUPLE of one constraint, so a composite UNIQUE(a,b) does not make
+	// a or b individually unique (a value may repeat across the other
+	// member), and different constraints never cross-collide (a value in
+	// UNIQUE(email) equal to another row's UNIQUE(phone) value is fine).
+	UniqueConstraints []UniqueConstraint
+}
+
+// UniqueConstraint is one unique constraint of a table: the primary key
+// (Name "PRIMARY") or a unique index, with its columns in index order
+// (functional index parts — no physical column — are not reported).
+type UniqueConstraint struct {
+	Name string
+	Cols []string
 }
 
 // ColMeta is one column's full structure metadata (the structure-sync
@@ -219,7 +230,7 @@ func IntrospectTable(ctx context.Context, db *sql.DB, table string) (*Schema, er
 	}
 	s.Key, s.KeySource = key, source
 	s.KeyIsUnique = source == "primary" || source == "unique"
-	s.UniqueCols, err = UniqueIndexedColumns(ctx, db, table)
+	s.UniqueConstraints, err = UniqueConstraints(ctx, db, table)
 	if err != nil {
 		return nil, err
 	}
@@ -477,29 +488,39 @@ func ExplicitKeyIsUnique(ctx context.Context, db *sql.DB, table string, key []st
 }
 
 // uniqueKeySequences returns the table's primary key column sequence and
-// its unique indexes (each a column sequence in index order), from
-// information_schema.STATISTICS (same source and PRIMARY special-casing as
-// SelectKey). Functional index parts (no physical column) are skipped.
+// its unique indexes (each a column sequence in index order), derived from
+// UniqueConstraints (information_schema.STATISTICS, same source as
+// SelectKey).
 func uniqueKeySequences(ctx context.Context, db *sql.DB, table string) (pk []string, uniques [][]string, err error) {
+	cons, err := UniqueConstraints(ctx, db, table)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, c := range cons {
+		if c.Name == "PRIMARY" {
+			pk = c.Cols
+		} else {
+			uniques = append(uniques, c.Cols)
+		}
+	}
+	return pk, uniques, nil
+}
+
+// UniqueConstraints returns the table's unique constraints from
+// information_schema.STATISTICS: the primary key (Name "PRIMARY") first,
+// then every unique index with its columns in index order. Functional
+// index parts (no physical column) are skipped.
+func UniqueConstraints(ctx context.Context, db *sql.DB, table string) ([]UniqueConstraint, error) {
 	rows, err := db.QueryContext(ctx, `
 		SELECT INDEX_NAME, NON_UNIQUE, SEQ_IN_INDEX, COLUMN_NAME
 		FROM information_schema.STATISTICS
 		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?
 		ORDER BY INDEX_NAME, SEQ_IN_INDEX`, table)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	defer rows.Close()
-	var (
-		cur     string
-		curCols []string
-	)
-	flush := func() {
-		if cur != "" && cur != "PRIMARY" {
-			uniques = append(uniques, curCols)
-		}
-		cur, curCols = "", nil
-	}
+	var rowsIn []statRow
 	for rows.Next() {
 		var (
 			keyName  string
@@ -508,26 +529,68 @@ func uniqueKeySequences(ctx context.Context, db *sql.DB, table string) (pk []str
 			colName  sql.NullString
 		)
 		if err := rows.Scan(&keyName, &nonUniq, &seqInIdx, &colName); err != nil {
-			return nil, nil, err
+			return nil, err
 		}
-		if !colName.Valid {
+		rowsIn = append(rowsIn, statRow{
+			name:      keyName,
+			nonUnique: nonUniq,
+			seq:       seqInIdx,
+			col:       colName.String,
+			colValid:  colName.Valid,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	cons := accumulateUniqueConstraints(rowsIn)
+	// primary key first (the order SelectKey prefers it in)
+	sort.SliceStable(cons, func(i, j int) bool {
+		return cons[i].Name == "PRIMARY" && cons[j].Name != "PRIMARY"
+	})
+	return cons, nil
+}
+
+// statRow is one information_schema.STATISTICS row (the columns
+// UniqueConstraints reads), decoupled from the live query so the
+// accumulation is unit-testable.
+type statRow struct {
+	name      string
+	nonUnique string // "0" (unique) or "1"
+	seq       int
+	col       string // empty when colValid is false
+	colValid  bool   // false: functional index part (no physical column)
+}
+
+// accumulateUniqueConstraints folds STATISTICS rows (already ordered by
+// INDEX_NAME, SEQ_IN_INDEX) into the unique constraints: the primary key
+// plus every NON_UNIQUE=0 index, each with its columns in index order.
+// Functional index parts and non-unique indexes are skipped. A
+// constraint's rows are contiguous (the ordering), so one cursor over
+// the accumulated slice suffices; the cursor starts at -1 (no
+// constraint open) — a zero-valued cursor would index the empty slice on
+// the very first unique row.
+func accumulateUniqueConstraints(rows []statRow) []UniqueConstraint {
+	var (
+		cons []UniqueConstraint
+		cur  = -1
+	)
+	flush := func() { cur = -1 }
+	for _, r := range rows {
+		if !r.colValid {
 			continue // functional index part: no physical column
 		}
-		if keyName == "PRIMARY" {
-			pk = append(pk, colName.String)
+		if r.name != "PRIMARY" && r.nonUnique != "0" {
 			continue
 		}
-		if nonUniq != "0" {
-			continue
-		}
-		if keyName != cur {
+		if cur == -1 || r.name != cons[cur].Name {
 			flush()
-			cur = keyName
+			cons = append(cons, UniqueConstraint{Name: r.name})
+			cur = len(cons) - 1
 		}
-		curCols = append(curCols, colName.String)
+		cons[cur].Cols = append(cons[cur].Cols, r.col)
 	}
 	flush()
-	return pk, uniques, rows.Err()
+	return cons
 }
 
 // keySequenceUnique is the pure decision of ExplicitKeyIsUnique: the key
@@ -566,29 +629,6 @@ func keySequenceUnique(pk []string, uniques [][]string, nullable map[string]bool
 		}
 	}
 	return false
-}
-
-// UniqueIndexedColumns returns the set of columns covered by a primary or
-// unique index. A single-column unique index makes its values unique table
-// wide; a composite index is reported through ALL of its member columns —
-// a superset (a value can repeat across the other members), which the
-// caller treats conservatively (it only turns a would-be UPDATE into a
-// delete+insert pair, which is always correct).
-func UniqueIndexedColumns(ctx context.Context, db *sql.DB, table string) (map[string]bool, error) {
-	pk, uniques, err := uniqueKeySequences(ctx, db, table)
-	if err != nil {
-		return nil, err
-	}
-	set := make(map[string]bool)
-	for _, c := range pk {
-		set[c] = true
-	}
-	for _, u := range uniques {
-		for _, c := range u {
-			set[c] = true
-		}
-	}
-	return set, nil
 }
 
 // nullableColumns returns the set of columns of the table that accept NULL

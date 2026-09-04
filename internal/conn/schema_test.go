@@ -70,3 +70,56 @@ func TestGeneratedColumn(t *testing.T) {
 		}
 	}
 }
+
+// TestAccumulateUniqueConstraints is the regression for the zero-value
+// cursor: a table whose STATISTICS holds a SINGLE unique index used to
+// index the (empty) accumulated slice on its first row and panic. It
+// also pins the folding rules: functional parts skipped, non-unique
+// indexes ignored, columns in SEQ order, PRIMARY kept first.
+func TestAccumulateUniqueConstraints(t *testing.T) {
+	// The exact panic shape: one row, the primary key.
+	single := []statRow{{name: "PRIMARY", nonUnique: "0", seq: 1, col: "id", colValid: true}}
+	got := accumulateUniqueConstraints(single)
+	if len(got) != 1 || got[0].Name != "PRIMARY" || len(got[0].Cols) != 1 || got[0].Cols[0] != "id" {
+		t.Fatalf("single PK: got %+v", got)
+	}
+
+	// No unique index at all: only a plain secondary index.
+	none := []statRow{
+		{name: "idx_v", nonUnique: "1", seq: 1, col: "v", colValid: true},
+	}
+	if got := accumulateUniqueConstraints(none); len(got) != 0 {
+		t.Fatalf("no unique: got %+v", got)
+	}
+
+	// Empty input (no STATISTICS rows) must not panic.
+	if got := accumulateUniqueConstraints(nil); len(got) != 0 {
+		t.Fatalf("empty: got %+v", got)
+	}
+
+	// Composite PK + a unique index + a functional part + a non-unique
+	// index, out of name order to exercise the cursor reset between
+	// constraints.
+	mixed := []statRow{
+		{name: "PRIMARY", nonUnique: "0", seq: 1, col: "a", colValid: true},
+		{name: "PRIMARY", nonUnique: "0", seq: 2, col: "b", colValid: true},
+		{name: "func_idx", nonUnique: "0", seq: 1, col: "", colValid: false}, // functional
+		{name: "uk_e", nonUnique: "0", seq: 1, col: "e", colValid: true},
+		{name: "plain", nonUnique: "1", seq: 1, col: "z", colValid: true},
+	}
+	got = accumulateUniqueConstraints(mixed)
+	if len(got) != 2 {
+		t.Fatalf("mixed: want 2 constraints, got %d: %+v", len(got), got)
+	}
+	// sort puts PRIMARY first
+	if got[0].Name != "PRIMARY" {
+		t.Fatalf("PRIMARY must sort first: %+v", got)
+	}
+	if len(got[0].Cols) != 2 || got[0].Cols[0] != "a" || got[0].Cols[1] != "b" {
+		t.Fatalf("PK cols: got %v", got[0].Cols)
+	}
+	rest := got[1]
+	if rest.Name != "uk_e" || len(rest.Cols) != 1 || rest.Cols[0] != "e" {
+		t.Fatalf("uk_e: got %+v", rest)
+	}
+}

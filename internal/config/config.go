@@ -68,6 +68,13 @@ type Options struct {
 	// behavior as a fallback). Default false: the failure stops the table
 	// with its data preserved.
 	AllowStructureTruncate bool `yaml:"allow_structure_truncate"`
+	// AllowRowRewrite: permit the destructive row rewrite for a
+	// unique-value conflict (swap/cycle/holder) — DELETE+INSERT of the
+	// affected rows, and the order-independent full resync for a
+	// cross-chunk swap. Default false: the table is REFUSED instead,
+	// because the rewrite fires FK ON DELETE CASCADE, triggers and audit
+	// logs for rows the user never asked to change.
+	AllowRowRewrite bool `yaml:"allow_row_rewrite"`
 }
 
 // Config is the fully-resolved configuration.

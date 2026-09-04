@@ -94,6 +94,29 @@ func (a *Applier) resync(ctx context.Context, st *Stats, b *Builder, schema *con
 	}
 }
 
+// batchCap is the row limit of one multi-row INSERT (P2-3): the
+// configured Batch, further capped by the bind-parameter budget
+// (maxBindParams / writable columns) — a wide table shrinks its batch
+// automatically, while the MaxBytes flush condition still applies on top.
+// A table so wide that ONE row already exceeds the budget is an explicit
+// error: a row cannot be split across statements.
+func (a *Applier) batchCap(b *Builder) (int, error) {
+	cols := b.WritableCols()
+	if cols > maxBindParams {
+		return 0, fmt.Errorf("table %s has %d writable columns: a single row already exceeds the %d bind-parameter budget — the row cannot be split across statements", b.Table, cols, maxBindParams)
+	}
+	batch := a.Batch
+	if cols > 0 {
+		if cap := maxBindParams / cols; batch > cap {
+			batch = cap
+		}
+	}
+	if batch < 1 {
+		batch = 1
+	}
+	return batch, nil
+}
+
 // ApplyOps runs the ROWLEVEL mode over the ops grouped by chunk: one
 // transaction per group, so a failure rolls back that group's writes only
 // and the counters count committed rows only. Within a group, DELETEs and
@@ -102,6 +125,11 @@ func (a *Applier) resync(ctx context.Context, st *Stats, b *Builder, schema *con
 // batched as multi-row statements and flushed on the batch limits (row
 // count, or rendered bytes to protect max_allowed_packet) or at the end.
 func (a *Applier) ApplyOps(ctx context.Context, st *Stats, b *Builder, chunked [][]op) {
+	batch, err := a.batchCap(b)
+	if err != nil {
+		st.Error = err.Error()
+		return
+	}
 	step := len(chunked) / 10
 	if step < 1 {
 		step = 1
@@ -138,7 +166,7 @@ func (a *Applier) ApplyOps(ctx context.Context, st *Stats, b *Builder, chunked [
 				if a.MaxBytes > 0 && len(pending) == 0 && rb > a.MaxBytes {
 					return fmt.Errorf("a single row renders to %d bytes, over the %d-byte budget: raise --max-allowed-packet", rb, a.MaxBytes)
 				}
-				if len(pending) > 0 && (len(pending) >= a.Batch || (a.MaxBytes > 0 && pendingBytes+rb > a.MaxBytes)) {
+				if len(pending) > 0 && (len(pending) >= batch || (a.MaxBytes > 0 && pendingBytes+rb > a.MaxBytes)) {
 					if err := flush(); err != nil {
 						return err
 					}
@@ -208,6 +236,10 @@ func (a *Applier) ApplyOps(ctx context.Context, st *Stats, b *Builder, chunked [
 // A batch flushes at Batch rows or when the rendered statement exceeds
 // MaxBytes (protects max_allowed_packet on BLOB-heavy tables).
 func (a *Applier) streamChunk(ctx context.Context, tx *sql.Tx, st *Stats, b *Builder, schema *conn.Schema, ch chunk.Chunk) error {
+	batch, err := a.batchCap(b)
+	if err != nil {
+		return err
+	}
 	cn, err := a.Src.AcquireScan(ctx)
 	if err != nil {
 		return err
@@ -219,10 +251,12 @@ func (a *Applier) streamChunk(ctx context.Context, tx *sql.Tx, st *Stats, b *Bui
 		idents[i] = conn.QuoteIdent(c.Name)
 	}
 	query := fmt.Sprintf("SELECT %s FROM %s", strings.Join(idents, ", "), conn.QuoteIdent(schema.Table))
-	if pred := ch.Predicate(schema.Key, ""); pred != "" {
-		query += " WHERE " + pred
+	// parameterized: the key bounds are bound on the server side (P0-1)
+	pred := ch.Pred(schema.Key, "")
+	if pred.SQL != "" {
+		query += " WHERE " + pred.SQL
 	}
-	rows, err := cn.QueryContext(ctx, query)
+	rows, err := cn.QueryContext(ctx, query, pred.Args...)
 	if err != nil {
 		return err
 	}
@@ -266,7 +300,7 @@ func (a *Applier) streamChunk(ctx context.Context, tx *sql.Tx, st *Stats, b *Bui
 		if a.MaxBytes > 0 && len(pending) == 0 && rowBytes > a.MaxBytes {
 			return fmt.Errorf("a single row renders to %d bytes, over the %d-byte budget: raise --max-allowed-packet", rowBytes, a.MaxBytes)
 		}
-		if len(pending) > 0 && (len(pending) >= a.Batch || (a.MaxBytes > 0 && pendingBytes+rowBytes > a.MaxBytes)) {
+		if len(pending) > 0 && (len(pending) >= batch || (a.MaxBytes > 0 && pendingBytes+rowBytes > a.MaxBytes)) {
 			if err := flush(); err != nil {
 				return err
 			}

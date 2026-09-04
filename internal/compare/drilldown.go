@@ -112,14 +112,15 @@ func (d *DrillDown) scanRows(ctx context.Context, side *conn.Side, cn *sql.Conn,
 	for _, c := range schema.Cols {
 		cols = append(cols, conn.QuoteIdent(c.Name))
 	}
-	pred := ch.Predicate(schema.Key, where)
+	// parameterized: the key bounds are bound on the server side (P0-1)
+	pred := ch.Pred(schema.Key, where)
 	var whereClause string
-	if pred != "" {
-		whereClause = " WHERE " + pred
+	if pred.SQL != "" {
+		whereClause = " WHERE " + pred.SQL
 	}
 	query := fmt.Sprintf("SELECT %s FROM %s%s%s",
 		strings.Join(cols, ", "), conn.QuoteIdent(schema.Table), whereClause, drillOrderBy(schema))
-	rows, err := cn.QueryContext(ctx, query)
+	rows, err := cn.QueryContext(ctx, query, pred.Args...)
 	if err != nil {
 		return nil, false, err
 	}

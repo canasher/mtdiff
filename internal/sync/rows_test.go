@@ -1,9 +1,13 @@
 package sync
 
 import (
+	"context"
+	"database/sql/driver"
+	"fmt"
 	"reflect"
 	"testing"
 
+	"mtdiff/internal/chunk"
 	"mtdiff/internal/conn"
 	"mtdiff/internal/normalize"
 )
@@ -34,7 +38,8 @@ func newTestEngine(t *testing.T, opts normalize.Options, unique bool, cols []con
 }
 
 // newTestEngineWithUnique builds an engine over possibly different
-// source/destination schemas and a set of unique (non-key) columns.
+// source/destination schemas and a set of single-column unique
+// constraints (the map's keys, one constraint per column).
 func newTestEngineWithUnique(t *testing.T, opts normalize.Options, unique bool, cols, dstCols []conn.Column, uniqueCols map[string]bool) *Engine {
 	t.Helper()
 	return NewEngine(
@@ -42,8 +47,25 @@ func newTestEngineWithUnique(t *testing.T, opts normalize.Options, unique bool, 
 		normalize.NewNormalizer(dstCols, opts),
 		normalize.NewNormalizer(colsFor(cols, "id"), opts),
 		normalize.NewNormalizer(colsFor(dstCols, "id"), opts),
-		unique, colsFor(cols, "id"), cols, dstCols, uniqueCols)
+		unique, colsFor(cols, "id"), cols, dstCols, uniqMap(srcUniq(cols, uniqueCols)), uniqMap(srcUniq(dstCols, uniqueCols)))
 }
+
+// srcUniq builds single-column unique constraints for the named columns
+// present in cols.
+func srcUniq(cols []conn.Column, names map[string]bool) []conn.UniqueConstraint {
+	if len(names) == 0 {
+		return nil
+	}
+	out := make([]conn.UniqueConstraint, 0, len(names))
+	for _, c := range cols {
+		if names[c.Name] {
+			out = append(out, conn.UniqueConstraint{Name: "uk_" + c.Name, Cols: []string{c.Name}})
+		}
+	}
+	return out
+}
+
+func uniqMap(u []conn.UniqueConstraint) []conn.UniqueConstraint { return u }
 
 // nextOf adapts a row slice to the iterator seam (mirrors the DB scan
 // loop, which hands out one reused buffer per row).
@@ -79,7 +101,7 @@ func TestDiffUniqueKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ops := e.Diff(srcM, dstM)
+	ops, _ := e.Diff(srcM, dstM)
 	if ins, upd, del := Counts([][]op{ops}); ins != 1 || upd != 1 || del != 1 {
 		t.Fatalf("counts = %d/%d/%d, want 1/1/1", ins, upd, del)
 	}
@@ -101,21 +123,21 @@ func TestDiffTrailingSpaceAndFoldCase(t *testing.T) {
 	dst := [][]any{{int64(1), "x", int64(10)}}
 	srcM, _ := e.buffer(e.srcRow, e.srcKey, nextOf(src))
 	dstM, _ := e.buffer(e.dstRow, e.dstKey, nextOf(dst))
-	if ops := e.Diff(srcM, dstM); len(ops) != 0 {
+	if ops, _ := e.Diff(srcM, dstM); len(ops) != 0 {
 		t.Errorf("trimmed rows must compare equal, got %d ops", len(ops))
 	}
 	// without trimming they differ: one update
 	e = newTestEngine(t, normalize.Options{}, true, keyedCols(false))
 	srcM, _ = e.buffer(e.srcRow, e.srcKey, nextOf(src))
 	dstM, _ = e.buffer(e.dstRow, e.dstKey, nextOf(dst))
-	if ops := e.Diff(srcM, dstM); len(ops) != 1 || ops[0].kind != opUpdate {
+	if ops, _ := e.Diff(srcM, dstM); len(ops) != 1 || ops[0].kind != opUpdate {
 		t.Errorf("untrimmed rows must yield one update, got %+v", ops)
 	}
 	// case folding
 	e = newTestEngine(t, normalize.Options{TrimTrailing: true, FoldCase: true}, true, keyedCols(false))
 	srcM, _ = e.buffer(e.srcRow, e.srcKey, nextOf([][]any{{int64(1), "Abc", int64(10)}}))
 	dstM, _ = e.buffer(e.dstRow, e.dstKey, nextOf([][]any{{int64(1), "abc", int64(10)}}))
-	if ops := e.Diff(srcM, dstM); len(ops) != 0 {
+	if ops, _ := e.Diff(srcM, dstM); len(ops) != 0 {
 		t.Errorf("folded-case rows must compare equal, got %d ops", len(ops))
 	}
 }
@@ -133,7 +155,7 @@ func TestDiffNonUniqueReplace(t *testing.T) {
 	}
 	srcM, _ := e.buffer(e.srcRow, e.srcKey, nextOf(src))
 	dstM, _ := e.buffer(e.dstRow, e.dstKey, nextOf(dst))
-	ops := e.Diff(srcM, dstM)
+	ops, _ := e.Diff(srcM, dstM)
 	if ins, upd, del := Counts([][]op{ops}); ins != 3 || upd != 0 || del != 2 {
 		t.Fatalf("counts = %d/%d/%d, want 3/0/2 (group replace)", ins, upd, del)
 	}
@@ -164,7 +186,7 @@ func TestDiffNULLKeyComponent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ops := e.Diff(srcM, dstM)
+	ops, _ := e.Diff(srcM, dstM)
 	if len(ops) != 1 || ops[0].kind != opUpdate {
 		t.Fatalf("want one update for the NULL-key row, got %+v", ops)
 	}
@@ -206,7 +228,10 @@ func TestDiffUniqueValueSwap(t *testing.T) {
 	}
 	srcM, _ := e.buffer(e.srcRow, e.srcKey, nextOf(src))
 	dstM, _ := e.buffer(e.dstRow, e.dstKey, nextOf(dst))
-	ops := e.Diff(srcM, dstM)
+	ops, rewrite := e.Diff(srcM, dstM)
+	if !rewrite {
+		t.Error("a 2-row swap must report the destructive row rewrite (P0-2)")
+	}
 	if ins, upd, del := Counts([][]op{ops}); ins != 2 || upd != 0 || del != 2 {
 		t.Fatalf("swap must be delete+insert per row: ins/upd/del = %d/%d/%d, want 2/0/2", ins, upd, del)
 	}
@@ -247,7 +272,10 @@ func TestDiffUniqueOneWayMoveStaysUpdate(t *testing.T) {
 	}
 	srcM, _ := e.buffer(e.srcRow, e.srcKey, nextOf(src))
 	dstM, _ := e.buffer(e.dstRow, e.dstKey, nextOf(dst))
-	ops := e.Diff(srcM, dstM)
+	ops, rewrite := e.Diff(srcM, dstM)
+	if rewrite {
+		t.Error("a collision-free move must keep plain updates (no destructive rewrite)")
+	}
 	if ins, upd, del := Counts([][]op{ops}); ins != 0 || upd != 2 || del != 0 {
 		t.Fatalf("no collision: keep two plain updates, got ins/upd/del = %d/%d/%d", ins, upd, del)
 	}
@@ -271,7 +299,10 @@ func TestDiffUniqueHolderRewrite(t *testing.T) {
 	}
 	srcM, _ := e.buffer(e.srcRow, e.srcKey, nextOf(src))
 	dstM, _ := e.buffer(e.dstRow, e.dstKey, nextOf(dst))
-	ops := e.Diff(srcM, dstM)
+	ops, rewrite := e.Diff(srcM, dstM)
+	if !rewrite {
+		t.Error("a holder conflict must report the destructive row rewrite (P0-2)")
+	}
 	var rewrites, dels, ins int
 	for _, o := range ops {
 		switch o.kind {
@@ -311,7 +342,10 @@ func TestDiffThreeCycleSwap(t *testing.T) {
 	}
 	srcM, _ := e.buffer(e.srcRow, e.srcKey, nextOf(src))
 	dstM, _ := e.buffer(e.dstRow, e.dstKey, nextOf(dst))
-	ops := e.Diff(srcM, dstM)
+	ops, rewrite := e.Diff(srcM, dstM)
+	if !rewrite {
+		t.Error("a 3-cycle must report the destructive row rewrite (P0-2)")
+	}
 	if ins, upd, del := Counts([][]op{ops}); ins != 3 || upd != 0 || del != 3 {
 		t.Fatalf("3-cycle must be 3 deletes + 3 inserts, got ins/upd/del = %d/%d/%d", ins, upd, del)
 	}
@@ -322,12 +356,13 @@ func TestDiffThreeCycleSwap(t *testing.T) {
 // column, whose values can collide across groups.
 func newTestEngineKeyed(t *testing.T, unique bool, cols []conn.Column, uniqueCols map[string]bool, keyName string) *Engine {
 	t.Helper()
+	u := srcUniq(cols, uniqueCols)
 	return NewEngine(
 		normalize.NewNormalizer(cols, normalize.DefaultOptions()),
 		normalize.NewNormalizer(cols, normalize.DefaultOptions()),
 		normalize.NewNormalizer(colsFor(cols, keyName), normalize.DefaultOptions()),
 		normalize.NewNormalizer(colsFor(cols, keyName), normalize.DefaultOptions()),
-		unique, colsFor(cols, keyName), cols, cols, uniqueCols)
+		unique, colsFor(cols, keyName), cols, cols, u, u)
 }
 
 // TestDiffUniqueNonPKKeyPKCollision is the e2e t_swap regression: PK id +
@@ -349,7 +384,10 @@ func TestDiffUniqueNonPKKeyPKCollision(t *testing.T) {
 	}
 	srcM, _ := e.buffer(e.srcRow, e.srcKey, nextOf(src))
 	dstM, _ := e.buffer(e.dstRow, e.dstKey, nextOf(dst))
-	ops := e.Diff(srcM, dstM)
+	ops, rewrite := e.Diff(srcM, dstM)
+	if !rewrite {
+		t.Error("a PK collision must report the destructive row rewrite (P0-2)")
+	}
 	if ins, upd, del := Counts([][]op{ops}); ins != 1 || upd != 0 || del != 1 {
 		t.Fatalf("want 1 insert + 1 delete, got ins/upd/del = %d/%d/%d: %+v", ins, upd, del, ops)
 	}
@@ -366,5 +404,465 @@ func TestDiffUniqueNonPKKeyPKCollision(t *testing.T) {
 	}
 	if lastDel >= firstIns {
 		t.Errorf("the delete of the PK-holding row must precede the insert: %+v", ops)
+	}
+}
+
+// compositeCols is the P1-5 test shape: id (PK) plus two columns that a
+// composite UNIQUE(a,b) covers.
+func compositeCols(t *testing.T) []conn.Column {
+	t.Helper()
+	return []conn.Column{
+		{Name: "id", Family: conn.FamINT, RawType: "int"},
+		{Name: "a", Family: conn.FamSTR, RawType: "varchar(10)"},
+		{Name: "b", Family: conn.FamSTR, RawType: "varchar(10)"},
+	}
+}
+
+func newTestEngineWithConstraints(t testing.TB, cols, dstCols []conn.Column, uniq []conn.UniqueConstraint) *Engine {
+	t.Helper()
+	return NewEngine(
+		normalize.NewNormalizer(cols, normalize.DefaultOptions()),
+		normalize.NewNormalizer(dstCols, normalize.DefaultOptions()),
+		normalize.NewNormalizer(colsFor(cols, "id"), normalize.DefaultOptions()),
+		normalize.NewNormalizer(colsFor(dstCols, "id"), normalize.DefaultOptions()),
+		true, colsFor(cols, "id"), cols, dstCols, uniq, uniq)
+}
+
+// TestDiffCompositeUniqueNoFalseConflict is the P1-5 regression: a
+// composite UNIQUE(a,b) must NOT make a or b individually unique — a
+// value of a that repeats across rows (with a different b) is not a
+// conflict, so the chunk keeps its plain UPDATEs (no destructive
+// rewrite).
+func TestDiffCompositeUniqueNoFalseConflict(t *testing.T) {
+	cols := compositeCols(t)
+	e := newTestEngineWithConstraints(t, cols, cols, []conn.UniqueConstraint{
+		{Name: "uk_ab", Cols: []string{"a", "b"}},
+	})
+	src := [][]any{
+		{int64(1), "x", "p"},
+		{int64(2), "x", "q"},
+	}
+	dst := [][]any{
+		{int64(1), "x", "z"},
+		{int64(2), "x", "q"},
+	}
+	srcM, _ := e.buffer(e.srcRow, e.srcKey, nextOf(src))
+	dstM, _ := e.buffer(e.dstRow, e.dstKey, nextOf(dst))
+	ops, rewrite := e.Diff(srcM, dstM)
+	if rewrite {
+		t.Fatalf("a repeated composite MEMBER is not a conflict: no rewrite expected: %+v", ops)
+	}
+	if len(ops) != 1 || ops[0].kind != opUpdate {
+		t.Fatalf("want one plain update, got %+v", ops)
+	}
+}
+
+// TestDiffCompositeTrueSwap: the whole TUPLE swaps between two rows —
+// that IS a conflict for UNIQUE(a,b), and the chunk is a destructive
+// rewrite (P0-2: reported, refused without --allow-row-rewrite).
+func TestDiffCompositeTrueSwap(t *testing.T) {
+	cols := compositeCols(t)
+	e := newTestEngineWithConstraints(t, cols, cols, []conn.UniqueConstraint{
+		{Name: "uk_ab", Cols: []string{"a", "b"}},
+	})
+	src := [][]any{
+		{int64(1), "a", "b"},
+		{int64(2), "b", "a"},
+	}
+	dst := [][]any{
+		{int64(1), "b", "a"},
+		{int64(2), "a", "b"},
+	}
+	srcM, _ := e.buffer(e.srcRow, e.srcKey, nextOf(src))
+	dstM, _ := e.buffer(e.dstRow, e.dstKey, nextOf(dst))
+	ops, rewrite := e.Diff(srcM, dstM)
+	if !rewrite {
+		t.Fatalf("a true tuple swap must be a destructive rewrite: %+v", ops)
+	}
+}
+
+// TestDiffTwoUniqueNoCrossCollision is the P1-5 regression: two
+// separate constraints (UNIQUE(email) + UNIQUE(phone)) must not
+// cross-collide — an email value equal to another row's phone value is
+// fine, the chunk stays on plain updates.
+func TestDiffTwoUniqueNoCrossCollision(t *testing.T) {
+	cols := []conn.Column{
+		{Name: "id", Family: conn.FamINT, RawType: "int"},
+		{Name: "email", Family: conn.FamSTR, RawType: "varchar(64)"},
+		{Name: "phone", Family: conn.FamSTR, RawType: "varchar(32)"},
+	}
+	e := newTestEngineWithConstraints(t, cols, cols, []conn.UniqueConstraint{
+		{Name: "uk_email", Cols: []string{"email"}},
+		{Name: "uk_phone", Cols: []string{"phone"}},
+	})
+	src := [][]any{
+		{int64(1), "x@e", "911"},
+		{int64(2), "911", "x@e"}, // email "911" == row 1's phone: different constraint
+	}
+	dst := [][]any{
+		{int64(1), "p@e", "111"},
+		{int64(2), "q@e", "222"},
+	}
+	srcM, _ := e.buffer(e.srcRow, e.srcKey, nextOf(src))
+	dstM, _ := e.buffer(e.dstRow, e.dstKey, nextOf(dst))
+	ops, rewrite := e.Diff(srcM, dstM)
+	if rewrite {
+		t.Fatalf("different constraints must not cross-collide: %+v", ops)
+	}
+	if len(ops) != 2 {
+		t.Fatalf("want two plain updates, got %+v", ops)
+	}
+}
+
+// TestDiffNullableUniqueNULLNoFalseConflict: a NULL in a unique column
+// occupies no slot (MySQL allows repeated NULLs): two rows moving to
+// NULL, past a no-op holder, are not a conflict.
+func TestDiffNullableUniqueNULLNoFalseConflict(t *testing.T) {
+	cols := []conn.Column{
+		{Name: "id", Family: conn.FamINT, RawType: "int"},
+		{Name: "u", Family: conn.FamSTR, RawType: "varchar(10)", Nullable: true},
+	}
+	e := newTestEngineWithConstraints(t, cols, cols, []conn.UniqueConstraint{
+		{Name: "uk_u", Cols: []string{"u"}},
+	})
+	src := [][]any{
+		{int64(1), nil},
+		{int64(2), nil},
+		{int64(3), "z"},
+	}
+	dst := [][]any{
+		{int64(1), "a"},
+		{int64(2), "b"},
+		{int64(3), "z"},
+	}
+	srcM, _ := e.buffer(e.srcRow, e.srcKey, nextOf(src))
+	dstM, _ := e.buffer(e.dstRow, e.dstKey, nextOf(dst))
+	ops, rewrite := e.Diff(srcM, dstM)
+	if rewrite {
+		t.Fatalf("NULL tuples occupy no unique slot: no rewrite expected: %+v", ops)
+	}
+	if len(ops) != 2 {
+		t.Fatalf("want two plain updates, got %+v", ops)
+	}
+}
+
+// TestValueCmp pins the cross-chunk ordering primitive: MySQL key order
+// (NULLs first), the numeric pairs, character/binary bytes, and the
+// conservative "incomparable" answer (mixed or unknown types must never
+// be reported as ordered).
+func TestValueCmp(t *testing.T) {
+	cases := []struct {
+		a, b any
+		cmp  int
+		ok   bool
+	}{
+		{nil, nil, 0, true},
+		{nil, int64(1), -1, true},
+		{int64(1), nil, 1, true},
+		{int64(1), int64(2), -1, true},
+		{int64(2), int64(2), 0, true},
+		{uint64(1), uint64(2), -1, true},
+		{int64(-1), uint64(1), -1, true}, // negatives sort first
+		{int64(1), uint64(1), 0, true},
+		{"a", "b", -1, true},
+		{[]byte("a"), "a", 0, true},
+		{[]byte("a\x01"), []byte("a\x02"), -1, true},
+		{float64(1), float64(2), 0, false}, // incomparable, not ordered
+		{int64(1), "1", 0, false},          // mixed: not ordered
+	}
+	for i, c := range cases {
+		if got, ok := valueCmp(c.a, c.b); ok != c.ok || (ok && got != c.cmp) {
+			t.Errorf("case %d (%v, %v) = (%d, %v), want (%d, %v)", i, c.a, c.b, got, ok, c.cmp, c.ok)
+		}
+	}
+}
+
+// TestHolderPosition pins the chunk-boundary classification, including
+// the lead-prefix case (the bound pins only the lead columns: equality
+// on the lead with an unbounded suffix is "unknown", never "inside").
+func TestHolderPosition(t *testing.T) {
+	e := &Engine{}
+	base := chunk.Chunk{Lo: []driver.Value{int64(1)}, LoIncl: true, Hi: []driver.Value{int64(10)}}
+	if p := e.holderPosition([]any{int64(0)}, base); p != holderBefore {
+		t.Errorf("below: got %v", p)
+	}
+	if p := e.holderPosition([]any{int64(11)}, base); p != holderAfter {
+		t.Errorf("above: got %v", p)
+	}
+	if p := e.holderPosition([]any{int64(5)}, base); p != holderInside {
+		t.Errorf("inside: got %v", p)
+	}
+	// exclusive lower bound: the bound row itself belongs to the
+	// previous chunk, so it sorts BEFORE this one
+	excl := chunk.Chunk{Lo: []driver.Value{int64(1)}, LoIncl: false, Hi: []driver.Value{int64(10)}}
+	if p := e.holderPosition([]any{int64(1)}, excl); p != holderBefore {
+		t.Errorf("exclusive bound row: got %v", p)
+	}
+	// lead-prefix EXCLUSIVE bound (int-keyed chunk i>0: Lo = prevHi-1,
+	// the bound lead belongs to the previous chunk): equal lead is
+	// strictly before, never unknown
+	pref := chunk.Chunk{
+		Lo: []driver.Value{int64(7501)}, LoIncl: false, LoPrefix: 1,
+		Hi: []driver.Value{int64(15002)}, HiPrefix: 1,
+	}
+	if p := e.holderPosition([]any{int64(7501), "x"}, pref); p != holderBefore {
+		t.Errorf("exclusive lead bound, equal lead: got %v", p)
+	}
+	if p := e.holderPosition([]any{int64(7500), "x"}, pref); p != holderBefore {
+		t.Errorf("below lead: got %v", p)
+	}
+	if p := e.holderPosition([]any{int64(15003), "x"}, pref); p != holderAfter {
+		t.Errorf("above lead: got %v", p)
+	}
+	// lead-prefix INCLUSIVE bound (the first int-keyed chunk: Lo = min,
+	// equal lead may be inside or below — the suffix is unbounded):
+	// unknown, the caller must not assume either side
+	prefIncl := chunk.Chunk{
+		Lo: []driver.Value{int64(7501)}, LoIncl: true, LoPrefix: 1,
+		Hi: []driver.Value{int64(15002)}, HiPrefix: 1,
+	}
+	if p := e.holderPosition([]any{int64(7501), "x"}, prefIncl); p != holderUnknown {
+		t.Errorf("inclusive lead bound, equal lead: got %v", p)
+	}
+	if p := e.holderPosition([]any{int64(7502), "x"}, prefIncl); p != holderInside {
+		t.Errorf("inside inclusive lead range: got %v", p)
+	}
+	// unbounded first chunk: nothing is "before"
+	first := chunk.Chunk{Hi: []driver.Value{int64(10)}}
+	if p := e.holderPosition([]any{int64(1)}, first); p != holderInside {
+		t.Errorf("first chunk inside: got %v", p)
+	}
+}
+
+// TestKeyCmpIncomparable: a component pair the comparison cannot order
+// (e.g. a float, which key columns do not yield but a custom backend
+// might) must come back ok=false — the caller treats that as "position
+// unknown", never as "equal" or "ordered".
+func TestKeyCmpIncomparable(t *testing.T) {
+	if _, ok := keyCmp([]any{float64(1)}, []any{float64(2)}, -1); ok {
+		t.Error("floats must be incomparable")
+	}
+	if c, ok := keyCmp([]any{int64(1), "a"}, []any{int64(2), "b"}, -1); !ok || c != -1 {
+		t.Errorf("ordered prefix must decide: got (%d, %v)", c, ok)
+	}
+}
+
+// TestKeyOrderKnown pins the whitelist: only key types the driver yields
+// in a form whose client order equals the server's key order are
+// order-known. Decimal/float keys arrive as digit strings ("9" bytes
+// before "10", numerically reversed), TIME as variable-width text,
+// ENUM/SET by label though the server orders by index — all must be
+// UNKNOWN (the cross-chunk holder check escalates instead of guessing).
+func TestKeyOrderKnown(t *testing.T) {
+	col := func(fam, raw, coll string) conn.Column {
+		return conn.Column{Name: "k", Family: fam, RawType: raw, Collation: coll}
+	}
+	sch := func(c conn.Column) *conn.Schema {
+		return &conn.Schema{Table: "t", Cols: []conn.Column{c}, Key: []string{"k"}}
+	}
+	cases := []struct {
+		name string
+		s    *conn.Schema
+		want bool
+	}{
+		{"nil schema", nil, false},
+		{"no key", &conn.Schema{Table: "t", Cols: []conn.Column{col(conn.FamINT, "int", "")}}, false},
+		{"int pk", sch(col(conn.FamINT, "int", "")), true},
+		{"uint pk", sch(col(conn.FamUINT, "bigint unsigned", "")), true},
+		{"year pk", sch(col(conn.FamYEAR, "year", "")), true},
+		{"datetime pk", sch(col(conn.FamDATETIME, "datetime(3)", "")), true},
+		{"date pk", sch(col(conn.FamDATE, "date", "")), true},
+		{"binary pk", sch(col(conn.FamBYTES, "varbinary(16)", "")), true},
+		{"bit pk", sch(col(conn.FamBIT, "bit(8)", "")), true},
+		{"varchar binary collation", sch(col(conn.FamSTR, "varchar(16)", "utf8mb4_bin")), true},
+		{"varchar ci collation", sch(col(conn.FamSTR, "varchar(16)", "utf8mb4_0900_ai_ci")), false},
+		{"decimal pk", sch(col(conn.FamDECIMAL, "decimal(10,2)", "")), false},
+		{"float pk", sch(col(conn.FamFLOAT, "float", "")), false},
+		{"double pk", sch(col(conn.FamDOUBLE, "double", "")), false},
+		{"time pk", sch(col(conn.FamTIME, "time", "")), false},
+		{"enum pk", sch(col(conn.FamENUM, "enum('a','b')", "")), false},
+		{"set pk", sch(col(conn.FamSET, "set('a','b')", "")), false},
+		{"json pk", sch(col(conn.FamJSON, "json", "")), false},
+		{"key column missing from cols", &conn.Schema{
+			Table: "t", Cols: []conn.Column{col(conn.FamINT, "int", "")}, Key: []string{"other"},
+		}, false},
+	}
+	// a composite key where only one member is order-unknown must be unknown
+	composite := &conn.Schema{
+		Table: "t",
+		Cols: []conn.Column{
+			{Name: "a", Family: conn.FamINT, RawType: "int"},
+			{Name: "d", Family: conn.FamDECIMAL, RawType: "decimal(10,2)"},
+		},
+		Key: []string{"a", "d"},
+	}
+	cases = append(cases, struct {
+		name string
+		s    *conn.Schema
+		want bool
+	}{"composite with a decimal member", composite, false})
+	for _, c := range cases {
+		if got := keyOrderKnown(c.s); got != c.want {
+			t.Errorf("%s: keyOrderKnown = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// TestClassifyHolderOorSet is the regression for the t_swap e2e
+// (sync key v, PK id, an out-of-range row holding the PK value an
+// in-range insert needs): the out-of-range pass's OWN server-side scan
+// (oorSet) is the safety proof, not a client-side key comparison. A
+// case-insensitive key must still clear an out-of-range holder (it is in
+// the set) yet refuse an in-range one (its chunk position is not
+// provable client-side); an order-known key turns an out-of-range holder
+// MISSING from the set into a conflict (a --where residual or a data
+// race), never a false safe. All cases resolve before any database
+// access (nil Sides).
+func TestClassifyHolderOorSet(t *testing.T) {
+	cols := []conn.Column{
+		{Name: "id", Family: conn.FamINT, RawType: "int"},
+		{Name: "u", Family: conn.FamSTR, RawType: "varchar(10)", Nullable: true},
+	}
+	e := newTestEngineWithConstraints(t, cols, cols, []conn.UniqueConstraint{
+		{Name: "uk_u", Cols: []string{"u"}},
+	})
+	h := []any{int64(99)}
+	buf := make([]byte, 0, 16)
+	id, err := e.dstKey.Normalize(h, buf)
+	if err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	idS := string(id)
+	ciS := &conn.Schema{ // a case-insensitive character key: not order-known
+		Table: "t",
+		Cols:  []conn.Column{{Name: "id", Family: conn.FamSTR, RawType: "varchar(10)", Collation: "utf8mb4_0900_ai_ci"}},
+		Key:   []string{"id"},
+	}
+	intS := &conn.Schema{
+		Table: "t",
+		Cols:  []conn.Column{{Name: "id", Family: conn.FamINT, RawType: "int"}},
+		Key:   []string{"id"},
+	}
+	c := e.uc[0]
+	run := func(srcS *conn.Schema, targeted, oorSet map[string]bool, lo, hi []driver.Value, inChunk bool, oorActive bool) (crossChunkVerdict, error) {
+		dstM := map[string][]*srow{}
+		if inChunk {
+			dstM[idS] = []*srow{{vals: h}}
+		}
+		return e.classifyHolder(context.Background(), nil, srcS, chunk.Chunk{}, dstM, 0, c, h, map[string][]any{}, lo, hi, targeted, oorSet, oorActive, keyOrderKnown(srcS))
+	}
+	cases := []struct {
+		name      string
+		srcS      *conn.Schema
+		targeted  map[string]bool
+		oorSet    map[string]bool
+		lo, hi    []driver.Value
+		inChunk   bool
+		oorActive bool
+		want      crossChunkVerdict
+	}{
+		{"targeted holder is safe (ci key)", ciS, map[string]bool{idS: true}, nil, nil, nil, false, true, crossSafe},
+		{"unaddressed in-chunk holder conflicts", intS, nil, nil, nil, nil, true, true, crossConflict},
+		{"no out-of-range pass: foreign holder conflicts", intS, nil, nil, nil, nil, false, false, crossConflict},
+		{"out-of-range set member is safe (ci key, no client order needed)", ciS, nil, map[string]bool{idS: true}, nil, nil, false, true, crossSafe},
+		{"in-range holder on a ci key is not provable", ciS, nil, nil, nil, nil, false, true, crossConflict},
+		{"out-of-range holder missing from the set conflicts (int key)", intS, nil, nil, []driver.Value{int64(1)}, []driver.Value{int64(50)}, false, true, crossConflict},
+	}
+	for _, cse := range cases {
+		v, err := run(cse.srcS, cse.targeted, cse.oorSet, cse.lo, cse.hi, cse.inChunk, cse.oorActive)
+		if err != nil {
+			t.Errorf("%s: unexpected DB access or error: %v", cse.name, err)
+			continue
+		}
+		if v != cse.want {
+			t.Errorf("%s: got %v, want %v", cse.name, v, cse.want)
+		}
+	}
+}
+
+// TestWrittenTuplesNullAndDedup pins the O(delta) tracking: NULL tuples
+// are not tracked, and identical tuples are deduplicated.
+func TestWrittenTuplesNullAndDedup(t *testing.T) {
+	cols := []conn.Column{
+		{Name: "id", Family: conn.FamINT, RawType: "int"},
+		{Name: "u", Family: conn.FamSTR, RawType: "varchar(10)", Nullable: true},
+	}
+	e := newTestEngineWithConstraints(t, cols, cols, []conn.UniqueConstraint{
+		{Name: "uk_u", Cols: []string{"u"}},
+	})
+	ops := []op{
+		{kind: opInsert, key: []any{int64(1)}, rows: [][]any{{int64(1), "x"}}},
+		{kind: opInsert, key: []any{int64(2)}, rows: [][]any{{int64(2), "x"}}}, // dedup
+		{kind: opInsert, key: []any{int64(3)}, rows: [][]any{{int64(3), nil}}}, // NULL: untracked
+		{kind: opDelete, key: []any{int64(9)}},
+	}
+	w, _ := e.writtenTuples(ops)
+	if len(w) != 1 {
+		t.Fatalf("one constraint: %d", len(w))
+	}
+	if len(w[0]) != 1 {
+		t.Fatalf("one deduplicated non-NULL tuple: %d (%v)", len(w[0]), w[0])
+	}
+}
+
+// TestCrossChunkTrackingScalesWithDelta is the P1-6 memory-bound proof:
+// the tracking structure holds only the tuples the ops actually write
+// (O(delta)), never a table-wide owner map. A 10M-row table whose only
+// diff is one row yields ONE tracked entry; a delta past the tracking
+// cap escalates (the guard returns before any query — the nil Sides
+// below prove no database access is attempted on that path).
+func TestCrossChunkTrackingScalesWithDelta(t *testing.T) {
+	cols := []conn.Column{
+		{Name: "id", Family: conn.FamINT, RawType: "int"},
+		{Name: "u", Family: conn.FamSTR, RawType: "varchar(10)"},
+	}
+	e := newTestEngineWithConstraints(t, cols, cols, []conn.UniqueConstraint{
+		{Name: "uk_u", Cols: []string{"u"}},
+	})
+	// 10M-row table, one row differs: Diff emits a single op.
+	ops := []op{{kind: opUpdate, key: []any{int64(1)}, rows: [][]any{{int64(1), "x"}}}}
+	w, overflow := e.writtenTuples(ops)
+	if overflow {
+		t.Fatal("one tuple must not overflow the cap")
+	}
+	if len(w[0]) != 1 {
+		t.Fatalf("one differing row must track exactly one tuple, tracked %d", len(w[0]))
+	}
+	// A delta past the cap: the guard must escalate WITHOUT touching the
+	// database (nil Sides would panic on any query).
+	big := make([]op, maxTrackedTuples+1)
+	for i := range big {
+		big[i] = op{kind: opUpdate, key: []any{int64(i)}, rows: [][]any{{int64(i), fmt.Sprint(i)}}}
+	}
+	v, err := e.crossChunkCheck(context.Background(), nil, nil, nil, nil, chunk.Chunk{}, nil, big, nil, nil, nil, true)
+	if err != nil {
+		t.Fatalf("cap guard must not error without a database: %v", err)
+	}
+	if v != crossConflict {
+		t.Fatalf("a delta past the tracking cap must escalate, got %v", v)
+	}
+}
+
+// BenchmarkCrossChunkEscalateLargeDelta measures the 1M-row-scale
+// escalation path (1M distinct written tuples): the check must stay in
+// milliseconds — it is a cap test on the delta, not a table scan.
+func BenchmarkCrossChunkEscalateLargeDelta(b *testing.B) {
+	cols := []conn.Column{
+		{Name: "id", Family: conn.FamINT, RawType: "int"},
+		{Name: "u", Family: conn.FamSTR, RawType: "varchar(10)"},
+	}
+	e := newTestEngineWithConstraints(b, cols, cols, []conn.UniqueConstraint{
+		{Name: "uk_u", Cols: []string{"u"}},
+	})
+	ops := make([]op, 1_000_000)
+	for i := range ops {
+		ops[i] = op{kind: opUpdate, key: []any{int64(i)}, rows: [][]any{{int64(i), fmt.Sprint(i)}}}
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if v, _ := e.crossChunkCheck(context.Background(), nil, nil, nil, nil, chunk.Chunk{}, nil, ops, nil, nil, nil, true); v != crossConflict {
+			b.Fatal("expected escalation")
+		}
 	}
 }

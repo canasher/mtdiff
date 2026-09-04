@@ -35,6 +35,16 @@ type Options struct {
 	// and re-apply the DDL on the empty table. Off by default: the
 	// in-place failure then stops the table with its data preserved.
 	AllowStructureTruncate bool
+	// AllowRowRewrite permits the destructive row rewrite (P0-2): when a
+	// unique-value swap, cycle, or holder conflict is detected, the
+	// affected rows are DELETEd and INSERTed again (a no-op holder is
+	// rewritten in place) so the unique slots can be freed. Off by
+	// default: such a rewrite fires FK ON DELETE CASCADE, triggers and
+	// audit logs for rows the user never asked to change, so the table
+	// is REFUSED instead (with a cross-chunk swap the refusal is the
+	// only option — the order-independent FULL resync is a destructive
+	// operation of the same kind and is likewise gated on this flag).
+	AllowRowRewrite bool
 	// Progress receives long-running phase updates (pre-pass scans, apply
 	// chunks, verification scans), forwarded to the comparer when the
 	// caller left Cmp.Progress unset. nil = no progress output.
@@ -95,6 +105,13 @@ var errEscalateFull = errors.New("data moved between the pre-pass and the row pl
 // (a misconfiguration, not a runtime failure). The CLI maps it to an
 // argument error (exit 3).
 var ErrMisconfigured = errors.New("sync misconfiguration")
+
+// errUniqueRewriteRefused marks a table whose unique-value conflict
+// (swap / cycle / holder) needs the destructive row rewrite the operator
+// did not permit (P0-2): it is a refusal, not a failure of the
+// destination — the CLI reports it and exits non-zero, but the message
+// tells the operator exactly which flag lifts it.
+var errUniqueRewriteRefused = errors.New("unique-value conflict requires the destructive row rewrite, which is not permitted")
 
 // Runner drives a sync run between two open sides.
 type Runner struct {
@@ -505,14 +522,18 @@ func (r *Runner) prepare(ctx context.Context, res compare.TableResult) (*prep, e
 	// updating single rows). DecidePlan gets the per-side facts so it can
 	// also reject the unsafe --where combinations.
 	engineUnique := srcS.KeyIsUnique && dstS.KeyIsUnique
-	// A column unique on EITHER side gets the swap protection: an insert
-	// must not collide with the destination's index, and a source
-	// duplicate against a destination-only index must fail loudly.
-	uniqueCols := make(map[string]bool, len(srcS.UniqueCols)+len(dstS.UniqueCols))
-	for _, s := range []*conn.Schema{srcS, dstS} {
-		for _, c := range s.Cols {
-			if s.UniqueCols[c.Name] {
-				uniqueCols[c.Name] = true
+	// Ignoring a unique-constraint column is rejected like ignoring a
+	// key column: the swap protection cannot watch a column the
+	// comparison drops, and a unique value would move unseen (P1-5).
+	if r.o.Cmp.Normalize.IgnoreCols != nil {
+		for _, s := range []*conn.Schema{srcS, dstS} {
+			for _, u := range s.UniqueConstraints {
+				for _, n := range u.Cols {
+					if r.o.Cmp.Normalize.IgnoreCols[n] {
+						return nil, fmt.Errorf("%w: table %s: --ignore-columns names unique column %q (constraint %s): the unique-swap protection needs it, so the sync cannot be proven safe",
+							ErrMisconfigured, res.Name, n, u.Name)
+					}
+				}
 			}
 		}
 	}
@@ -528,7 +549,7 @@ func (r *Runner) prepare(ctx context.Context, res compare.TableResult) (*prep, e
 		normalize.NewNormalizer(dstS.Cols, r.o.Cmp.Normalize),
 		normalize.NewNormalizer(keyColsOf(srcS), r.o.Cmp.Normalize),
 		normalize.NewNormalizer(keyColsOf(dstS), r.o.Cmp.Normalize),
-		engineUnique, keyColsOf(srcS), srcS.Cols, dstS.Cols, uniqueCols)
+		engineUnique, keyColsOf(srcS), srcS.Cols, dstS.Cols, srcS.UniqueConstraints, dstS.UniqueConstraints)
 	return p, nil
 }
 
@@ -593,47 +614,110 @@ func (r *Runner) RowOps(ctx context.Context, p *prep, res compare.TableResult, f
 		targets = chunks
 	}
 	out := make([][]op, 0, len(targets))
-	// Cross-chunk unique-value-swap detection (P1-4): a value whose source
-	// owner is in one chunk while its current destination holder sits in
-	// another cannot be converged by per-chunk writes in any commit order
-	// (each chunk is its own transaction), so the table escalates to the
-	// FULL resync. Only tables with unique non-key columns can have one;
-	// the intra-chunk case is resolved by the engine itself.
-	var owner map[string]int
-	if len(p.e.uniqueCols) > 0 {
-		owner = make(map[string]int)
-	}
-	for _, ch := range targets {
-		srcM, err := p.e.scanSide(ctx, r.Src, p.srcS, p.e.srcRow, p.e.srcKey, ch, r.o.Cmp.Where)
+	// Unique-constraint verification (P0-2 / P1-5 / P1-6). In-chunk: a
+	// swap, cycle or holder conflict needs the destructive row rewrite
+	// (DELETE+INSERT), refused unless --allow-row-rewrite is set.
+	// Cross-chunk: a unique value whose current holder sits in another
+	// chunk cannot be ordered across the per-chunk commits; the check
+	// resolves each foreign holder with targeted point queries (O(delta),
+	// never O(table)) and, when it cannot prove the slot is freed,
+	// refuses (without the flag) or escalates to the FULL resync (with
+	// it — a filtered table can never be fully resynced, so there it
+	// always refuses).
+	filtered := r.o.Cmp.Where != ""
+	oorActive := !filtered && len(p.srcS.Key) > 0 && len(p.dstS.Key) > 0 && keyAgree(p.srcS, p.dstS)
+	var loV, hiV []driver.Value
+	if len(p.e.uc) > 0 {
+		minV, maxV, err := planner.Extremes(ctx, r.Src.Ctl())
 		if err != nil {
-			return nil, fmt.Errorf("src chunk %d: %w", ch.ID, err)
+			return nil, fmt.Errorf("key extremes: %w", err)
 		}
-		dstM, err := p.e.scanSide(ctx, r.Dst, p.dstS, p.e.dstRow, p.e.dstKey, ch, r.o.Cmp.Where)
-		if err != nil {
-			return nil, fmt.Errorf("dst chunk %d: %w", ch.ID, err)
-		}
-		if owner != nil {
-			p.e.srcWriteOwner(srcM, ch.ID, owner)
-		}
-		out = append(out, p.e.Diff(srcM, dstM))
+		loV, hiV = minV, maxV
 	}
-	if owner != nil {
-		// a second destination pass: every value this chunk still holds
-		// must be owned (in the source) by this same chunk
-		for _, ch := range targets {
-			dstM, err := p.e.scanSide(ctx, r.Dst, p.dstS, p.e.dstRow, p.e.dstKey, ch, r.o.Cmp.Where)
-			if err != nil {
-				return nil, fmt.Errorf("dst re-scan chunk %d: %w", ch.ID, err)
-			}
-			if p.e.crossChunkHeld(dstM, ch.ID, owner) {
-				return nil, fmt.Errorf("a unique value swaps between rows of different chunks (chunk %d): row-level writes cannot order this safely, escalating to a full resync: %w",
-					ch.ID, errEscalateFull)
-			}
-		}
-	}
+	// The out-of-range pass is scanned BEFORE the chunk loop: its result
+	// is the authoritative (server-side) answer to "is this foreign
+	// unique holder deleted before any in-range write", and the per-chunk
+	// unique check consults it instead of re-deriving the key order
+	// client-side (a case-insensitive or a decimal key order cannot be
+	// reproduced by the client, but the scan can be trusted either way).
 	oor, err := r.outOfRangeDeletes(ctx, p, freshSrc)
 	if err != nil {
 		return nil, fmt.Errorf("out-of-range scan: %w", err)
+	}
+	oorSet := make(map[string]bool, len(oor))
+	if len(oor) > 0 {
+		buf := make([]byte, 0, 256)
+		for _, grp := range oor {
+			for _, o := range grp {
+				id, err := p.e.dstKey.Normalize(o.key, buf)
+				if err != nil {
+					return nil, fmt.Errorf("out-of-range delete: %w", err)
+				}
+				oorSet[string(id)] = true
+				buf = id[:0]
+			}
+		}
+	}
+	// One scan connection per side for the whole table (P2-1): the
+	// per-chunk scans reuse them instead of churning the pool, and a
+	// connection that dies mid-scan is replaced (the pool re-initializes
+	// it) with the chunk retried once.
+	srcCn, err := r.Src.AcquireScan(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { srcCn.Close() }()
+	dstCn, err := r.Dst.AcquireScan(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { dstCn.Close() }()
+	for _, ch := range targets {
+		srcM, err := p.e.scanSideConn(ctx, srcCn, p.srcS, p.e.srcRow, p.e.srcKey, ch, r.o.Cmp.Where)
+		if err != nil && conn.DeadConn(err) {
+			srcCn.Close()
+			if srcCn, err = r.Src.AcquireScan(ctx); err != nil {
+				return nil, fmt.Errorf("src chunk %d: re-acquire scan connection: %w", ch.ID, err)
+			}
+			srcM, err = p.e.scanSideConn(ctx, srcCn, p.srcS, p.e.srcRow, p.e.srcKey, ch, r.o.Cmp.Where)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("src chunk %d: %w", ch.ID, err)
+		}
+		dstM, err := p.e.scanSideConn(ctx, dstCn, p.dstS, p.e.dstRow, p.e.dstKey, ch, r.o.Cmp.Where)
+		if err != nil && conn.DeadConn(err) {
+			dstCn.Close()
+			if dstCn, err = r.Dst.AcquireScan(ctx); err != nil {
+				return nil, fmt.Errorf("dst chunk %d: re-acquire scan connection: %w", ch.ID, err)
+			}
+			dstM, err = p.e.scanSideConn(ctx, dstCn, p.dstS, p.e.dstRow, p.e.dstKey, ch, r.o.Cmp.Where)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("dst chunk %d: %w", ch.ID, err)
+		}
+		ops, rewrite := p.e.Diff(srcM, dstM)
+		if rewrite && !r.o.AllowRowRewrite {
+			return nil, fmt.Errorf("%w: table %s has a unique-value conflict (a swap, cycle or holder) that per-row writes cannot order; converging it requires a destructive row rewrite (DELETE+INSERT), which is disabled by default because FK/trigger side effects cannot be proven safe — re-run with --allow-row-rewrite to permit it",
+				errUniqueRewriteRefused, res.Name)
+		}
+		if len(p.e.uc) > 0 {
+			v, err := p.e.crossChunkCheck(ctx, r.Src, r.Dst, p.srcS, p.dstS, ch, dstM, ops, loV, hiV, oorSet, oorActive)
+			if err != nil {
+				return nil, fmt.Errorf("unique holder check, chunk %d: %w", ch.ID, err)
+			}
+			switch v {
+			case crossConflict:
+				if !r.o.AllowRowRewrite {
+					return nil, fmt.Errorf("%w: table %s swaps a unique value between rows of different chunks (chunk %d); no row-level order applies it safely, and the order-independent full resync is a destructive operation — re-run with --allow-row-rewrite to permit it",
+						errUniqueRewriteRefused, res.Name, ch.ID)
+				}
+				return nil, fmt.Errorf("table %s swaps a unique value between rows of different chunks (chunk %d): row-level writes cannot order this safely, escalating to a full resync: %w",
+					res.Name, ch.ID, errEscalateFull)
+			case crossDuplicate:
+				return nil, fmt.Errorf("table %s: the source holds one unique value in two different rows; the destination's unique index cannot hold both — fix the source data before syncing", res.Name)
+			}
+		}
+		out = append(out, ops)
 	}
 	// Order matters: the out-of-range DELETEs go FIRST. The in-range
 	// chunks only cover the source's key span, so an out-of-range
@@ -649,10 +733,25 @@ func (r *Runner) RowOps(ctx context.Context, p *prep, res compare.TableResult, f
 }
 
 // dstDeletes plans the destination side and deletes every row it holds:
-// the fallback for a filtered table whose source match set is empty (the
-// source re-plan yields no chunks, so there is nothing to target deletes
-// from). The destination's key is the same key the comparison used, so
-// every row can be addressed by key.
+// the fallback for a table whose source match set is empty (the source
+// re-plan yields no chunks, so there is nothing to target deletes from —
+// a --where filter that matches nothing on the source, or a source that
+// simply emptied). The destination's key is the same key the comparison
+// used, so every row can be addressed by key.
+//
+// MEMORY NOTE (known residual, O(matched-destination-rows), not O(chunk)):
+// this path materializes one key-only opDelete PER destination row in the
+// match set, all in memory at once. Every OTHER sync path is O(chunk) or
+// O(chunk+delta) — the row-level diff keeps only the differing chunks, the
+// out-of-range pass keeps only the (few) rows outside the source's key
+// span, and the full resync streams in batches. This fallback is the one
+// place the whole (filtered) destination match set is buffered, so an
+// empty-source / match-everything --where over a very large table holds
+// one small op per row in RAM. It is SAFE (key-addressed deletes, no
+// unique interaction) but not memory-bounded the way the rest is; a
+// streaming delete pass (emit each chunk's ops before scanning the next)
+// would close it, but that changes the ops-return contract and is left as
+// a follow-up rather than folded into this safety round.
 func (r *Runner) dstDeletes(ctx context.Context, p *prep, freshDst int64) ([][]op, error) {
 	planner := chunk.Planner{
 		Table:       p.dstS.Table,
@@ -715,18 +814,18 @@ func keyAgree(a, b *conn.Schema) bool {
 
 // oorPredicate renders the "key strictly outside [min, max]" predicate for
 // the destination's key columns, bounded by the source's minimum and
-// maximum key values: RenderLessThan(min) OR RenderGreaterThan(max). The
+// maximum key values: LessThan(min) OR GreaterThan(max), parameterized
+// (P0-1) — the bound values are the SOURCE's raw key values and are bound
+// as data on the server, never rendered into the SQL text. The
 // comparison is strict on purpose — a row equal to a bound is in range and
 // belongs to the chunk diff. A side that renders empty is dropped; when
 // both do (a single-column all-NULL minimum bounds everything below) ok is
-// false. The bounds are rendered with the source key columns' family-aware
-// literals (a character or decimal bound rendered as a hex blob would put
-// rows on the wrong side of the boundary).
-func (r *Runner) oorPredicate(p *prep, minV, maxV []driver.Value) (string, bool) {
-	lits := keyLits(compare.KeyFamilies(p.srcS))
-	// a side joins the two tails with a top-level OR only when the key is
-	// composite; wrap it then (a single term, or a fully parenthesized
-	// group like "(`a` IS NULL OR ...)", is safe to OR as-is)
+// false.
+func (r *Runner) oorPredicate(p *prep, minV, maxV []driver.Value) (chunk.Pred, bool) {
+	// a composite key's strict comparison joins its column terms with a
+	// top-level OR; wrap it when the two tails are ORed together (a single
+	// term, or a fully parenthesized group like "(`a` IS NULL OR ...)",
+	// is safe to OR as-is)
 	wrap := func(s string) string {
 		if strings.Contains(s, " OR ") && !isParenGroup(s) {
 			return "(" + s + ")"
@@ -734,19 +833,24 @@ func (r *Runner) oorPredicate(p *prep, minV, maxV []driver.Value) (string, bool)
 		return s
 	}
 	var sides []string
+	var args []any
 	if !allNil(minV) {
 		// the all-NULL row is the minimum: nothing sits below it
-		if s := chunk.RenderLessThan(p.dstS.Key, minV, lits); s != "1=0" {
-			sides = append(sides, wrap(s))
+		lt := chunk.LessThan(p.dstS.Key, minV)
+		if lt.SQL != "1=0" {
+			sides = append(sides, wrap(lt.SQL))
+			args = append(args, lt.Args...)
 		}
 	}
-	if s := chunk.RenderGreaterThan(p.dstS.Key, maxV, lits); s != "1=0" {
-		sides = append(sides, wrap(s))
+	gt := chunk.GreaterThan(p.dstS.Key, maxV)
+	if gt.SQL != "1=0" {
+		sides = append(sides, wrap(gt.SQL))
+		args = append(args, gt.Args...)
 	}
 	if len(sides) == 0 {
-		return "", false
+		return chunk.Pred{}, false
 	}
-	return strings.Join(sides, " OR "), true
+	return chunk.Pred{SQL: strings.Join(sides, " OR "), Args: args}, true
 }
 
 // isParenGroup reports whether the whole string is one parenthesized group
@@ -872,10 +976,13 @@ const errWhereDrift = "structure drift on a --where-filtered table cannot be syn
 // cannot be reproduced — an expression default). The source structure is
 // returned because a repaired destination will have exactly this shape:
 // the post-repair data strategy (row-level vs full) is decided from it.
-func (r *Runner) SchemaPlanFor(ctx context.Context, table string) (*StructPlan, *conn.Struct, error) {
-	if !r.o.SyncSchema {
-		return nil, nil, nil
-	}
+// structurePlan computes the structure plan for one table from a FRESH
+// introspection of both sides (nil plan when the structures already
+// agree), plus the source structure. It is the re-plan seam (P1-2): a
+// plan is valid only for the schema facts it was computed from — after
+// any DDL failure the old plan is stale and must be recomputed, never
+// replayed.
+func (r *Runner) structurePlan(ctx context.Context, table string) (*StructPlan, *conn.Struct, error) {
 	srcS, err := conn.IntrospectStructure(ctx, r.Src.Ctl(), table)
 	if err != nil {
 		return nil, nil, err
@@ -901,55 +1008,97 @@ func (r *Runner) SchemaPlanFor(ctx context.Context, table string) (*StructPlan, 
 	return &StructPlan{DDL: RenderDDL(table, changes), Reasons: reasons}, srcS, nil
 }
 
-// execDDL runs the structure DDL statements in order, returning the first
-// failure (the caller then decides: stop with the data preserved, or the
-// truncate fallback).
-func execDDL(ctx context.Context, ap *Applier, ddl []string) error {
-	for _, stmt := range ddl {
+// SchemaPlanFor is the read-side (dry-run/verify) structure plan.
+func (r *Runner) SchemaPlanFor(ctx context.Context, table string) (*StructPlan, *conn.Struct, error) {
+	if !r.o.SyncSchema {
+		return nil, nil, nil
+	}
+	return r.structurePlan(ctx, table)
+}
+
+// execDDL runs the structure DDL statements in order, returning the
+// index of the statement that failed (-1 when all succeeded). A
+// MULTI-STATEMENT DDL is NOT atomic: every statement before the failed
+// one may already have been applied (only a single ALTER rolls back as a
+// unit), so the caller must re-plan from a fresh introspection rather
+// than replay the original plan (P1-2).
+func execDDL(ctx context.Context, ap *Applier, ddl []string) (int, error) {
+	for i, stmt := range ddl {
 		if err := ap.execDirect(ctx, stmt); err != nil {
-			return err
+			return i, err
 		}
 	}
-	return nil
+	return -1, nil
 }
 
 // ApplyStructureTable syncs a structure-drifted table (P1-3): apply the
-// DDL IN PLACE on the destination — the data stays put, and an InnoDB
-// ALTER is atomic, so a failed statement leaves the table exactly as it
-// was (not half-migrated, not emptied). The default on failure is to stop
-// the table FAILED with its data preserved; with
-// --allow-structure-truncate the old path is the fallback instead:
-// TRUNCATE, re-apply the DDL on the empty table, full reload. Either way
-// the data is then converged — see convergeAfterDDL for the re-read /
-// re-plan: a key the repair restores (e.g. the primary key) puts the
-// table back on row-level sync, only a still-keyless pair stays on the
-// full load. The table state (AUTO_INCREMENT) is reconciled last; the
-// caller verifies.
+// DDL IN PLACE on the destination — the data stays put. A SINGLE ALTER
+// is atomic (a failed statement leaves the table exactly as it was), but
+// a MULTI-STATEMENT plan is not: when statement N fails, statements
+// before it may already have been applied (P1-2). The default on failure
+// is to stop the table FAILED with its data preserved, saying exactly
+// that; with --allow-structure-truncate the fallback is TRUNCATE, then
+// RE-PLAN from a fresh introspection of both sides (the old plan is
+// stale — replaying it would re-run the statements that already
+// applied) and execute only the DDL still missing. Either way the data
+// is then converged — see convergeAfterDDL for the re-read / re-plan:
+// a key the repair restores (e.g. the primary key) puts the table back
+// on row-level sync, only a still-keyless pair stays on the full load.
+// The table state (AUTO_INCREMENT) is reconciled last; the caller
+// verifies.
 func (r *Runner) ApplyStructureTable(ctx context.Context, res compare.TableResult, sp *StructPlan, ap *Applier) TableSync {
 	ts := TableSync{Name: res.Name, SchemaChanged: true, SchemaSQL: sp.DDL, DstRows: 0}
 	if r.o.Progress != nil {
 		r.o.Progress("%-24s structure: in-place ALTER, %d DDL statement(s): %s", res.Name, len(sp.DDL), strings.Join(sp.Reasons, "; "))
 	}
 	preTruncated := false
-	if err := execDDL(ctx, ap, sp.DDL); err != nil {
+	idx, err := execDDL(ctx, ap, sp.DDL)
+	if err != nil {
 		if !r.o.AllowStructureTruncate {
-			// the ALTER rolled back atomically: the destination's data is
-			// untouched, and the next run re-plans from the current facts
-			ts.Mode, ts.Status, ts.Error = "ERROR", "FAILED", fmt.Sprintf(
-				"structure sync: in-place ALTER failed (destination data preserved): %v — re-run with --allow-structure-truncate to truncate the table and re-apply, or align the schema manually", err)
+			var msg string
+			if len(sp.DDL) == 1 {
+				// a single ALTER rolled back atomically: the schema is
+				// unchanged, the data untouched
+				msg = fmt.Sprintf(
+					"structure sync: the in-place ALTER rolled back atomically (schema and destination data unchanged): %v — align the schema manually, or re-run with --allow-structure-truncate", err)
+			} else {
+				// a multi-statement DDL is NOT atomic: the statements
+				// before the failed one may already have been applied
+				msg = fmt.Sprintf(
+					"structure sync: DDL statement %d of %d failed (%v); one or more prior DDL statements may already have been applied — destination data was not truncated; re-run (it re-plans from the current schema) or align the schema manually",
+					idx+1, len(sp.DDL), err)
+			}
+			ts.Mode, ts.Status, ts.Error = "ERROR", "FAILED", msg
 			return ts
 		}
 		if err2 := ap.execDirect(ctx, "TRUNCATE TABLE "+conn.QuoteIdent(res.Name)); err2 != nil {
 			ts.Mode, ts.Status, ts.Error = "ERROR", "FAILED", fmt.Sprintf(
-				"structure sync: in-place ALTER failed (%v) and the truncate fallback failed (%v); destination data preserved", err, err2)
+				"structure sync: in-place DDL failed (%v) and the truncate fallback failed (%v); destination data preserved", err, err2)
 			return ts
 		}
 		ts.Truncated = true
 		preTruncated = true
-		if err := execDDL(ctx, ap, sp.DDL); err != nil {
-			ts.Mode, ts.Status, ts.Error = "ERROR", "FAILED", fmt.Sprintf("structure sync (after truncate): %v", err)
+		// The failed pass may have left the structure half-migrated, so
+		// the original plan is stale: re-introspect BOTH sides, re-diff,
+		// and execute only the DDL that is still missing. Never replay
+		// the original statements (an already-applied ADD COLUMN would
+		// fail again on the empty table).
+		sp2, _, err2 := r.structurePlan(ctx, res.Name)
+		if err2 != nil {
+			ts.Mode, ts.Status, ts.Error = "ERROR", "FAILED", fmt.Sprintf(
+				"structure sync (after truncate): re-planning the remaining DDL failed: %v", err2)
 			return ts
 		}
+		applied := append([]string{}, sp.DDL[:idx]...)
+		if sp2 != nil {
+			applied = append(applied, sp2.DDL...)
+			if i2, err3 := execDDL(ctx, ap, sp2.DDL); err3 != nil {
+				ts.Mode, ts.Status, ts.Error = "ERROR", "FAILED", fmt.Sprintf(
+					"structure sync (after truncate): the re-planned DDL failed at statement %d of %d: %v", i2+1, len(sp2.DDL), err3)
+				return ts
+			}
+		}
+		ts.SchemaSQL = applied
 	}
 	return r.convergeAfterDDL(ctx, res.Name, "structure sync", ap, &ts, preTruncated)
 }
@@ -1346,6 +1495,13 @@ func (r *Runner) PlanTable(ctx context.Context, res compare.TableResult) TableSy
 			ts.Inserts, ts.Updates, ts.Deletes = Counts(ops)
 			ts.Chunks = len(ops)
 			ts.SampleSQL = r.samples(d.p.b, ops, r.o.SampleLimit)
+			if n := rewriteCount(ops); n > 0 {
+				// P0-2: the destructive rewrite is shown SEPARATELY in
+				// the confirmation summary — it is the only kind of
+				// statement that touches rows the user did not ask to
+				// change (FK/trigger side effects ride on it)
+				ts.SampleSQL = append(ts.SampleSQL, fmt.Sprintf("DESTRUCTIVE ROW REWRITE: %d row group(s) are deleted and re-inserted to free unique slots (permitted by --allow-row-rewrite)", n))
+			}
 		} else {
 			ts.SampleSQL = r.fullSamples(d.p.b, res.SrcRows)
 		}

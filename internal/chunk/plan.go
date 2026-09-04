@@ -313,10 +313,14 @@ func (p *Planner) planSample(ctx context.Context, db Querier, minV, maxV []drive
 // sample picks an interior key value at roughly the off-th row of (lo, hi].
 func (p *Planner) sample(ctx context.Context, db Querier, lo, hi []driver.Value, loIncl bool, off int64) ([]driver.Value, error) {
 	c := Chunk{Lo: lo, LoIncl: loIncl, Hi: hi}
-	pred := c.Predicate(p.KeyCols, "")
+	// The split point must come from the SAME row set the plan covers
+	// (P2-2): the --where filter applies here exactly as it does to the
+	// extremes and the chunk scans. Without it, a sparse filter would pull
+	// split points from the unfiltered data and skew every chunk.
+	pred := c.Pred(p.KeyCols, p.Where)
 	var where string
-	if pred != "" {
-		where = " WHERE " + pred
+	if pred.SQL != "" {
+		where = " WHERE " + pred.SQL
 	}
 	// []any scan destinations: see keyRow for why not []driver.Value.
 	dest := make([]any, len(p.KeyCols))
@@ -326,7 +330,8 @@ func (p *Planner) sample(ctx context.Context, db Querier, lo, hi []driver.Value,
 	}
 	err := db.QueryRowContext(ctx,
 		fmt.Sprintf("SELECT %s FROM %s%s ORDER BY %s LIMIT 1 OFFSET %d",
-			strings.Join(p.keyIdents(), ", "), ident(p.Table), where, strings.Join(p.keyIdents(), ", "), off)).
+			strings.Join(p.keyIdents(), ", "), ident(p.Table), where, strings.Join(p.keyIdents(), ", "), off),
+		pred.Args...).
 		Scan(ptrs...)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -352,14 +357,15 @@ func NewScanner(norm *normalize.Normalizer, ordered bool) *Scanner {
 // Scan streams the chunk and returns its digest. The connection must be
 // dedicated to this scan (session policy stays in effect).
 func (s *Scanner) Scan(ctx context.Context, c *sql.Conn, schema *conn.Schema, ch Chunk, where string) (hash.ChunkDigest, error) {
-	pred := ch.Predicate(schema.Key, where)
+	// parameterized: the key bounds are bound on the server side (P0-1)
+	pred := ch.Pred(schema.Key, where)
 	var whereClause string
-	if pred != "" {
-		whereClause = " WHERE " + pred
+	if pred.SQL != "" {
+		whereClause = " WHERE " + pred.SQL
 	}
 	query := fmt.Sprintf("SELECT %s FROM %s%s%s",
 		selectCols(schema.Cols), ident(schema.Table), whereClause, s.orderBy(schema))
-	rows, err := c.QueryContext(ctx, query)
+	rows, err := c.QueryContext(ctx, query, pred.Args...)
 	if err != nil {
 		return hash.ChunkDigest{}, err
 	}

@@ -280,6 +280,12 @@ func genCol(name, typ, fam, storage string) conn.ColMeta {
 	return c
 }
 
+func genColExpr(name, typ, fam, storage, expr string) conn.ColMeta {
+	c := genCol(name, typ, fam, storage)
+	c.GenExpr = expr
+	return c
+}
+
 // TestDiffStructureGeneratedColumnRefused pins P0-2: the structure sync
 // refuses to (re-)define a generated column — the expression is a
 // cross-backend promise, and re-defining would silently drop it — while
@@ -374,6 +380,71 @@ func TestDiffStructureGeneratedColumnRefused(t *testing.T) {
 	}
 	if g := generatedCols(srcPlain); len(g) != 0 {
 		t.Fatalf("generatedCols(plain) = %v, want none", g)
+	}
+}
+
+// TestDiffStructureGeneratedExprCompare pins P1-1: the generation
+// EXPRESSION is part of the definition. Same expression (modulo
+// cosmetic re-printing) -> no drift; a different expression, a VIRTUAL
+// vs STORED swap, or one side unreadable -> drift, and the structure
+// sync REFUSES (explicit error) instead of rebuilding.
+func TestDiffStructureGeneratedExprCompare(t *testing.T) {
+	base := metaCol("id", "int", conn.FamINT, false)
+	one := func(expr string) *conn.Struct {
+		return &conn.Struct{Cols: []conn.ColMeta{base, genColExpr("total", "decimal(12,2)", conn.FamDECIMAL, "STORED", expr)}}
+	}
+
+	// 1. the same expression, cosmetically re-printed (whitespace,
+	// outer paren wrapping): no drift, no refusal.
+	if changes, err := DiffStructure(one("  ((`a`) + (`b`))  "), one("(`a`) + (`b`)"), "", ""); err != nil || len(changes) != 0 {
+		t.Fatalf("cosmetically equal expressions: changes=%v err=%v, want none", changes, err)
+	}
+
+	// 2. a genuinely different expression: drift, refused.
+	if _, err := DiffStructure(one("`a` + `b`"), one("`a` * `b`"), "", ""); err == nil {
+		t.Fatal("different generation expressions must be refused")
+	}
+
+	// 3. VIRTUAL vs STORED: drift, refused (a re-definition would
+	// change storage semantics).
+	virt := &conn.Struct{Cols: []conn.ColMeta{base, genColExpr("total", "decimal(12,2)", conn.FamDECIMAL, "VIRTUAL", "(`a`) + (`b`)")}}
+	stor := &conn.Struct{Cols: []conn.ColMeta{base, genColExpr("total", "decimal(12,2)", conn.FamDECIMAL, "STORED", "(`a`) + (`b`)")}}
+	if _, err := DiffStructure(virt, stor, "", ""); err == nil {
+		t.Fatal("a VIRTUAL/STORED storage swap must be refused")
+	}
+
+	// 4. one side unreadable (the backend does not expose
+	// GENERATION_EXPRESSION): never assumed equal to a readable one —
+	// drift, refused (the safe direction).
+	if _, err := DiffStructure(one(""), one("(`a`) + (`b`)"), "", ""); err == nil {
+		t.Fatal("an unreadable-vs-readable expression pair must be refused, not matched")
+	}
+
+	// 5. both unreadable: nothing to compare, the Generated/GenStorage
+	// check governs — no drift, no refusal.
+	if changes, err := DiffStructure(one(""), one(""), "", ""); err != nil || len(changes) != 0 {
+		t.Fatalf("two unreadable expressions: changes=%v err=%v, want none", changes, err)
+	}
+}
+
+// TestNormalizeGenerationExpr pins the conservative normalization: trim
+// plus whole-string paren peeling, nothing else. A quote anywhere
+// disables the peeling (a literal parenthesis would defeat the balance
+// scan); under-normalizing is the safe direction.
+func TestNormalizeGenerationExpr(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"  a + b  ", "a + b"},
+		{"(a) + (b)", "(a) + (b)"},
+		{"  ((a)+(b))  ", "(a)+(b)"},
+		{"(a)+b", "(a)+b"},                             // not fully wrapped: untouched beyond trim
+		{"((a))", "a"},                                 // fully wrapped: peeled to the core
+		{`concat('(', x, ')')`, `concat('(', x, ')')`}, // quotes: no peeling
+		{"", ""},
+	}
+	for _, c := range cases {
+		if got := normalizeGenerationExpr(c.in); got != c.want {
+			t.Errorf("normalizeGenerationExpr(%q) = %q, want %q", c.in, got, c.want)
+		}
 	}
 }
 

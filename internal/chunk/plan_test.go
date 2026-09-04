@@ -3,6 +3,7 @@ package chunk
 import (
 	"database/sql/driver"
 	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -230,12 +231,12 @@ func TestPredicateLeadPrefix(t *testing.T) {
 		Lo: []driver.Value{int64(7501)}, LoIncl: false, LoPrefix: 1,
 		Hi: []driver.Value{int64(15002)}, HiPrefix: 1,
 	}
-	if got := c.Predicate([]string{"a", "b"}, ""); got != "`a` > 7501 AND `a` <= 15002" {
-		t.Errorf("lead-prefix predicate = %q", got)
+	if got := c.Pred([]string{"a", "b"}, ""); got.SQL != "`a` > ? AND `a` <= ?" || !sameArgs(got.Args, int64(7501), int64(15002)) {
+		t.Errorf("lead-prefix predicate = %q args %v", got.SQL, got.Args)
 	}
 	c.Lo, c.LoIncl = []driver.Value{int64(1)}, true
-	if got := c.Predicate([]string{"a", "b"}, ""); got != "`a` >= 1 AND `a` <= 15002" {
-		t.Errorf("inclusive lead-prefix predicate = %q", got)
+	if got := c.Pred([]string{"a", "b"}, ""); got.SQL != "`a` >= ? AND `a` <= ?" || !sameArgs(got.Args, int64(1), int64(15002)) {
+		t.Errorf("inclusive lead-prefix predicate = %q args %v", got.SQL, got.Args)
 	}
 	if got, want := c.RenderBound(true), "1"; got != want {
 		t.Errorf("bound display must show the lead value only: %q, want %q", got, want)
@@ -244,9 +245,22 @@ func TestPredicateLeadPrefix(t *testing.T) {
 	c2 := Chunk{
 		Lo: []driver.Value{int64(1), int64(2)}, LoIncl: true, LoPrefix: 2,
 	}
-	if got, want := c2.Predicate([]string{"a", "b"}, ""), "(`a` > 1 OR (`a` = 1 AND `b` >= 2))"; got != want {
-		t.Errorf("full-width prefix must stay lexicographic: %q, want %q", got, want)
+	if got := c2.Pred([]string{"a", "b"}, ""); got.SQL != "(`a` > ? OR (`a` = ? AND `b` >= ?))" || !sameArgs(got.Args, int64(1), int64(1), int64(2)) {
+		t.Errorf("full-width prefix must stay lexicographic: %q args %v", got.SQL, got.Args)
 	}
+}
+
+// sameArgs reports whether the bound arguments equal want, in order.
+func sameArgs(got []any, want ...any) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range want {
+		if !valueEqual(got[i], want[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 // TestKeyOrder covers the latent composite-extremes bug: the sort
@@ -290,28 +304,50 @@ func TestToDriverValues(t *testing.T) {
 
 func TestPredicate(t *testing.T) {
 	c := Chunk{ID: 1, Lo: []driver.Value{int64(5)}, Hi: []driver.Value{int64(10)}}
-	if got := c.Predicate([]string{"id"}, ""); got != "`id` > 5 AND `id` <= 10" {
-		t.Errorf("predicate = %q", got)
+	if got := c.Pred([]string{"id"}, ""); got.SQL != "`id` > ? AND `id` <= ?" || !sameArgs(got.Args, int64(5), int64(10)) {
+		t.Errorf("predicate = %q args %v", got.SQL, got.Args)
 	}
 	c.LoIncl = true
-	if got := c.Predicate([]string{"id"}, ""); got != "`id` >= 5 AND `id` <= 10" {
-		t.Errorf("predicate = %q", got)
+	if got := c.Pred([]string{"id"}, ""); got.SQL != "`id` >= ? AND `id` <= ?" || !sameArgs(got.Args, int64(5), int64(10)) {
+		t.Errorf("predicate = %q args %v", got.SQL, got.Args)
 	}
-	if got := c.Predicate([]string{"id"}, "status = 1"); got != "`id` >= 5 AND `id` <= 10 AND (status = 1)" {
-		t.Errorf("predicate with where = %q", got)
+	// the operator's --where stays a RAW fragment, ANDed in after the
+	// parameterized key bounds (never itself parameterized)
+	if got := c.Pred([]string{"id"}, "status = 1"); got.SQL != "`id` >= ? AND `id` <= ? AND (status = 1)" || !sameArgs(got.Args, int64(5), int64(10)) {
+		t.Errorf("predicate with where = %q args %v", got.SQL, got.Args)
 	}
 	// no bounds at all (keyless whole-table chunk)
-	if got := (Chunk{ID: 0}).Predicate(nil, ""); got != "" {
-		t.Errorf("empty predicate = %q", got)
+	if got := (Chunk{ID: 0}).Pred(nil, ""); got.SQL != "" || got.Args != nil {
+		t.Errorf("empty predicate = %q args %v", got.SQL, got.Args)
 	}
-	// composite exclusive lower bound / inclusive upper bound
+	// composite exclusive lower bound / inclusive upper bound: the bound
+	// value is bound TWICE in the lower term (k > v OR (k = v AND ...))
 	cc := Chunk{
 		Lo: []driver.Value{"a", int64(2)},
 		Hi: []driver.Value{"b", int64(3)},
 	}
-	want := "(`a` > 'a' OR (`a` = 'a' AND `b` > 2)) AND (`a` < 'b' OR (`a` = 'b' AND `b` <= 3))"
-	if got := cc.Predicate([]string{"a", "b"}, ""); got != want {
-		t.Errorf("composite predicate = %q, want %q", got, want)
+	got := cc.Pred([]string{"a", "b"}, "")
+	wantSQL := "(`a` > ? OR (`a` = ? AND `b` > ?)) AND (`a` < ? OR (`a` = ? AND `b` <= ?))"
+	if got.SQL != wantSQL || !sameArgs(got.Args, "a", "a", int64(2), "b", "b", int64(3)) {
+		t.Errorf("composite predicate = %q args %v, want %q", got.SQL, got.Args, wantSQL)
+	}
+}
+
+// TestPredicateStringKey pins P0-1: a character key value with backslashes
+// and quotes never enters the SQL text — it is a bound argument, so the
+// statement is byte-exact under any sql_mode, including
+// NO_BACKSLASH_ESCAPES (where a rendered literal would change meaning).
+func TestPredicateStringKey(t *testing.T) {
+	c := Chunk{ID: 1, Lo: []driver.Value{`a\b`}, LoIncl: true, Hi: []driver.Value{`C:\abc\def'`}}
+	got := c.Pred([]string{"k"}, "")
+	if strings.Contains(got.SQL, `a\b`) || strings.Contains(got.SQL, `def`) || strings.Contains(got.SQL, "'") {
+		t.Errorf("the key value must never appear in the SQL text: %q", got.SQL)
+	}
+	if got.SQL != "`k` >= ? AND `k` <= ?" {
+		t.Errorf("predicate = %q, want two placeholders", got.SQL)
+	}
+	if !sameArgs(got.Args, `a\b`, `C:\abc\def'`) {
+		t.Errorf("args = %v, want the raw values verbatim", got.Args)
 	}
 }
 
@@ -322,23 +358,23 @@ func TestPredicateNULLBounds(t *testing.T) {
 	// single nullable column, first chunk [NULL .. 5]: covers the NULL rows
 	// plus every non-NULL value at or below 5
 	c := Chunk{ID: 0, Lo: []driver.Value{nil}, LoIncl: true, Hi: []driver.Value{int64(5)}}
-	if got := c.Predicate([]string{"a"}, ""); got != "(`a` IS NULL OR `a` <= 5)" {
-		t.Errorf("NULL-min single column = %q", got)
+	if got := c.Pred([]string{"a"}, ""); got.SQL != "(`a` IS NULL OR `a` <= ?)" || !sameArgs(got.Args, int64(5)) {
+		t.Errorf("NULL-min single column = %q args %v", got.SQL, got.Args)
 	}
 	// whole key space NULL (all values NULL): no predicate
 	c = Chunk{ID: 0, Lo: []driver.Value{nil}, LoIncl: true, Hi: []driver.Value{nil}}
-	if got := c.Predicate([]string{"a"}, ""); got != "" {
-		t.Errorf("all-NULL key must have empty predicate, got %q", got)
+	if got := c.Pred([]string{"a"}, ""); got.SQL != "" {
+		t.Errorf("all-NULL key must have empty predicate, got %q", got.SQL)
 	}
 	// exclusive NULL lower bound (sample landed on a NULL row): strictly
 	// greater than NULL means exactly the non-NULL rows
 	c = Chunk{ID: 1, Lo: []driver.Value{nil}, Hi: []driver.Value{int64(5)}}
-	if got := c.Predicate([]string{"a"}, ""); got != "`a` IS NOT NULL AND `a` <= 5" {
-		t.Errorf("exclusive NULL-min single column = %q", got)
+	if got := c.Pred([]string{"a"}, ""); got.SQL != "`a` IS NOT NULL AND `a` <= ?" || !sameArgs(got.Args, int64(5)) {
+		t.Errorf("exclusive NULL-min single column = %q args %v", got.SQL, got.Args)
 	}
 	c = Chunk{ID: 1, Lo: []driver.Value{nil}}
-	if got := c.Predicate([]string{"a"}, ""); got != "`a` IS NOT NULL" {
-		t.Errorf("exclusive NULL-min, no upper bound = %q", got)
+	if got := c.Pred([]string{"a"}, ""); got.SQL != "`a` IS NOT NULL" {
+		t.Errorf("exclusive NULL-min, no upper bound = %q", got.SQL)
 	}
 	// composite lower bound with a NULL leading column: (a IS NULL AND b >= 2)
 	// or any non-NULL a; upper bound plain
@@ -346,27 +382,31 @@ func TestPredicateNULLBounds(t *testing.T) {
 		Lo: []driver.Value{nil, int64(2)}, LoIncl: true,
 		Hi: []driver.Value{int64(5), int64(3)},
 	}
-	want := "((`a` IS NULL AND `b` >= 2) OR `a` IS NOT NULL) AND (`a` < 5 OR (`a` = 5 AND `b` <= 3))"
-	if got := c.Predicate([]string{"a", "b"}, ""); got != want {
-		t.Errorf("composite NULL lower bound = %q, want %q", got, want)
+	got := c.Pred([]string{"a", "b"}, "")
+	wantSQL := "((`a` IS NULL AND `b` >= ?) OR `a` IS NOT NULL) AND (`a` < ? OR (`a` = ? AND `b` <= ?))"
+	if got.SQL != wantSQL || !sameArgs(got.Args, int64(2), int64(5), int64(5), int64(3)) {
+		t.Errorf("composite NULL lower bound = %q args %v, want %q", got.SQL, got.Args, wantSQL)
 	}
 	// composite bound with a NULL last column, inclusive lower: the
 	// all-NULL row is the minimum of the suffix, so the suffix term is a
 	// tautology; exclusive lower must still exclude the bound row itself
 	c = Chunk{Lo: []driver.Value{int64(1), nil}, LoIncl: true, Hi: []driver.Value{int64(2), int64(3)}}
-	if got := c.Predicate([]string{"a", "b"}, ""); got != "(`a` > 1 OR (`a` = 1 AND 1=1)) AND (`a` < 2 OR (`a` = 2 AND `b` <= 3))" {
-		t.Errorf("inclusive NULL last column = %q", got)
+	if got := c.Pred([]string{"a", "b"}, ""); got.SQL != "(`a` > ? OR (`a` = ? AND 1=1)) AND (`a` < ? OR (`a` = ? AND `b` <= ?))" {
+		t.Errorf("inclusive NULL last column = %q", got.SQL)
+	} else if !sameArgs(got.Args, int64(1), int64(1), int64(2), int64(2), int64(3)) {
+		t.Errorf("inclusive NULL last column args = %v", got.Args)
 	}
 	c.LoIncl = false
-	if got := c.Predicate([]string{"a", "b"}, ""); got != "(`a` > 1 OR (`a` = 1 AND `b` IS NOT NULL)) AND (`a` < 2 OR (`a` = 2 AND `b` <= 3))" {
-		t.Errorf("exclusive NULL last column = %q", got)
+	if got := c.Pred([]string{"a", "b"}, ""); got.SQL != "(`a` > ? OR (`a` = ? AND `b` IS NOT NULL)) AND (`a` < ? OR (`a` = ? AND `b` <= ?))" {
+		t.Errorf("exclusive NULL last column = %q", got.SQL)
 	}
 	// NULL upper bound component (only when the leading value is NULL too):
 	// (a IS NULL AND b <= 2); a non-NULL a is always greater
 	c = Chunk{Lo: []driver.Value{nil, int64(1)}, LoIncl: true, Hi: []driver.Value{nil, int64(2)}}
-	want = "((`a` IS NULL AND `b` >= 1) OR `a` IS NOT NULL) AND (`a` IS NULL AND `b` <= 2)"
-	if got := c.Predicate([]string{"a", "b"}, ""); got != want {
-		t.Errorf("NULL upper bound component = %q, want %q", got, want)
+	got = c.Pred([]string{"a", "b"}, "")
+	wantSQL = "((`a` IS NULL AND `b` >= ?) OR `a` IS NOT NULL) AND (`a` IS NULL AND `b` <= ?)"
+	if got.SQL != wantSQL || !sameArgs(got.Args, int64(1), int64(2)) {
+		t.Errorf("NULL upper bound component = %q args %v, want %q", got.SQL, got.Args, wantSQL)
 	}
 }
 
@@ -416,15 +456,16 @@ func TestValuesEqual(t *testing.T) {
 // UNKNOWN for it).
 func TestRenderLessThan(t *testing.T) {
 	tests := []struct {
-		key   []string
-		bound []driver.Value
-		lits  []LiteralFunc
-		want  string
+		key      []string
+		bound    []driver.Value
+		want     string
+		wantArgs []any
 	}{
 		{
-			key:   []string{"a"},
-			bound: []driver.Value{int64(5)},
-			want:  "(`a` IS NULL OR `a` < 5)",
+			key:      []string{"a"},
+			bound:    []driver.Value{int64(5)},
+			want:     "(`a` IS NULL OR `a` < ?)",
+			wantArgs: []any{int64(5)},
 		},
 		{
 			// all-NULL single-column bound: the minimum, nothing below it
@@ -433,23 +474,26 @@ func TestRenderLessThan(t *testing.T) {
 			want:  "1=0",
 		},
 		{
-			key:   []string{"a", "b"},
-			bound: []driver.Value{int64(1), int64(2)},
-			want:  "(`a` IS NULL OR `a` < 1) OR (`a` = 1 AND (`b` IS NULL OR `b` < 2))",
+			key:      []string{"a", "b"},
+			bound:    []driver.Value{int64(1), int64(2)},
+			want:     "(`a` IS NULL OR `a` < ?) OR (`a` = ? AND (`b` IS NULL OR `b` < ?))",
+			wantArgs: []any{int64(1), int64(1), int64(2)},
 		},
 		{
 			// NULL leading bound component: only NULL rows continue into
 			// the (strict) suffix
-			key:   []string{"a", "b"},
-			bound: []driver.Value{nil, int64(2)},
-			want:  "`a` IS NULL AND (`b` IS NULL OR `b` < 2)",
+			key:      []string{"a", "b"},
+			bound:    []driver.Value{nil, int64(2)},
+			want:     "`a` IS NULL AND (`b` IS NULL OR `b` < ?)",
+			wantArgs: []any{int64(2)},
 		},
 		{
 			// NULL last bound component: a row equal in the prefix with a
 			// NULL last component EQUALS the bound — the suffix is empty
-			key:   []string{"a", "b"},
-			bound: []driver.Value{int64(1), nil},
-			want:  "(`a` IS NULL OR `a` < 1) OR (`a` = 1 AND 1=0)",
+			key:      []string{"a", "b"},
+			bound:    []driver.Value{int64(1), nil},
+			want:     "(`a` IS NULL OR `a` < ?) OR (`a` = ? AND 1=0)",
+			wantArgs: []any{int64(1), int64(1)},
 		},
 		{
 			// all-NULL composite bound: the all-NULL row is the bound
@@ -458,16 +502,21 @@ func TestRenderLessThan(t *testing.T) {
 			want:  "`a` IS NULL AND 1=0",
 		},
 		{
-			// per-column literal renderers must be used verbatim
-			key:   []string{"a", "b"},
-			bound: []driver.Value{int64(1), int64(2)},
-			lits:  []LiteralFunc{func(driver.Value) string { return "X1" }, func(driver.Value) string { return "X2" }},
-			want:  "(`a` IS NULL OR `a` < X1) OR (`a` = X1 AND (`b` IS NULL OR `b` < X2))",
+			// a string bound travels as bound data (P0-1): the value must
+			// never appear in the SQL text, and the arg is the raw value
+			key:      []string{"a"},
+			bound:    []driver.Value{"it's \\ 中文"},
+			want:     "(`a` IS NULL OR `a` < ?)",
+			wantArgs: []any{"it's \\ 中文"},
 		},
 	}
 	for _, tt := range tests {
-		if got := RenderLessThan(tt.key, tt.bound, tt.lits); got != tt.want {
-			t.Errorf("RenderLessThan(%v, %v) = %q, want %q", tt.key, tt.bound, got, tt.want)
+		got := LessThan(tt.key, tt.bound)
+		if got.SQL != tt.want {
+			t.Errorf("LessThan(%v, %v) = %q, want %q", tt.key, tt.bound, got.SQL, tt.want)
+		}
+		if tt.wantArgs != nil && !sameArgs(got.Args, tt.wantArgs...) {
+			t.Errorf("LessThan(%v, %v) args = %v, want %v", tt.key, tt.bound, got.Args, tt.wantArgs)
 		}
 	}
 }
@@ -476,14 +525,16 @@ func TestRenderLessThan(t *testing.T) {
 // out-of-range delete's high side).
 func TestRenderGreaterThan(t *testing.T) {
 	tests := []struct {
-		key   []string
-		bound []driver.Value
-		want  string
+		key      []string
+		bound    []driver.Value
+		want     string
+		wantArgs []any
 	}{
 		{
-			key:   []string{"a"},
-			bound: []driver.Value{int64(5)},
-			want:  "`a` > 5",
+			key:      []string{"a"},
+			bound:    []driver.Value{int64(5)},
+			want:     "`a` > ?",
+			wantArgs: []any{int64(5)},
 		},
 		{
 			// all-NULL bound: every non-NULL row sits above the minimum
@@ -492,21 +543,24 @@ func TestRenderGreaterThan(t *testing.T) {
 			want:  "`a` IS NOT NULL",
 		},
 		{
-			key:   []string{"a", "b"},
-			bound: []driver.Value{int64(1), int64(2)},
-			want:  "`a` > 1 OR (`a` = 1 AND `b` > 2)",
+			key:      []string{"a", "b"},
+			bound:    []driver.Value{int64(1), int64(2)},
+			want:     "`a` > ? OR (`a` = ? AND `b` > ?)",
+			wantArgs: []any{int64(1), int64(1), int64(2)},
 		},
 		{
-			key:   []string{"a", "b"},
-			bound: []driver.Value{nil, int64(2)},
-			want:  "(`a` IS NULL AND `b` > 2) OR `a` IS NOT NULL",
+			key:      []string{"a", "b"},
+			bound:    []driver.Value{nil, int64(2)},
+			want:     "(`a` IS NULL AND `b` > ?) OR `a` IS NOT NULL",
+			wantArgs: []any{int64(2)},
 		},
 		{
 			// NULL last bound component: the equal-prefix all-NULL row is
 			// the bound itself and must stay out
-			key:   []string{"a", "b"},
-			bound: []driver.Value{int64(1), nil},
-			want:  "`a` > 1 OR (`a` = 1 AND `b` IS NOT NULL)",
+			key:      []string{"a", "b"},
+			bound:    []driver.Value{int64(1), nil},
+			want:     "`a` > ? OR (`a` = ? AND `b` IS NOT NULL)",
+			wantArgs: []any{int64(1), int64(1)},
 		},
 		{
 			// all-NULL composite bound: only the all-NULL row is excluded
@@ -516,8 +570,12 @@ func TestRenderGreaterThan(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		if got := RenderGreaterThan(tt.key, tt.bound, nil); got != tt.want {
-			t.Errorf("RenderGreaterThan(%v, %v) = %q, want %q", tt.key, tt.bound, got, tt.want)
+		got := GreaterThan(tt.key, tt.bound)
+		if got.SQL != tt.want {
+			t.Errorf("GreaterThan(%v, %v) = %q, want %q", tt.key, tt.bound, got.SQL, tt.want)
+		}
+		if tt.wantArgs != nil && !sameArgs(got.Args, tt.wantArgs...) {
+			t.Errorf("GreaterThan(%v, %v) args = %v, want %v", tt.key, tt.bound, got.Args, tt.wantArgs)
 		}
 	}
 }

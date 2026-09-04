@@ -5,6 +5,8 @@ package conn
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -95,14 +97,13 @@ func buildDSN(ep config.Endpoint, maxAllowedPacket, writeTimeoutSec int) string 
 // pre-warms the scan pool, then verifies the server answers.
 //
 // The pre-warm is a latency optimization, NOT the correctness mechanism:
-// database/sql hands the same idle connection back to consecutive Conn()
-// calls, so the loop may have initialized far fewer than `parallel`
-// physical connections, and connections opened lazily later never get the
-// policy from it. The per-connection guarantee lives in AcquireScan (the
-// inited map): every connection is policy-applied before first use. That
-// application is cheap — it runs once per physical connection (the maps
-// remember), and applySession is idempotent (the sql_mode flags are added
-// at most once, the read-only SET is a no-op when already ON).
+// it opens `parallel` DISTINCT physical connections up front (holding each
+// until all are open, so the idle pool cannot hand one connection back for
+// several iterations), and connections opened lazily later, or replacing a
+// dead one, get the policy from AcquireScan's memo before first use. The
+// application is cheap — once per physical connection (the memo remembers
+// by CONNECTION_ID) — and applySession is idempotent, so even a
+// re-application on a reused session is a no-op.
 //
 // allowUnenforcedReadOnly is config.Options.AllowUnenforcedReadOnly; see
 // applySession for what it relaxes.
@@ -179,6 +180,11 @@ func OpenSide(ctx context.Context, name string, ep config.Endpoint, maxAllowedPa
 	}
 	c.Close() // returns the pre-conditioned connection to the pool
 
+	// Hold every acquired connection until all `parallel` are open, so the
+	// idle pool cannot recycle one physical connection for several
+	// iterations (database/sql's Conn() takes the idle one back the moment
+	// it is returned); release them all, already policy-applied, at the end.
+	prewarmed := make([]*sql.Conn, 0, parallel)
 	for i := 0; i < parallel; i++ {
 		sc, err := scanDB.Conn(ctx)
 		if err != nil {
@@ -198,6 +204,9 @@ func OpenSide(ctx context.Context, name string, ep config.Endpoint, maxAllowedPa
 			ctlDB.Close()
 			return nil, fmt.Errorf("%s: pre-warm scan pool: %s: %w", name, ep.MaskedDSN(), err)
 		}
+		prewarmed = append(prewarmed, sc)
+	}
+	for _, sc := range prewarmed {
 		sc.Close() // back to the idle pool, policy already in effect
 	}
 	return &Side{
@@ -308,19 +317,48 @@ func (s *Side) AcquireScan(ctx context.Context) (*sql.Conn, error) {
 	}
 	s.initMu.Lock()
 	first := !s.inited[id]
-	if first {
-		s.inited[id] = true
-	}
 	s.initMu.Unlock()
 	if first {
-		// Outside the lock: the SET batch must not hold the map mutex
-		// (another worker may wait on it while this round trip runs).
+		// Apply the policy BEFORE marking (P1-3): a failed applySession
+		// must not leave the connection behind in the memo — the next
+		// checkout of the same physical connection (a recycled
+		// CONNECTION_ID after a server restart, or the pool reusing the
+		// slot) would then be trusted to be read-only without the policy
+		// ever having been set. Marking is a no-op duplicate when two
+		// paths race: a physical connection is exclusively checked out
+		// (DB.Conn pins it), so only one caller can ever initialize it,
+		// and the map is guarded by initMu either way. The SET batch
+		// itself runs outside the lock (another worker may wait on it
+		// while this round trip runs).
 		if err := applySession(ctx, c, s.allowUnforced); err != nil {
 			c.Close()
 			return nil, fmt.Errorf("%s: init scan connection: %w", s.Name, err)
 		}
+		s.initMu.Lock()
+		s.inited[id] = true
+		s.initMu.Unlock()
 	}
 	return c, nil
+}
+
+// DeadConn reports a dead-connection error: the driver's bad-connection
+// marker, or MySQL's lost-connection family in the message (the driver
+// wraps server-side disconnects as "invalid connection: Lost
+// connection to MySQL server ..."). A pinned sql.Conn does NOT get
+// database/sql's one automatic retry (that only exists on DB-level
+// methods), so a caller holding a pinned connection must take a FRESH
+// one from the pool — AcquireScan re-initializes it if it is new.
+func DeadConn(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, driver.ErrBadConn) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "bad connection") ||
+		strings.Contains(msg, "invalid connection") ||
+		strings.Contains(msg, "Lost connection")
 }
 
 // Ctl returns the control pool for introspection/planning queries.

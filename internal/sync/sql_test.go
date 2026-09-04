@@ -1,6 +1,7 @@
 package sync
 
 import (
+	"fmt"
 	"math"
 	"reflect"
 	"strings"
@@ -397,5 +398,54 @@ func TestBuilderGeneratedColumnExcludedFromWrites(t *testing.T) {
 	stmt, args := b.InsertExec([]any{int64(1), []byte("9.99"), []byte("19.98"), "x"})
 	if stmt != "INSERT INTO `t` (`id`, `price`) VALUES (?, ?)" || len(args) != 2 {
 		t.Errorf("InsertExec = %q args=%v", stmt, args)
+	}
+}
+
+// wideBuilder builds a Builder over n writable columns (P2-3 shape).
+func wideBuilder(t *testing.T, n int) *Builder {
+	t.Helper()
+	names := make([]string, n)
+	cols := make([]conn.Column, n)
+	for i := range names {
+		names[i] = fmt.Sprintf("c%d", i)
+		cols[i] = conn.Column{Name: names[i], Family: conn.FamINT, RawType: "int"}
+	}
+	schema := &conn.Schema{Table: "t", Cols: cols}
+	return NewBuilder("t", schema)
+}
+
+// TestBatchCap pins P2-3: the multi-row INSERT batch is capped by the
+// bind-parameter budget (maxBindParams / writable columns) below the
+// configured batch, a narrow table keeps its configured batch, and a
+// table too wide for a SINGLE row is an explicit error.
+func TestBatchCap(t *testing.T) {
+	cases := []struct {
+		cols, batch, want int
+		err               bool
+	}{
+		{10, 1000, 1000, false},            // narrow: the configured batch holds
+		{10, 50, 50, false},                // small batch below the cap
+		{60, 1000, 1000, false},            // exactly at the cap
+		{61, 1000, 983, false},             // wide: shrunk (60000/61)
+		{100, 1000, 600, false},            // very wide: shrunk (60000/100)
+		{100, 100, 100, false},             // small batch below the shrunk cap
+		{maxBindParams + 1, 1000, 0, true}, // one row alone is over budget
+	}
+	for _, c := range cases {
+		a := &Applier{Batch: c.batch}
+		got, err := a.batchCap(wideBuilder(t, c.cols))
+		if c.err {
+			if err == nil {
+				t.Errorf("%d cols, batch %d: want the over-budget error, got batch %d", c.cols, c.batch, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("%d cols, batch %d: %v", c.cols, c.batch, err)
+			continue
+		}
+		if got != c.want {
+			t.Errorf("%d cols, batch %d: got %d, want %d", c.cols, c.batch, got, c.want)
+		}
 	}
 }

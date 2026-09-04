@@ -136,10 +136,13 @@ func colDiffers(sc, dc conn.ColMeta, srcDef, dstDef string) bool {
 	}
 	// A column becoming generated (or ceasing to be) is a semantic change
 	// the raw type alone would not reveal: the generated-ness is part of
-	// the definition. (A re-defined generated column is then refused by
-	// addable — the expression cannot be reproduced.)
+	// the definition. The EXPRESSION is part of it too (P1-1): two
+	// generated columns of the same storage that compute different values
+	// are a drift, and a drift with an unreadable side is a safe refusal
+	// (addable) — never a silent match.
 	if sc.Generated != dc.Generated ||
-		(sc.Generated && !strings.EqualFold(sc.GenStorage, dc.GenStorage)) {
+		(sc.Generated && !strings.EqualFold(sc.GenStorage, dc.GenStorage)) ||
+		(sc.Generated && dc.Generated && genExprDiffers(sc, dc)) {
 		return true
 	}
 	if normalizeIntType(sc.RawType) != normalizeIntType(dc.RawType) {
@@ -159,6 +162,61 @@ func colDiffers(sc, dc conn.ColMeta, srcDef, dstDef string) bool {
 	}
 	if sc.Collation != dc.Collation && !defaultCollationsMatch(sc, dc, srcDef, dstDef) {
 		return true
+	}
+	return false
+}
+
+// genExprDiffers compares two generated columns' generation expressions
+// (P1-1). Normalization is deliberately conservative: it folds
+// surrounding whitespace and outermost paren wrapping, and NOTHING else
+// (no AST re-print, no identifier case-folding, no operator rewriting) —
+// an expression that differs in any other way is a real difference. An
+// expression either side cannot read ("" — the backend does not expose
+// GENERATION_EXPRESSION) never matches a readable one: not comparable is
+// not the same as equal, so the pair counts as a drift and the structure
+// sync refuses rather than guessing. Two unreadable expressions degrade
+// to the Generated/GenStorage check only.
+func genExprDiffers(sc, dc conn.ColMeta) bool {
+	return normalizeGenerationExpr(sc.GenExpr) != normalizeGenerationExpr(dc.GenExpr)
+}
+
+// normalizeGenerationExpr folds the cosmetic differences a backend may
+// introduce when it re-prints the same expression: surrounding
+// whitespace and whole-string paren wrapping, peeled while the string
+// stays fully wrapped ("((a)+(b))" -> "(a)+(b)", then it stops: the
+// remainder is not one balanced outer pair). NOTHING else is normalized
+// (no AST re-print, no identifier case-folding, no operator rewriting).
+// Expressions that contain a quote are trimmed only — a parenthesis
+// inside a string literal would defeat the balance scan, and
+// under-normalizing is the safe direction (a cosmetic match missed is a
+// drift reported; a different expression declared equal is data
+// corruption).
+func normalizeGenerationExpr(expr string) string {
+	e := strings.TrimSpace(expr)
+	if strings.ContainsAny(e, "'\"") {
+		return e
+	}
+	for strings.HasPrefix(e, "(") && strings.HasSuffix(e, ")") && outerParens(e) {
+		e = strings.TrimSpace(e[1 : len(e)-1])
+	}
+	return e
+}
+
+// outerParens reports whether the whole string is wrapped in ONE balanced
+// pair of parentheses (the opener at index 0 closes at the final
+// position): "(a) + (b)" is, "(a)+b" is not.
+func outerParens(s string) bool {
+	depth := 0
+	for i, r := range s {
+		switch r {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return i == len(s)-1
+			}
+		}
 	}
 	return false
 }
@@ -203,6 +261,13 @@ func colWhy(sc, dc conn.ColMeta) string {
 	switch {
 	case sc.Generated != dc.Generated:
 		return fmt.Sprintf("generated column %v -> %v", dc.Generated, sc.Generated)
+	case sc.Generated && !strings.EqualFold(sc.GenStorage, dc.GenStorage):
+		return fmt.Sprintf("generated storage %s -> %s", dc.GenStorage, sc.GenStorage)
+	case sc.Generated && genExprDiffers(sc, dc):
+		if sc.GenExpr == "" || dc.GenExpr == "" {
+			return "generated expression unreadable on one side"
+		}
+		return "generated expression differs"
 	case !strings.EqualFold(sc.RawType, dc.RawType):
 		return fmt.Sprintf("type %s -> %s", dc.RawType, sc.RawType)
 	case sc.Nullable != dc.Nullable:

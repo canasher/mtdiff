@@ -89,6 +89,16 @@ func (b *Builder) keyCols() []string {
 // KeyCols returns the key column names in key order (empty when keyless).
 func (b *Builder) KeyCols() []string { return b.keyCols() }
 
+// WritableCols is the number of columns an INSERT binds per row (the
+// writable subset: plain columns, generated ones excluded).
+func (b *Builder) WritableCols() int { return len(b.writeCols) }
+
+// maxBindParams is the bind-parameter budget per statement (P2-3): a
+// batch of N rows binds N x WritableCols parameters, and a statement past
+// tens of thousands of placeholders is a server-side resource DoS (and
+// is rejected by some proxies) long before max_allowed_packet bites.
+const maxBindParams = 60000
+
 // Insert renders a single-row INSERT of the source row's WRITABLE columns
 // (generated columns are excluded — P0-2).
 func (b *Builder) Insert(vals []any) string {

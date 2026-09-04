@@ -316,13 +316,26 @@ func (c *Comparer) scanSide(ctx context.Context, side *conn.Side, snapConn *sql.
 	results := make(chan result, len(chunks))
 	for w := 0; w < parallel; w++ {
 		g.Go(func() error {
+			// One scan connection per worker for the whole side
+			// (P2-1): acquiring per chunk churns the pool and pays
+			// the checkout bookkeeping on every chunk. If the
+			// pinned connection dies mid-scan, take a fresh one
+			// (the pool re-initializes it) and retry the chunk
+			// once.
+			cn, err := side.AcquireScan(gctx)
+			if err != nil {
+				return err
+			}
+			defer func() { cn.Close() }()
 			for ch := range jobs {
-				cn, err := side.AcquireScan(gctx)
-				if err != nil {
-					return err
-				}
 				d, err := sc.Scan(gctx, cn, schema, ch, c.opts.Where)
-				cn.Close()
+				if err != nil && conn.DeadConn(err) {
+					cn.Close()
+					if cn, err = side.AcquireScan(gctx); err != nil {
+						return err
+					}
+					d, err = sc.Scan(gctx, cn, schema, ch, c.opts.Where)
+				}
 				if err != nil {
 					return err
 				}
@@ -393,23 +406,78 @@ func (c *Comparer) countQ(ctx context.Context, q chunk.Querier, sideName, table 
 // transaction on it: that connection becomes the side's snapshot scope
 // for one table — the COUNT, the key extremes, the chunk scans and the
 // drill-downs all run on it, so the whole table is read at one point in
-// time. A plain START TRANSACTION (not MySQL's "WITH CONSISTENT
-// SNAPSHOT") works on both backends: MySQL's default REPEATABLE READ
-// pins the snapshot on the first read, and TiDB pins a transaction's
-// read timestamp on its first statement. (A session deliberately running
-// a non-snapshot isolation level, e.g. READ COMMITTED, weakens the
-// guarantee to per-statement — the snapshot is then only as consistent as
-// that session's isolation level.)
+// time.
+//
+// The guarantee is FORCED, not inherited from the server default
+// (P1-4): the session isolation level is set to REPEATABLE READ before
+// the transaction begins, so a server or session configured for READ
+// COMMITTED cannot silently weaken the snapshot to per-statement reads
+// (a non-snapshot level would let COUNT, extremes and the chunk scans
+// each see a different point in time and the digest could mix them).
+// Only when the session is verified to be REPEATABLE READ does a plain
+// START TRANSACTION suffice: in REPEATABLE READ every read in a
+// transaction sees the same snapshot (MySQL pins it on the first read,
+// TiDB pins the transaction's read timestamp on its first statement),
+// and all reads here run on this one connection in this one
+// transaction. A backend where neither the SET nor a verifiable
+// REPEATABLE READ session is possible makes --snapshot a REFUSAL
+// (unsupported), never a silent downgrade.
 func (c *Comparer) beginSnapshotTx(ctx context.Context, side *conn.Side, table string) (*sql.Conn, error) {
 	cn, err := side.AcquireScan(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := cn.ExecContext(ctx, "START TRANSACTION"); err != nil {
+	if err := beginSnapshotTx(ctx, cn); err != nil {
 		cn.Close()
-		return nil, fmt.Errorf("%s %s: snapshot: %w", side.Name, table, err)
+		return nil, fmt.Errorf("%s %s: --snapshot: %w", side.Name, table, err)
 	}
 	return cn, nil
+}
+
+// beginSnapshotTx forces the snapshot semantics on one dedicated
+// connection: REPEATABLE READ for the session, then a transaction on it.
+// The explicit "START TRANSACTION WITH CONSISTENT SNAPSHOT" is tried
+// first (it pins the snapshot at the BEGIN, before any read); a backend
+// that rejects the clause falls back to a plain START TRANSACTION, which
+// is equally strict once the session is verified REPEATABLE READ (the
+// snapshot pins on the first read, and every read of the table runs in
+// this transaction on this connection).
+func beginSnapshotTx(ctx context.Context, cn *sql.Conn) error {
+	if _, err := cn.ExecContext(ctx, "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ"); err != nil {
+		// The SET is refused: the session may already run REPEATABLE
+		// READ (a no-op SET is accepted, so a refusal means something
+		// else — verify rather than assume). A session that cannot be
+		// shown to be REPEATABLE READ cannot honor --snapshot.
+		iso, isoErr := currentIsolation(ctx, cn)
+		if isoErr != nil || !strings.EqualFold(iso, "REPEATABLE-READ") {
+			return fmt.Errorf("cannot enforce REPEATABLE READ on this backend (set: %v; isolation: %v%v): --snapshot is unsupported here, run without it",
+				err, iso, func() string {
+					if isoErr != nil {
+						return " unreadable"
+					}
+					return ""
+				}())
+		}
+	}
+	if _, err := cn.ExecContext(ctx, "START TRANSACTION WITH CONSISTENT SNAPSHOT"); err != nil {
+		if _, err2 := cn.ExecContext(ctx, "START TRANSACTION"); err2 != nil {
+			return fmt.Errorf("cannot open a snapshot transaction on this backend (%v; %v): --snapshot is unsupported here, run without it", err, err2)
+		}
+	}
+	return nil
+}
+
+// currentIsolation reads the session's current isolation level (the
+// modern name first; tx_isolation is the 5.7 spelling, removed from
+// later 8.0 releases, so both are tried).
+func currentIsolation(ctx context.Context, cn *sql.Conn) (string, error) {
+	for _, v := range []string{"@@SESSION.transaction_isolation", "@@SESSION.tx_isolation"} {
+		var iso string
+		if err := cn.QueryRowContext(ctx, "SELECT "+v).Scan(&iso); err == nil {
+			return iso, nil
+		}
+	}
+	return "", fmt.Errorf("isolation level unreadable")
 }
 
 // endSnapshotTx ends the snapshot scope: the transaction was read-only,

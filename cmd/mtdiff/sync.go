@@ -24,6 +24,7 @@ type syncOpts struct {
 	sampleLimit    int
 	noSyncSchema   bool
 	structTruncate bool
+	rowRewrite     bool
 }
 
 var (
@@ -47,6 +48,7 @@ func init() {
 	f.IntVar(&syncOpt.sampleLimit, "sample-limit", 0, "sample SQL statements shown per table in a dry-run (default 5)")
 	f.BoolVar(&syncOpt.noSyncSchema, "no-sync-schema", false, "do not align the destination table structure before the data sync (default: structure is synced first, shown in the dry run)")
 	f.BoolVar(&syncOpt.structTruncate, "allow-structure-truncate", false, "if the in-place structure ALTER fails, truncate the destination table and re-apply the DDL on it (default: the failure stops the table with its data preserved)")
+	f.BoolVar(&syncOpt.rowRewrite, "allow-row-rewrite", false, "permit the destructive row rewrite (DELETE+INSERT) for a unique-value swap/cycle/holder, and the full resync for a cross-chunk swap (default: the table is refused, because the rewrite fires FK/trigger side effects)")
 	rootCmd.AddCommand(syncCmd)
 }
 
@@ -78,6 +80,9 @@ func applySyncOpts(cmd *cobra.Command, o *syncOpts, c *config.Config) error {
 	}
 	if cmd.Flags().Changed("allow-structure-truncate") {
 		c.Opts.AllowStructureTruncate = o.structTruncate
+	}
+	if cmd.Flags().Changed("allow-row-rewrite") {
+		c.Opts.AllowRowRewrite = o.rowRewrite
 	}
 	return nil
 }
@@ -171,6 +176,7 @@ func syncRunE(cmd *cobra.Command, _ []string) error {
 		MaxPacket:              cfg.Opts.MaxAllowedPacket,
 		SyncSchema:             !cfg.Opts.NoSyncSchema,
 		AllowStructureTruncate: cfg.Opts.AllowStructureTruncate,
+		AllowRowRewrite:        cfg.Opts.AllowRowRewrite,
 		Progress:               progressLog, // forwarded to the comparer (pre-pass + verification) by NewRunner
 	})
 	results, err := runner.PrePass(ctx, tables)
