@@ -203,10 +203,10 @@ check "$(qdst "SELECT COUNT(*) FROM t_compat WHERE id >= 1000000")" 0 \
 say "compat out-of-range sync"
 sql "$DST_P" "$DST_PWD" dstdb m_oor.sql
 expect 1 "oor dry-run (int key)" sync --src "$SRC" --dst "$DST" --tables t_oor
-if ! grep -q 'DELETE FROM `t_oor`' "$OUT"; then
-  echo "FAIL: oor dry-run showed no DELETE sample"; cat "$OUT"; exit 1
+if ! grep -q 'STREAM DELETE' "$OUT"; then
+  echo "FAIL: oor dry-run showed no STREAM DELETE plan"; cat "$OUT"; exit 1
 fi
-echo "ok: oor dry-run shows a DELETE sample"
+echo "ok: oor dry-run plans the stream delete"
 expect 0 "oor --apply --yes (int key)" sync --src "$SRC" --dst "$DST" --tables t_oor --apply --yes
 expect 0 "diff identical after oor sync" --src "$SRC" --dst "$DST" --tables t_oor
 check "$(qdst "SELECT COUNT(*) FROM t_oor WHERE id = 0 OR id > 100")" 0 \

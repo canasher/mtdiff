@@ -708,17 +708,18 @@ func TestKeyOrderKnown(t *testing.T) {
 	}
 }
 
-// TestClassifyHolderOorSet is the regression for the t_swap e2e
+// TestClassifyHolderOorFlag is the regression for the t_swap e2e
 // (sync key v, PK id, an out-of-range row holding the PK value an
-// in-range insert needs): the out-of-range pass's OWN server-side scan
-// (oorSet) is the safety proof, not a client-side key comparison. A
-// case-insensitive key must still clear an out-of-range holder (it is in
-// the set) yet refuse an in-range one (its chunk position is not
-// provable client-side); an order-known key turns an out-of-range holder
-// MISSING from the set into a conflict (a --where residual or a data
-// race), never a false safe. All cases resolve before any database
-// access (nil Sides).
-func TestClassifyHolderOorSet(t *testing.T) {
+// in-range insert needs): the holder's SERVER-SIDE out-of-range flag
+// (the out-of-range predicate evaluated in the holders query itself) is
+// the safety proof, not a client-side key comparison. A case-insensitive
+// key must still clear a flagged holder (the out-of-range pass deletes
+// it before any in-range write) yet refuse an unflagged one (its chunk
+// position is not provable client-side); an order-known key turns an
+// unflagged holder the client orders OUTSIDE the source range into a
+// conflict (a --where residual or a data race), never a false safe. All
+// cases resolve before any database access (nil Sides).
+func TestClassifyHolderOorFlag(t *testing.T) {
 	cols := []conn.Column{
 		{Name: "id", Family: conn.FamINT, RawType: "int"},
 		{Name: "u", Family: conn.FamSTR, RawType: "varchar(10)", Nullable: true},
@@ -744,32 +745,32 @@ func TestClassifyHolderOorSet(t *testing.T) {
 		Key:   []string{"id"},
 	}
 	c := e.uc[0]
-	run := func(srcS *conn.Schema, targeted, oorSet map[string]bool, lo, hi []driver.Value, inChunk bool, oorActive bool) (crossChunkVerdict, error) {
+	run := func(srcS *conn.Schema, targeted map[string]bool, oor bool, lo, hi []driver.Value, inChunk, oorActive bool) (crossChunkVerdict, error) {
 		dstM := map[string][]*srow{}
 		if inChunk {
 			dstM[idS] = []*srow{{vals: h}}
 		}
-		return e.classifyHolder(context.Background(), nil, srcS, chunk.Chunk{}, dstM, 0, c, h, map[string][]any{}, lo, hi, targeted, oorSet, oorActive, keyOrderKnown(srcS))
+		return e.classifyHolder(context.Background(), nil, srcS, chunk.Chunk{}, dstM, 0, c, holderRow{key: h, oor: oor}, map[string][]any{}, lo, hi, targeted, oorActive, keyOrderKnown(srcS))
 	}
 	cases := []struct {
 		name      string
 		srcS      *conn.Schema
 		targeted  map[string]bool
-		oorSet    map[string]bool
+		oor       bool
 		lo, hi    []driver.Value
 		inChunk   bool
 		oorActive bool
 		want      crossChunkVerdict
 	}{
-		{"targeted holder is safe (ci key)", ciS, map[string]bool{idS: true}, nil, nil, nil, false, true, crossSafe},
-		{"unaddressed in-chunk holder conflicts", intS, nil, nil, nil, nil, true, true, crossConflict},
-		{"no out-of-range pass: foreign holder conflicts", intS, nil, nil, nil, nil, false, false, crossConflict},
-		{"out-of-range set member is safe (ci key, no client order needed)", ciS, nil, map[string]bool{idS: true}, nil, nil, false, true, crossSafe},
-		{"in-range holder on a ci key is not provable", ciS, nil, nil, nil, nil, false, true, crossConflict},
-		{"out-of-range holder missing from the set conflicts (int key)", intS, nil, nil, []driver.Value{int64(1)}, []driver.Value{int64(50)}, false, true, crossConflict},
+		{"targeted holder is safe (ci key)", ciS, map[string]bool{idS: true}, false, nil, nil, false, true, crossSafe},
+		{"unaddressed in-chunk holder conflicts", intS, nil, false, nil, nil, true, true, crossConflict},
+		{"no out-of-range pass: foreign holder conflicts", intS, nil, false, nil, nil, false, false, crossConflict},
+		{"server-flagged holder is safe (ci key, no client order needed)", ciS, nil, true, nil, nil, false, true, crossSafe},
+		{"unflagged in-range holder on a ci key is not provable", ciS, nil, false, nil, nil, false, true, crossConflict},
+		{"unflagged holder the client orders out of range conflicts (int key)", intS, nil, false, []driver.Value{int64(1)}, []driver.Value{int64(50)}, false, true, crossConflict},
 	}
 	for _, cse := range cases {
-		v, err := run(cse.srcS, cse.targeted, cse.oorSet, cse.lo, cse.hi, cse.inChunk, cse.oorActive)
+		v, err := run(cse.srcS, cse.targeted, cse.oor, cse.lo, cse.hi, cse.inChunk, cse.oorActive)
 		if err != nil {
 			t.Errorf("%s: unexpected DB access or error: %v", cse.name, err)
 			continue
@@ -834,7 +835,7 @@ func TestCrossChunkTrackingScalesWithDelta(t *testing.T) {
 	for i := range big {
 		big[i] = op{kind: opUpdate, key: []any{int64(i)}, rows: [][]any{{int64(i), fmt.Sprint(i)}}}
 	}
-	v, err := e.crossChunkCheck(context.Background(), nil, nil, nil, nil, chunk.Chunk{}, nil, big, nil, nil, nil, true)
+	v, err := e.crossChunkCheck(context.Background(), nil, nil, nil, nil, chunk.Chunk{}, nil, big, nil, nil, chunk.Pred{}, true)
 	if err != nil {
 		t.Fatalf("cap guard must not error without a database: %v", err)
 	}
@@ -861,7 +862,7 @@ func BenchmarkCrossChunkEscalateLargeDelta(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if v, _ := e.crossChunkCheck(context.Background(), nil, nil, nil, nil, chunk.Chunk{}, nil, ops, nil, nil, nil, true); v != crossConflict {
+		if v, _ := e.crossChunkCheck(context.Background(), nil, nil, nil, nil, chunk.Chunk{}, nil, ops, nil, nil, chunk.Pred{}, true); v != crossConflict {
 			b.Fatal("expected escalation")
 		}
 	}

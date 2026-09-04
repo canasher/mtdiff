@@ -48,7 +48,7 @@ func init() {
 	f.IntVar(&syncOpt.sampleLimit, "sample-limit", 0, "sample SQL statements shown per table in a dry-run (default 5)")
 	f.BoolVar(&syncOpt.noSyncSchema, "no-sync-schema", false, "do not align the destination table structure before the data sync (default: structure is synced first, shown in the dry run)")
 	f.BoolVar(&syncOpt.structTruncate, "allow-structure-truncate", false, "if the in-place structure ALTER fails, truncate the destination table and re-apply the DDL on it (default: the failure stops the table with its data preserved)")
-	f.BoolVar(&syncOpt.rowRewrite, "allow-row-rewrite", false, "permit the destructive row rewrite (DELETE+INSERT) for a unique-value swap/cycle/holder, and the full resync for a cross-chunk swap (default: the table is refused, because the rewrite fires FK/trigger side effects)")
+	f.BoolVar(&syncOpt.rowRewrite, "allow-row-rewrite", false, "permit the destructive row rewrite (DELETE+INSERT) for a unique-value swap/cycle/holder (default: the table is refused, because the rewrite fires FK/trigger side effects). It authorizes the row rewrite only: a cross-chunk swap becomes a full-resync plan (TRUNCATE + reload), which the apply executes only when the confirmed plan showed that TRUNCATE — a confirmed row-level plan never escalates to it in the same run")
 	rootCmd.AddCommand(syncCmd)
 }
 
@@ -207,14 +207,17 @@ func syncRunE(cmd *cobra.Command, _ []string) error {
 		return syncDryRunExit(syncResults)
 	}
 
-	// Apply: decide the plan for everything first (the plans drive the
-	// confirmation summary), then confirm before any write connection
-	// exists. Only the decision is computed here (no row re-scan):
-	// ApplyTable re-plans and rescans right before writing, so planning
-	// the ops now would scan the differing chunks twice for nothing.
+	// Apply: plan everything first (the plans drive the confirmation
+	// summary), then confirm before any write connection exists. The
+	// plan here is the PREFLIGHT, not a decision shortcut: it runs the
+	// same row planning the apply re-runs, so the destructive scope the
+	// user confirms (a full resync with its TRUNCATE, a row rewrite) is
+	// computed from a real plan. ApplyTable re-plans right before
+	// writing and may only stay within the confirmed scope — the
+	// preflight's extra scan is deliberate (safety over speed).
 	dataPlans := make([]msync.TableSync, len(results))
 	for i, r := range results {
-		dataPlans[i] = runner.PlanSummary(ctx, r)
+		dataPlans[i] = runner.PlanTable(ctx, r)
 	}
 	allPlans := append(append([]msync.TableSync{}, dataPlans...), dropPlans...)
 	// a plan that is an argument error (e.g. keyless + --where) stops the
@@ -255,7 +258,9 @@ func syncRunE(cmd *cobra.Command, _ []string) error {
 			syncResults = append(syncResults, dataPlans[i])
 			continue
 		}
-		ts := runner.ApplyTable(ctx, r, ap)
+		// dataPlans[i] is the CONFIRMED plan (preflight): the apply may
+		// shrink it but not expand its destructive scope
+		ts := runner.ApplyTable(ctx, r, ap, dataPlans[i])
 		syncResults = append(syncResults, ts)
 		if ts.Status == "APPLIED" {
 			synced = append(synced, ts.Name)
@@ -398,10 +403,13 @@ func allSkip(plans []msync.TableSync) bool {
 // sync would do, and the destructive statements (DROP TABLE, DROP
 // COLUMN, DROP INDEX, DROP PRIMARY KEY) listed separately — they are the
 // irreversible ones and must not be hidden behind "N statements will be
-// executed".
+// executed". The destructive row rewrites (DELETE+INSERT to free a
+// unique slot) get their own section: they touch rows the user did not
+// ask to change, and they run only because this very summary showed
+// them (P0-3).
 func syncSummary(plans []msync.TableSync) string {
 	var full, row, skip, create, drop, state, stateNote, fail int
-	var names, destructive []string
+	var names, destructive, rewrites []string
 	for _, p := range plans {
 		switch p.Mode {
 		case "SKIP":
@@ -416,6 +424,9 @@ func syncSummary(plans []msync.TableSync) string {
 		case "ROWLEVEL":
 			row++
 			names = append(names, p.Name)
+			if p.Rewrites > 0 {
+				rewrites = append(rewrites, fmt.Sprintf("%s (%d row group(s))", p.Name, p.Rewrites))
+			}
 		case "CREATE":
 			create++
 			names = append(names, p.Name+" (create table)")
@@ -447,9 +458,18 @@ func syncSummary(plans []msync.TableSync) string {
 	if len(names) > 0 {
 		summary += ": " + strings.Join(names, ", ")
 	}
+	if syncOpt.structTruncate {
+		summary += "\nNOTE: --allow-structure-truncate is set — if an in-place structure ALTER fails, the destination table is TRUNCATED and the DDL re-applied on the empty table"
+	}
 	if len(destructive) > 0 {
 		summary += fmt.Sprintf("\nDESTRUCTIVE: %d irreversible statement(s) will be executed:", len(destructive))
 		for _, s := range destructive {
+			summary += "\n  " + s
+		}
+	}
+	if len(rewrites) > 0 {
+		summary += fmt.Sprintf("\nDESTRUCTIVE ROW REWRITE: %d table(s) will DELETE and re-INSERT whole row groups to free unique slots (FK/trigger side effects fire on rows the sync did not otherwise touch):", len(rewrites))
+		for _, s := range rewrites {
 			summary += "\n  " + s
 		}
 	}

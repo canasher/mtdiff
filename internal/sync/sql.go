@@ -351,6 +351,63 @@ func (b *Builder) DeleteExec(keyVals []any) (string, []any) {
 		conn.QuoteIdent(b.Table), where), args
 }
 
+// DeleteBatchExec is the parameterized DELETE for a BATCH of destination
+// key rows (P2): one statement instead of one round trip per row. Each
+// key is the row's raw key values in key order.
+//
+// A single-column key renders IN (?...): MySQL's IN never matches NULL,
+// so a NULL key travels as a separate "OR k IS NULL" term (a batch of
+// nothing but NULLs is that term alone — every row of a unique key is
+// distinct, so the term addresses exactly the batch). A composite key
+// renders the OR of the per-row AND tuples (keyWhereExec, IS NULL for a
+// NULL component), because IN takes single values only.
+//
+// The caller bounds the batch (deleteBatchCap: the configured batch and
+// the bind-parameter budget); the statement text carries no data, only
+// placeholders (P0-3).
+func (b *Builder) DeleteBatchExec(keys [][]any) (string, []any, error) {
+	if len(b.keyIdx) == 0 {
+		panic("sync: Delete on a keyless table")
+	}
+	if len(keys) == 0 {
+		return "", nil, errors.New("empty DELETE batch")
+	}
+	if len(b.keyIdx) == 1 {
+		id := conn.QuoteIdent(b.Cols[b.keyIdx[0]])
+		fam := b.cols[b.keyIdx[0]].Family
+		terms := make([]string, 0, len(keys))
+		args := make([]any, 0, len(keys))
+		nulls := 0
+		for _, k := range keys {
+			if len(k) == 0 || k[0] == nil {
+				nulls++
+				continue
+			}
+			terms = append(terms, "?")
+			args = append(args, bindArg(fam, k[0]))
+		}
+		var cond string
+		switch {
+		case len(terms) == 0:
+			cond = id + " IS NULL"
+		case nulls > 0:
+			cond = id + " IN (" + strings.Join(terms, ", ") + ") OR " + id + " IS NULL"
+		default:
+			cond = id + " IN (" + strings.Join(terms, ", ") + ")"
+		}
+		return fmt.Sprintf("DELETE FROM %s WHERE %s", conn.QuoteIdent(b.Table), cond), args, nil
+	}
+	terms := make([]string, len(keys))
+	args := make([]any, 0, len(keys)*len(b.keyIdx))
+	for i, k := range keys {
+		where, wargs := b.keyWhereExec(k)
+		terms[i] = "(" + where + ")"
+		args = append(args, wargs...)
+	}
+	return fmt.Sprintf("DELETE FROM %s WHERE %s",
+		conn.QuoteIdent(b.Table), strings.Join(terms, " OR ")), args, nil
+}
+
 // keyWhereExec is keyWhere's parameterized twin: one "? = ?" term per key
 // component, IS NULL for a NULL component.
 func (b *Builder) keyWhereExec(keyVals []any) (string, []any) {

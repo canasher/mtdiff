@@ -23,6 +23,13 @@ type Stats struct {
 	Deletes   int
 	Chunks    int
 	Error     string
+	// MaxBufferedDeleteKeys is the peak number of destination key
+	// vectors held at once in a streaming delete pass (the O(chunk)/
+	// O(batch) bound — it must stay at the batch size, not grow with
+	// the table). MaxBufferedOps is the peak ops buffered for one
+	// chunk group (the ordinary-row-level O(chunk-delta) bound).
+	MaxBufferedDeleteKeys int
+	MaxBufferedOps        int
 }
 
 // Applier executes sync statements on the destination's dedicated write
@@ -94,6 +101,25 @@ func (a *Applier) resync(ctx context.Context, st *Stats, b *Builder, schema *con
 	}
 }
 
+// deleteBatchCap is the key-row limit of one batched DELETE (P2): the
+// configured batch, further capped by the bind-parameter budget — a
+// key batch binds one placeholder per key COMPONENT, so a composite
+// key of k columns shrinks the batch to maxBindParams/k. The floor is
+// 1: even a key wider than the whole budget deletes one row per
+// statement rather than failing.
+func deleteBatchCap(batch, keyCols int) int {
+	cap := batch
+	if keyCols > 0 {
+		if c := maxBindParams / keyCols; cap > c {
+			cap = c
+		}
+	}
+	if cap < 1 {
+		cap = 1
+	}
+	return cap
+}
+
 // batchCap is the row limit of one multi-row INSERT (P2-3): the
 // configured Batch, further capped by the bind-parameter budget
 // (maxBindParams / writable columns) — a wide table shrinks its batch
@@ -119,9 +145,12 @@ func (a *Applier) batchCap(b *Builder) (int, error) {
 
 // ApplyOps runs the ROWLEVEL mode over the ops grouped by chunk: one
 // transaction per group, so a failure rolls back that group's writes only
-// and the counters count committed rows only. Within a group, DELETEs and
-// UPDATEs execute one statement at a time in engine order (a key group's
-// deletes precede its inserts, keeping unique slots free), INSERTs are
+// and the counters count committed rows only. Within a group, DELETEs
+// accumulate into a batch and execute as one statement (DeleteBatchExec,
+// no per-row round trip — P2), flushed before the first non-delete op
+// (a key group's deletes still precede its inserts, keeping unique slots
+// free; a rewrite's re-inserts run only after its own deletes), UPDATEs
+// execute one statement at a time in engine order, and INSERTs are
 // batched as multi-row statements and flushed on the batch limits (row
 // count, or rendered bytes to protect max_allowed_packet) or at the end.
 func (a *Applier) ApplyOps(ctx context.Context, st *Stats, b *Builder, chunked [][]op) {
@@ -130,6 +159,7 @@ func (a *Applier) ApplyOps(ctx context.Context, st *Stats, b *Builder, chunked [
 		st.Error = err.Error()
 		return
 	}
+	delCap := deleteBatchCap(batch, len(b.keyIdx))
 	step := len(chunked) / 10
 	if step < 1 {
 		step = 1
@@ -138,98 +168,167 @@ func (a *Applier) ApplyOps(ctx context.Context, st *Stats, b *Builder, chunked [
 		if len(ops) == 0 {
 			continue
 		}
-		var ins, upd, del int
+		c := &groupCounts{}
 		err := a.applyTx(ctx, func(tx *sql.Tx) error {
-			var pending [][]any
-			var pendingBytes int
-			flush := func() error {
-				if len(pending) == 0 {
-					return nil
-				}
-				// the executable INSERT is parameterized (P0-3): the
-				// values travel as bound arguments, never rendered into
-				// the statement text
-				stmt, args, err := b.InsertBatchExec(pending)
-				if err != nil {
-					return err
-				}
-				if _, err := tx.ExecContext(ctx, stmt, args...); err != nil {
-					return err
-				}
-				ins += len(pending)
-				pending = nil
-				pendingBytes = 0
-				return nil
-			}
-			addInsert := func(row []any) error {
-				rb := b.rowBytes(row)
-				if a.MaxBytes > 0 && len(pending) == 0 && rb > a.MaxBytes {
-					return fmt.Errorf("a single row renders to %d bytes, over the %d-byte budget: raise --max-allowed-packet", rb, a.MaxBytes)
-				}
-				if len(pending) > 0 && (len(pending) >= batch || (a.MaxBytes > 0 && pendingBytes+rb > a.MaxBytes)) {
-					if err := flush(); err != nil {
-						return err
-					}
-				}
-				pending = append(pending, row)
-				pendingBytes += rb
-				return nil
-			}
-			for _, o := range ops {
-				switch o.kind {
-				case opDelete:
-					stmt, args := b.DeleteExec(o.key)
-					if _, err := tx.ExecContext(ctx, stmt, args...); err != nil {
-						return err
-					}
-					del++
-				case opUpdate:
-					stmt, args := b.UpdateExec(o.key, o.rows[0])
-					if _, err := tx.ExecContext(ctx, stmt, args...); err != nil {
-						return err
-					}
-					upd++
-				case opRewrite:
-					// the unique-value-swap protection rewrites a no-op
-					// holder: delete the whole destination group, then
-					// re-insert the same rows (carried in the op, read
-					// from the source). Every row's raw key is deleted —
-					// the group's rows can carry distinct raw keys that
-					// only fold together under the normalizer, so a
-					// single-key delete would leave the rest behind.
-					for _, k := range o.delKeys {
-						stmt, args := b.DeleteExec(k)
-						if _, err := tx.ExecContext(ctx, stmt, args...); err != nil {
-							return err
-						}
-						del++
-					}
-					for _, row := range o.rows {
-						if err := addInsert(row); err != nil {
-							return err
-						}
-					}
-				case opInsert:
-					if err := addInsert(o.rows[0]); err != nil {
-						return err
-					}
-				}
-			}
-			return flush()
+			return runOpsGroup(ops, b, batch, delCap, a.MaxBytes, st, c,
+				func(stmt string, args ...any) (sql.Result, error) {
+					return tx.ExecContext(ctx, stmt, args...)
+				})
 		})
 		if err != nil {
 			st.Error = fmt.Sprintf("chunk group %d: %v", gi, err)
 			return
 		}
-		st.Inserts += ins
-		st.Updates += upd
-		st.Deletes += del
+		st.Inserts += c.ins
+		st.Updates += c.upd
+		st.Deletes += c.del
 		st.Chunks++
 		if a.Progress != nil && (gi+1)%step == 0 {
 			a.Progress("  %-24s row-level %3d%% (%d/%d chunks, %d rows written)", st.Table,
 				100*(gi+1)/len(chunked), gi+1, len(chunked), st.Inserts+st.Updates+st.Deletes)
 		}
 	}
+}
+
+// groupCounts is one chunk group's committed counters, credited to the
+// Stats only after the group's transaction commits.
+type groupCounts struct {
+	ins, upd, del int
+}
+
+// runOpsGroup executes one chunk group's ops through exec (one bound
+// statement per flush) in the engine order that keeps unique slots free:
+// DELETEs accumulate into a batch and run as one statement (DeleteBatchExec
+// — no per-row round trip, P2), flushed at the cap, before the first
+// non-delete op, and before a rewrite's re-inserts (they need the slots
+// the deletes free); UPDATEs run one statement at a time; INSERTs batch
+// and flush on the row-count and rendered-bytes limits (max_allowed_packet)
+// or at the end.
+//
+// exec is the statement seam: production passes the group transaction's
+// ExecContext, a failing exec stops the group (the caller rolls the
+// transaction back — the completed groups before it stand), and the tests
+// pass a recorder. c is credited per successful statement; st.MaxBuffered
+// DeleteKeys tracks the widest delete batch actually run.
+func runOpsGroup(ops []op, b *Builder, batch, delCap, maxBytes int, st *Stats, c *groupCounts, exec func(string, ...any) (sql.Result, error)) error {
+	var pending [][]any
+	var pendingBytes int
+	flush := func() error {
+		if len(pending) == 0 {
+			return nil
+		}
+		// the executable INSERT is parameterized (P0-3): the values
+		// travel as bound arguments, never rendered into the statement
+		// text
+		stmt, args, err := b.InsertBatchExec(pending)
+		if err != nil {
+			return err
+		}
+		if _, err := exec(stmt, args...); err != nil {
+			return err
+		}
+		c.ins += len(pending)
+		pending = nil
+		pendingBytes = 0
+		return nil
+	}
+	addInsert := func(row []any) error {
+		rb := b.rowBytes(row)
+		if maxBytes > 0 && len(pending) == 0 && rb > maxBytes {
+			return fmt.Errorf("a single row renders to %d bytes, over the %d-byte budget: raise --max-allowed-packet", rb, maxBytes)
+		}
+		if len(pending) > 0 && (len(pending) >= batch || (maxBytes > 0 && pendingBytes+rb > maxBytes)) {
+			if err := flush(); err != nil {
+				return err
+			}
+		}
+		pending = append(pending, row)
+		pendingBytes += rb
+		return nil
+	}
+	var delBatch [][]any
+	flushDeletes := func() error {
+		if len(delBatch) == 0 {
+			return nil
+		}
+		cur := delBatch
+		delBatch = delBatch[:0]
+		if len(cur) > st.MaxBufferedDeleteKeys {
+			st.MaxBufferedDeleteKeys = len(cur)
+		}
+		stmt, args, err := b.DeleteBatchExec(cur)
+		if err != nil {
+			return err
+		}
+		n, err := exec(stmt, args...)
+		if err != nil {
+			return err
+		}
+		na, _ := n.RowsAffected()
+		c.del += int(na)
+		return nil
+	}
+	for _, o := range ops {
+		switch o.kind {
+		case opDelete:
+			delBatch = append(delBatch, o.key)
+			if len(delBatch) >= delCap {
+				if err := flushDeletes(); err != nil {
+					return err
+				}
+			}
+		case opUpdate:
+			// a pending delete precedes this update in engine order:
+			// flush before it runs
+			if err := flushDeletes(); err != nil {
+				return err
+			}
+			stmt, args := b.UpdateExec(o.key, o.rows[0])
+			if _, err := exec(stmt, args...); err != nil {
+				return err
+			}
+			c.upd++
+		case opRewrite:
+			// the unique-value-swap protection rewrites a no-op holder:
+			// delete the whole destination group, then re-insert the same
+			// rows (carried in the op, read from the source). Every row's
+			// raw key is deleted — the group's rows can carry distinct
+			// raw keys that only fold together under the normalizer, so a
+			// single-key delete would leave the rest behind. The re-inserts
+			// run only after the group's own deletes (they free the unique
+			// slots).
+			if err := flushDeletes(); err != nil {
+				return err
+			}
+			for _, k := range o.delKeys {
+				delBatch = append(delBatch, k)
+				if len(delBatch) >= delCap {
+					if err := flushDeletes(); err != nil {
+						return err
+					}
+				}
+			}
+			if err := flushDeletes(); err != nil {
+				return err
+			}
+			for _, row := range o.rows {
+				if err := addInsert(row); err != nil {
+					return err
+				}
+			}
+		case opInsert:
+			if err := flushDeletes(); err != nil {
+				return err
+			}
+			if err := addInsert(o.rows[0]); err != nil {
+				return err
+			}
+		}
+	}
+	if err := flushDeletes(); err != nil {
+		return err
+	}
+	return flush()
 }
 
 // streamChunk reads one source chunk row by row and batch-INSERTs it.

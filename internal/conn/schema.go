@@ -96,6 +96,15 @@ type ColMeta struct {
 	Charset    string
 	Comment    string
 	GenExpr    string // GENERATION_EXPRESSION verbatim ("") when unreadable
+	// GenExprReadable: the backend actually reported the expression for
+	// this generated column. False means it is UNKNOWN (a backend
+	// without the information_schema column, or a failed read) — and an
+	// unknown expression can never be compared: two unknown expressions
+	// ("" == "") are not "the expressions match", they are "neither side
+	// could be read", so a readable-vs-unreadable or unreadable-vs-
+	// unreadable pair is a drift the structure sync refuses, never a
+	// silent match.
+	GenExprReadable bool
 }
 
 // Index is one key of a table: the primary key (Name "PRIMARY") or a unique
@@ -304,7 +313,10 @@ func IntrospectStructure(ctx context.Context, db *sql.DB, table string) (*Struct
 	// EXTRA above and works everywhere.
 	if exprs, err := generatedExpressions(ctx, db, table); err == nil {
 		for i := range s.Cols {
-			s.Cols[i].GenExpr = exprs[s.Cols[i].Name]
+			if expr, ok := exprs[s.Cols[i].Name]; ok {
+				s.Cols[i].GenExpr = expr
+				s.Cols[i].GenExprReadable = true
+			}
 		}
 	}
 	s.Indexes, err = structureIndexes(ctx, db, table)

@@ -2,6 +2,7 @@ package sync
 
 import (
 	"context"
+	"database/sql"
 	"database/sql/driver"
 	"errors"
 	"fmt"
@@ -36,19 +37,73 @@ type Options struct {
 	// in-place failure then stops the table with its data preserved.
 	AllowStructureTruncate bool
 	// AllowRowRewrite permits the destructive row rewrite (P0-2): when a
-	// unique-value swap, cycle, or holder conflict is detected, the
-	// affected rows are DELETEd and INSERTed again (a no-op holder is
-	// rewritten in place) so the unique slots can be freed. Off by
-	// default: such a rewrite fires FK ON DELETE CASCADE, triggers and
-	// audit logs for rows the user never asked to change, so the table
-	// is REFUSED instead (with a cross-chunk swap the refusal is the
-	// only option — the order-independent FULL resync is a destructive
-	// operation of the same kind and is likewise gated on this flag).
+	// unique-value swap, cycle, or holder conflict is detected within a
+	// chunk, the affected rows are DELETEd and INSERTed again (a no-op
+	// holder is rewritten in place) so the unique slots can be freed.
+	// Off by default: such a rewrite fires FK ON DELETE CASCADE,
+	// triggers and audit logs for rows the user never asked to change,
+	// so the table is REFUSED instead.
+	//
+	// It authorizes the row rewrite ONLY (P0-2, round 3): a cross-chunk
+	// swap still cannot be ordered row-level, so with the flag the plan
+	// becomes the order-independent FULL resync (TRUNCATE + reload) —
+	// shown in the plan and in the confirmation summary, and executed
+	// only when that FULL plan (with its TRUNCATE) is what the user
+	// confirmed. Without the flag the table is refused outright. The
+	// flag is never a blanket authorization to TRUNCATE at runtime: a
+	// confirmed row-level plan can never escalate to a full resync in
+	// the same run (the apply stops with ErrReplanRequired).
 	AllowRowRewrite bool
 	// Progress receives long-running phase updates (pre-pass scans, apply
 	// chunks, verification scans), forwarded to the comparer when the
 	// caller left Cmp.Progress unset. nil = no progress output.
 	Progress func(format string, args ...any)
+}
+
+// DestructiveScope is the set of destructive operations a plan may
+// execute. It is computed from the plan shown to the user BEFORE the
+// confirmation (the preflight runs the same row planning the apply
+// re-runs), and the apply re-plans right before writing and refuses to
+// execute anything outside it: a confirmed row-level plan can never
+// TRUNCATE, and a rewrite appears in the summary before it may run.
+type DestructiveScope struct {
+	// RowRewrite: the destructive row rewrite (DELETE+INSERT) that frees
+	// a unique slot, permitted by --allow-row-rewrite AND shown in the
+	// confirmed plan.
+	RowRewrite bool
+	// FullResync: the order-independent full resync (TRUNCATE + reload),
+	// shown in the confirmed plan (a keyless table, a stale or
+	// cross-chunk plan with --allow-row-rewrite, or a structure repair
+	// that ends on the full load).
+	FullResync bool
+}
+
+// scopeGate judges the re-plan's destructive part against the CONFIRMED
+// plan (P0). It returns the human-readable description of what the
+// re-plan needs beyond the confirmed scope — the caller then stops the
+// table (ErrReplanRequired, zero destructive statements executed) — or
+// "" when the re-plan is within the confirmed scope.
+//
+// The two destructive axes are checked separately:
+//
+//   - the full resync: a re-plan that needs the TRUNCATE runs only when
+//     the confirmed plan is the one that showed it (a confirmed
+//     row-level plan can never TRUNCATE in the same run — P0-1);
+//   - the rewrites: the re-plan's destructive rewrite count may not
+//     exceed what the confirmed plan SHOWED (a plan that showed 2
+//     rewrite groups may not run 5: the difference means data moved,
+//     and the new plan needs a fresh confirmation). Shrinking — fewer
+//     rewrites, a full plan that no longer needs the TRUNCATE — always
+//     passes: it never touches rows the confirmed plan would not.
+func scopeGate(mode Mode, w rowWork, confirmed TableSync) string {
+	switch {
+	case mode == ModeFull && !confirmed.Scope.FullResync:
+		return "the full resync (TRUNCATE + reload)"
+	case mode == ModeRowLevel && w.rewrites > confirmed.Rewrites:
+		return fmt.Sprintf("%d destructive row rewrite group(s) (DELETE+INSERT); the confirmed plan showed %d",
+			w.rewrites, confirmed.Rewrites)
+	}
+	return ""
 }
 
 // TableSync is the per-table outcome of a sync run.
@@ -58,13 +113,23 @@ type TableSync struct {
 	// "CREATE" (the destination table is missing and is created) |
 	// "DROP" (a destination-only table is dropped, whole-database mode) |
 	// "STATE" (only the table state, AUTO_INCREMENT, is realigned).
-	Mode      string
-	SrcRows   int64
-	DstRows   int64
-	Inserts   int
-	Updates   int
-	Deletes   int
-	Chunks    int
+	Mode    string
+	SrcRows int64
+	DstRows int64
+	Inserts int
+	Updates int
+	Deletes int
+	Chunks  int
+	// Rewrites is the number of destructive row-rewrite groups (P0-3):
+	// row groups the sync deletes and re-inserts to free a unique slot.
+	// It is 0 for a plan that rewrites nothing, and the confirmation
+	// summary lists it separately — a rewrite is the one kind of
+	// statement that touches rows the user did not ask to change.
+	Rewrites int
+	// Scope is the destructive scope the plan was CONFIRMED with: the
+	// preflight's (read-only) plan, computed before the confirmation
+	// prompt. The apply re-plans and must stay within it.
+	Scope     DestructiveScope
 	Truncated bool
 	SampleSQL []string
 	// SchemaChanged is set when the destination's structure drifted from
@@ -112,6 +177,21 @@ var ErrMisconfigured = errors.New("sync misconfiguration")
 // destination — the CLI reports it and exits non-zero, but the message
 // tells the operator exactly which flag lifts it.
 var errUniqueRewriteRefused = errors.New("unique-value conflict requires the destructive row rewrite, which is not permitted")
+
+// ErrReplanRequired marks a table the apply STOPPED because its
+// re-planned operations exceed the destructive scope the user confirmed
+// (P0): the apply-time plan needs a destructive operation the confirmed
+// plan did not show. No destructive escalation is executed — the table
+// is left as-is (already-applied earlier tables are kept) and the
+// operator re-runs so the new plan is reviewed and confirmed like any
+// first plan.
+var ErrReplanRequired = errors.New("the apply-time plan requires a destructive operation that was not part of the confirmed plan; no destructive escalation was executed. Re-run the dry-run/apply so the new plan can be reviewed and confirmed")
+
+// ErrFullResyncRequired marks the specific condition behind a replan
+// refusal: the re-plan (a stale row plan, or a cross-chunk unique swap)
+// needs the order-independent full resync (TRUNCATE + reload). It is
+// wrapped by ErrReplanRequired when the confirmed scope lacks it.
+var ErrFullResyncRequired = errors.New("the table requires the order-independent full resync (TRUNCATE + reload)")
 
 // Runner drives a sync run between two open sides.
 type Runner struct {
@@ -553,31 +633,78 @@ func (r *Runner) prepare(ctx context.Context, res compare.TableResult) (*prep, e
 	return p, nil
 }
 
-// RowOps computes the row-level operations for a planned table: it re-plans
-// on the source (with the freshly recounted source row count, not the
-// pre-pass one — a source that grew in between must not silently turn the
-// re-plan into a handful of over-sized chunks) and buffers both sides of
-// the planned chunks only (the pre-pass already proved the matching chunks
-// identical). When the pre-pass planned no chunks (row counts differ,
-// planning was short-circuited) the differing chunks are unknown and every
-// chunk is rescaned.
+// rowWorkKind selects the execution path of the row-level work.
+type rowWorkKind int
+
+const (
+	rowWorkNone      rowWorkKind = iota // nothing to do
+	rowWorkChunks                       // the ordinary path: the differing chunks' ops
+	rowWorkDstDelete                    // empty source match set: stream-delete the destination's
+	// match set, chunk by chunk
+)
+
+// rowWork is the READ-ONLY plan of one table's row-level work: what the
+// preflight shows the user (and what the confirmation covers) and what
+// the apply re-plans through the very same function before writing.
 //
-// It returns the ops grouped by chunk (in chunk order): the applier commits
-// one transaction per group, so a mid-apply failure rolls back that group's
-// writes only.
+// Memory model: the ordinary path buffers ONLY the differing chunks
+// (O(delta) — a table with a few changed chunks holds just those rows).
+// The two large-delete paths buffer nothing per row: an empty-source
+// match set is streamed away chunk by chunk (O(chunk)), and the
+// out-of-range rows are streamed away by keyset pagination (O(batch)).
+// The one residual is a fully diverged table, where the differing
+// chunks are the whole table and the ops buffer every row — the
+// documented maximum of the ordinary path.
+type rowWork struct {
+	kind rowWorkKind
+	// rowWorkChunks: the differing chunks' ops, in chunk order (the
+	// applier commits one transaction per chunk group).
+	ops [][]op
+	// dstDel is the destination match-set row count (rowWorkDstDelete):
+	// the executor streams the deletes in chunk/batch-sized
+	// transactions — the count comes from the COUNT, not a key scan.
+	dstDel int64
+	// oorDel is the destination row count strictly OUTSIDE the source's
+	// key range (a COUNT, not a scan): the executor streams them away
+	// in batch-sized transactions BEFORE any in-range write.
+	oorDel int64
+	// rewrites is the number of destructive row-rewrite groups the plan
+	// shows (0 when the plan rewrites nothing).
+	rewrites int
+	// maxChunkOps is the largest single chunk group's op count (the
+	// ordinary path's per-group memory peak, O(chunk delta)).
+	maxChunkOps int
+}
+
+// PlanRowWork computes the READ-ONLY row-level plan for a planned
+// table: it re-plans on the source (with the freshly recounted source
+// row count, not the pre-pass one — a source that grew in between must
+// not silently turn the re-plan into a handful of over-sized chunks)
+// and buffers both sides of the planned chunks only (the pre-pass
+// already proved the matching chunks identical). When the pre-pass
+// planned no chunks the differing chunks are unknown and every chunk is
+// rescaned.
 //
-// When the source re-plans to no chunk but the destination still has rows
-// (only possible with a --where filter: zero source matches, N destination
-// matches), the destination side is re-planned instead and every
-// destination row is deleted: a filtered table cannot be truncated, so its
-// only path to convergence is emptying the destination's match set.
+// It returns the work to execute (ApplyRowWork) without writing
+// anything: the preflight calls it for the confirmation summary, and
+// the apply calls it right before writing — the same plan, so the
+// destructive scope the user confirmed is the one the apply checks
+// against (P0-3).
 //
-// After the chunk ops, the destination is scanned once for rows whose key
-// falls strictly outside the source's key range (the chunks never cover
-// them) and each is deleted individually (outOfRangeDeletes). Without a
-// filter this keeps the first round from escalating to a full resync; with
-// a filter it is the only path to convergence for out-of-range rows.
-func (r *Runner) RowOps(ctx context.Context, p *prep, res compare.TableResult, freshSrc, freshDst int64) ([][]op, error) {
+// When the source re-plans to no chunk but the destination still has
+// rows (only possible with a --where filter: zero source matches, N
+// destination matches), the work is rowWorkDstDelete: the executor
+// stream-deletes the destination's match set chunk by chunk (a
+// filtered table cannot be truncated, so its only path to
+// convergence is emptying the match set).
+//
+// Rows whose key falls strictly outside the source's key range are
+// never covered by the in-range chunks; the plan counts them (COUNT,
+// not a scan) and the executor stream-deletes them first, in
+// batch-sized transactions. Without a filter this keeps the first
+// round from escalating to a full resync; with a filter it is the
+// only path to convergence for out-of-range rows.
+func (r *Runner) PlanRowWork(ctx context.Context, p *prep, res compare.TableResult, freshSrc, freshDst int64) (rowWork, error) {
 	planner := chunk.Planner{
 		Table:       res.Name,
 		KeyCols:     p.srcS.Key,
@@ -587,13 +714,17 @@ func (r *Runner) RowOps(ctx context.Context, p *prep, res compare.TableResult, f
 	}
 	chunks, err := planner.Plan(ctx, r.Src.Ctl(), freshSrc)
 	if err != nil {
-		return nil, fmt.Errorf("re-plan: %w", err)
+		return rowWork{}, fmt.Errorf("re-plan: %w", err)
 	}
 	if len(chunks) == 0 {
 		if freshDst <= 0 {
-			return nil, nil
+			return rowWork{kind: rowWorkNone}, nil
 		}
-		return r.dstDeletes(ctx, p, freshDst)
+		// the destination match set is the whole work. The executor
+		// streams it (COUNT + chunk-sized key scans + batched
+		// DELETEs); the plan scans no keys at all — a 100M-row match
+		// set is not scanned for a count.
+		return rowWork{kind: rowWorkDstDelete, dstDel: freshDst}, nil
 	}
 	byID := make(map[int]chunk.Chunk, len(chunks))
 	for _, ch := range chunks {
@@ -606,7 +737,7 @@ func (r *Runner) RowOps(ctx context.Context, p *prep, res compare.TableResult, f
 			if !ok {
 				// the pre-pass saw a differing chunk that the re-plan no
 				// longer produces: data moved between the two passes
-				return nil, errEscalateFull
+				return rowWork{}, errEscalateFull
 			}
 			targets = append(targets, ch)
 		}
@@ -614,6 +745,7 @@ func (r *Runner) RowOps(ctx context.Context, p *prep, res compare.TableResult, f
 		targets = chunks
 	}
 	out := make([][]op, 0, len(targets))
+	var maxChunkOps int
 	// Unique-constraint verification (P0-2 / P1-5 / P1-6). In-chunk: a
 	// swap, cycle or holder conflict needs the destructive row rewrite
 	// (DELETE+INSERT), refused unless --allow-row-rewrite is set.
@@ -625,38 +757,45 @@ func (r *Runner) RowOps(ctx context.Context, p *prep, res compare.TableResult, f
 	// it — a filtered table can never be fully resynced, so there it
 	// always refuses).
 	filtered := r.o.Cmp.Where != ""
+	// oorActive: the UNFILTERED out-of-range pass runs (keyed on both
+	// sides, keys agreeing). It is the one server-side proof a
+	// foreign out-of-range unique holder can be deleted before any
+	// in-range write (see crossChunkCheck / classifyHolder).
 	oorActive := !filtered && len(p.srcS.Key) > 0 && len(p.dstS.Key) > 0 && keyAgree(p.srcS, p.dstS)
+	// The source's key extremes (--where applied): the cross-chunk
+	// holder check's global range and the out-of-range pass's bounds,
+	// read once.
 	var loV, hiV []driver.Value
-	if len(p.e.uc) > 0 {
+	oorPass := freshSrc > 0 && len(p.srcS.Key) > 0 && len(p.dstS.Key) > 0 && keyAgree(p.srcS, p.dstS)
+	if len(p.e.uc) > 0 || oorPass {
 		minV, maxV, err := planner.Extremes(ctx, r.Src.Ctl())
 		if err != nil {
-			return nil, fmt.Errorf("key extremes: %w", err)
+			return rowWork{}, fmt.Errorf("key extremes: %w", err)
 		}
 		loV, hiV = minV, maxV
 	}
-	// The out-of-range pass is scanned BEFORE the chunk loop: its result
-	// is the authoritative (server-side) answer to "is this foreign
-	// unique holder deleted before any in-range write", and the per-chunk
-	// unique check consults it instead of re-deriving the key order
-	// client-side (a case-insensitive or a decimal key order cannot be
-	// reproduced by the client, but the scan can be trusted either way).
-	oor, err := r.outOfRangeDeletes(ctx, p, freshSrc)
-	if err != nil {
-		return nil, fmt.Errorf("out-of-range scan: %w", err)
-	}
-	oorSet := make(map[string]bool, len(oor))
-	if len(oor) > 0 {
-		buf := make([]byte, 0, 256)
-		for _, grp := range oor {
-			for _, o := range grp {
-				id, err := p.e.dstKey.Normalize(o.key, buf)
-				if err != nil {
-					return nil, fmt.Errorf("out-of-range delete: %w", err)
-				}
-				oorSet[string(id)] = true
-				buf = id[:0]
-			}
+	// The out-of-range row count (COUNT, not a scan): the executor
+	// stream-deletes these rows FIRST (before any in-range write) — the
+	// in-range chunks only cover the source's key span, yet an
+	// out-of-range destination row can still block an in-range INSERT
+	// (it can hold a unique value an in-range row takes). Deleting only
+	// frees unique slots, so committing them before any in-range write
+	// makes the sequence collision-free.
+	var oorDel int64
+	if oorPass && loV != nil && hiV != nil {
+		oorDel, err = r.countOOR(ctx, p, loV, hiV)
+		if err != nil {
+			return rowWork{}, fmt.Errorf("out-of-range count: %w", err)
 		}
+	}
+	// The out-of-range flag the holders query carries per row (the
+	// UNFILTERED pass only — a filtered pass cannot prove an unfiltered
+	// holder is removed): the same parameterized predicate the delete
+	// pass scans with, so a flag-marked holder is provably deleted
+	// before any in-range write.
+	var oorFlag chunk.Pred
+	if len(p.e.uc) > 0 && oorActive && loV != nil && hiV != nil {
+		oorFlag, _ = r.oorPredicate(p, loV, hiV)
 	}
 	// One scan connection per side for the whole table (P2-1): the
 	// per-chunk scans reuse them instead of churning the pool, and a
@@ -664,12 +803,12 @@ func (r *Runner) RowOps(ctx context.Context, p *prep, res compare.TableResult, f
 	// it) with the chunk retried once.
 	srcCn, err := r.Src.AcquireScan(ctx)
 	if err != nil {
-		return nil, err
+		return rowWork{}, err
 	}
 	defer func() { srcCn.Close() }()
 	dstCn, err := r.Dst.AcquireScan(ctx)
 	if err != nil {
-		return nil, err
+		return rowWork{}, err
 	}
 	defer func() { dstCn.Close() }()
 	for _, ch := range targets {
@@ -677,113 +816,177 @@ func (r *Runner) RowOps(ctx context.Context, p *prep, res compare.TableResult, f
 		if err != nil && conn.DeadConn(err) {
 			srcCn.Close()
 			if srcCn, err = r.Src.AcquireScan(ctx); err != nil {
-				return nil, fmt.Errorf("src chunk %d: re-acquire scan connection: %w", ch.ID, err)
+				return rowWork{}, fmt.Errorf("src chunk %d: re-acquire scan connection: %w", ch.ID, err)
 			}
 			srcM, err = p.e.scanSideConn(ctx, srcCn, p.srcS, p.e.srcRow, p.e.srcKey, ch, r.o.Cmp.Where)
 		}
 		if err != nil {
-			return nil, fmt.Errorf("src chunk %d: %w", ch.ID, err)
+			return rowWork{}, fmt.Errorf("src chunk %d: %w", ch.ID, err)
 		}
 		dstM, err := p.e.scanSideConn(ctx, dstCn, p.dstS, p.e.dstRow, p.e.dstKey, ch, r.o.Cmp.Where)
 		if err != nil && conn.DeadConn(err) {
 			dstCn.Close()
 			if dstCn, err = r.Dst.AcquireScan(ctx); err != nil {
-				return nil, fmt.Errorf("dst chunk %d: re-acquire scan connection: %w", ch.ID, err)
+				return rowWork{}, fmt.Errorf("dst chunk %d: re-acquire scan connection: %w", ch.ID, err)
 			}
 			dstM, err = p.e.scanSideConn(ctx, dstCn, p.dstS, p.e.dstRow, p.e.dstKey, ch, r.o.Cmp.Where)
 		}
 		if err != nil {
-			return nil, fmt.Errorf("dst chunk %d: %w", ch.ID, err)
+			return rowWork{}, fmt.Errorf("dst chunk %d: %w", ch.ID, err)
 		}
 		ops, rewrite := p.e.Diff(srcM, dstM)
 		if rewrite && !r.o.AllowRowRewrite {
-			return nil, fmt.Errorf("%w: table %s has a unique-value conflict (a swap, cycle or holder) that per-row writes cannot order; converging it requires a destructive row rewrite (DELETE+INSERT), which is disabled by default because FK/trigger side effects cannot be proven safe — re-run with --allow-row-rewrite to permit it",
+			return rowWork{}, fmt.Errorf("%w: table %s has a unique-value conflict (a swap, cycle or holder) that per-row writes cannot order; converging it requires a destructive row rewrite (DELETE+INSERT), which is disabled by default because FK/trigger side effects cannot be proven safe — re-run with --allow-row-rewrite to permit it",
 				errUniqueRewriteRefused, res.Name)
 		}
 		if len(p.e.uc) > 0 {
-			v, err := p.e.crossChunkCheck(ctx, r.Src, r.Dst, p.srcS, p.dstS, ch, dstM, ops, loV, hiV, oorSet, oorActive)
+			v, err := p.e.crossChunkCheck(ctx, r.Src, r.Dst, p.srcS, p.dstS, ch, dstM, ops, loV, hiV, oorFlag, oorActive)
 			if err != nil {
-				return nil, fmt.Errorf("unique holder check, chunk %d: %w", ch.ID, err)
+				return rowWork{}, fmt.Errorf("unique holder check, chunk %d: %w", ch.ID, err)
 			}
 			switch v {
 			case crossConflict:
 				if !r.o.AllowRowRewrite {
-					return nil, fmt.Errorf("%w: table %s swaps a unique value between rows of different chunks (chunk %d); no row-level order applies it safely, and the order-independent full resync is a destructive operation — re-run with --allow-row-rewrite to permit it",
+					return rowWork{}, fmt.Errorf("%w: table %s swaps a unique value between rows of different chunks (chunk %d); no row-level order applies it safely. Re-run with --allow-row-rewrite to plan the order-independent full resync (shown in the plan and confirmed before it runs)",
 						errUniqueRewriteRefused, res.Name, ch.ID)
 				}
-				return nil, fmt.Errorf("table %s swaps a unique value between rows of different chunks (chunk %d): row-level writes cannot order this safely, escalating to a full resync: %w",
+				// With the flag the table's plan becomes the order-
+				// independent FULL resync. The flag authorizes planning
+				// it — not executing it blindly: the apply runs it only
+				// when the FULL plan (with its TRUNCATE) is what the
+				// user confirmed, otherwise it stops the table (P0-2).
+				return rowWork{}, fmt.Errorf("table %s swaps a unique value between rows of different chunks (chunk %d): row-level writes cannot order this safely; the plan becomes the full resync (TRUNCATE + reload), which the apply executes only if the confirmed plan showed it: %w",
 					res.Name, ch.ID, errEscalateFull)
 			case crossDuplicate:
-				return nil, fmt.Errorf("table %s: the source holds one unique value in two different rows; the destination's unique index cannot hold both — fix the source data before syncing", res.Name)
+				return rowWork{}, fmt.Errorf("table %s: the source holds one unique value in two different rows; the destination's unique index cannot hold both — fix the source data before syncing", res.Name)
 			}
 		}
 		out = append(out, ops)
+		if len(ops) > maxChunkOps {
+			maxChunkOps = len(ops)
+		}
 	}
-	// Order matters: the out-of-range DELETEs go FIRST. The in-range
-	// chunks only cover the source's key span, so an out-of-range
-	// destination row is invisible to the engine's in-chunk unique
-	// protection — yet it can still block an in-range INSERT: addressed
-	// by a non-PK unique key, the source row to insert can carry the PK
-	// value an out-of-range destination row currently holds (e.g. --key v
-	// with src (2,'A') vs dst (2,'Z'): inserting id=2 duplicates the PK
-	// of the row the out-of-range scan deletes later). Deletes only free
-	// unique slots, so committing them before any in-range write makes the
-	// whole sequence collision-free.
-	return append(oor, out...), nil
+	w := rowWork{kind: rowWorkChunks, ops: out, oorDel: oorDel, rewrites: rewriteCount(out), maxChunkOps: maxChunkOps}
+	return w, nil
 }
 
-// dstDeletes plans the destination side and deletes every row it holds:
-// the fallback for a table whose source match set is empty (the source
-// re-plan yields no chunks, so there is nothing to target deletes from —
-// a --where filter that matches nothing on the source, or a source that
-// simply emptied). The destination's key is the same key the comparison
-// used, so every row can be addressed by key.
+// keyDeleteBatches prepares one chunk's raw key rows for the batched
+// deletes: it sorts them by normalized key identity (a small in-chunk
+// sort, never a whole-range sort — rows that fold to one identity delete
+// together) and cuts them into batches of at most cap. It is the entire
+// per-chunk state of the stream-delete paths: the chunk's own keys plus
+// one batch (O(chunk) / O(batch) — never the table).
+func keyDeleteBatches(rows [][]any, canon func(vals []any) (string, error), cap int) ([][][]any, error) {
+	if cap < 1 {
+		cap = 1
+	}
+	type keyed struct {
+		canon string
+		kv    []any
+	}
+	kr := make([]keyed, len(rows))
+	for i, vals := range rows {
+		c, err := canon(vals)
+		if err != nil {
+			return nil, err
+		}
+		kr[i] = keyed{canon: c, kv: vals}
+	}
+	sort.Slice(kr, func(i, j int) bool { return kr[i].canon < kr[j].canon })
+	out := make([][][]any, 0, (len(rows)+cap-1)/cap)
+	for start := 0; start < len(kr); start += cap {
+		end := start + cap
+		if end > len(kr) {
+			end = len(kr)
+		}
+		batch := make([][]any, 0, end-start)
+		for _, k := range kr[start:end] {
+			batch = append(batch, k.kv)
+		}
+		out = append(out, batch)
+	}
+	return out, nil
+}
+
+// streamKeyDeletes deletes a side's key match set in chunk-sized,
+// batch-sized transactions: plan the side, scan ONE chunk of key
+// columns, batch-DELETE it (DeleteBatchExec), commit, release, next
+// chunk. Peak memory is one chunk of key vectors plus one delete batch
+// (O(chunk), independent of the match set's size): an empty-source
+// match set over a 100M-row table streams, it is never buffered.
 //
-// MEMORY NOTE (known residual, O(matched-destination-rows), not O(chunk)):
-// this path materializes one key-only opDelete PER destination row in the
-// match set, all in memory at once. Every OTHER sync path is O(chunk) or
-// O(chunk+delta) — the row-level diff keeps only the differing chunks, the
-// out-of-range pass keeps only the (few) rows outside the source's key
-// span, and the full resync streams in batches. This fallback is the one
-// place the whole (filtered) destination match set is buffered, so an
-// empty-source / match-everything --where over a very large table holds
-// one small op per row in RAM. It is SAFE (key-addressed deletes, no
-// unique interaction) but not memory-bounded the way the rest is; a
-// streaming delete pass (emit each chunk's ops before scanning the next)
-// would close it, but that changes the ops-return contract and is left as
-// a follow-up rather than folded into this safety round.
-func (r *Runner) dstDeletes(ctx context.Context, p *prep, freshDst int64) ([][]op, error) {
+// The chunk's keys are sorted by normalized key identity before
+// batching (a small in-chunk sort, never a whole-range sort), so rows
+// that fold to one normalized identity delete as one batch.
+func (r *Runner) streamKeyDeletes(ctx context.Context, p *prep, side *conn.Side, s *conn.Schema, total int64, ap *Applier, st *Stats) error {
 	planner := chunk.Planner{
-		Table:       p.dstS.Table,
-		KeyCols:     p.dstS.Key,
-		KeyFamilies: compare.KeyFamilies(p.dstS),
+		Table:       s.Table,
+		KeyCols:     s.Key,
+		KeyFamilies: compare.KeyFamilies(s),
 		ChunkSize:   r.o.Cmp.ChunkSize,
 		Where:       r.o.Cmp.Where,
 	}
-	chunks, err := planner.Plan(ctx, r.Dst.Ctl(), freshDst)
+	chunks, err := planner.Plan(ctx, side.Ctl(), total)
 	if err != nil {
-		return nil, fmt.Errorf("re-plan dst: %w", err)
+		return fmt.Errorf("re-plan %s: %w", side.Name, err)
 	}
-	out := make([][]op, 0, len(chunks))
-	for _, ch := range chunks {
-		dstM, err := p.e.scanSide(ctx, r.Dst, p.dstS, p.e.dstRow, p.e.dstKey, ch, r.o.Cmp.Where)
+	b, cap := r.deleteBatch(p)
+	if cap <= 0 {
+		return nil // keyless: the caller never plans this path without a key
+	}
+	step := len(chunks) / 10
+	if step < 1 {
+		step = 1
+	}
+	buf := make([]byte, 0, 256)
+	canon := func(vals []any) (string, error) {
+		c, err := p.e.dstKey.Normalize(vals, buf)
 		if err != nil {
-			return nil, fmt.Errorf("dst chunk %d: %w", ch.ID, err)
+			return "", err
 		}
-		keys := make([]string, 0, len(dstM))
-		for k := range dstM {
-			keys = append(keys, k)
+		buf = c[:0]
+		return string(c), nil
+	}
+	for i, ch := range chunks {
+		rows, err := p.e.scanKeyRows(ctx, side, s, ch.Pred(s.Key, ""), r.o.Cmp.Where)
+		if err != nil {
+			return fmt.Errorf("%s chunk %d: %w", side.Name, ch.ID, err)
 		}
-		sort.Strings(keys)
-		ops := make([]op, 0)
-		for _, k := range keys {
-			for _, row := range dstM[k] {
-				ops = append(ops, op{kind: opDelete, key: p.e.keyVals(row.vals)})
+		// one transaction per batch of key vectors: a mid-stream failure
+		// rolls back that batch only, the completed batches stay, and a
+		// re-run converges (the deletes are key-addressed and
+		// idempotent). The canon buffer is reused across rows (the
+		// sorted keys are string copies).
+		batches, err := keyDeleteBatches(rows, canon, cap)
+		if err != nil {
+			return fmt.Errorf("%s chunk %d: %w", side.Name, ch.ID, err)
+		}
+		for _, cur := range batches {
+			if len(cur) > st.MaxBufferedDeleteKeys {
+				st.MaxBufferedDeleteKeys = len(cur)
+			}
+			if err := ap.applyTx(ctx, func(tx *sql.Tx) error {
+				stmt, args, err := b.DeleteBatchExec(cur)
+				if err != nil {
+					return err
+				}
+				n, err := tx.ExecContext(ctx, stmt, args...)
+				if err != nil {
+					return err
+				}
+				na, _ := n.RowsAffected()
+				st.Deletes += int(na)
+				return nil
+			}); err != nil {
+				return fmt.Errorf("%s chunk %d: %w", side.Name, ch.ID, err)
 			}
 		}
-		out = append(out, ops)
+		st.Chunks++
+		if r.o.Progress != nil && (i+1)%step == 0 {
+			r.o.Progress("  %-24s stream-delete %3d%% (%d/%d chunks, %d rows deleted)", s.Table, 100*(i+1)/len(chunks), i+1, len(chunks), st.Deletes)
+		}
 	}
-	return out, nil
+	return nil
 }
 
 // allNil reports whether every value is nil (the all-NULL key row).
@@ -874,82 +1077,332 @@ func isParenGroup(s string) bool {
 	return false
 }
 
-// outOfRangeDeletes plans the deletes of destination rows whose key falls
-// strictly outside the source's key range: the row-level chunks only cover
-// the source's min..max range, so such rows would otherwise never be
-// touched. It reads the source's extremes (the --where filter applies, as
-// to the destination scan below), scans the destination for rows outside
-// them, and deletes them one by one, grouped in Batch-sized transactions
-// appended after the in-range chunk groups.
-//
-// It is a no-op for a keyless table, an empty source (the caller took
-// dstDeletes instead), a key the two sides disagree on, and a scan that
-// finds nothing. With a --where filter, out-of-range rows that do not
-// match the filter are left in place: a filtered table cannot be
-// truncated, so they are the one documented residual (the verification
-// reports the table DIFFERENT and a plain, unfiltered comparison shows
-// them).
-func (r *Runner) outOfRangeDeletes(ctx context.Context, p *prep, freshSrc int64) ([][]op, error) {
-	if freshSrc <= 0 || len(p.srcS.Key) == 0 || len(p.dstS.Key) == 0 {
-		return nil, nil
+// deleteBatch is the statement builder and the per-batch key limit for
+// the streaming delete paths (P2): the configured batch, further capped
+// by the bind-parameter budget (one placeholder per key component — a
+// wide composite key shrinks its batch automatically).
+func (r *Runner) deleteBatch(p *prep) (*Builder, int) {
+	if len(p.dstS.Key) == 0 {
+		return nil, 0
 	}
-	if !keyAgree(p.srcS, p.dstS) {
-		// the bounds are the SOURCE's key values rendered against the
-		// DESTINATION's key columns, so the two sides must agree on the
-		// key by name and order (with --no-sync-schema the keys can drift
-		// at equal length, e.g. PK (a, b) vs (b, a) — rendering the src
-		// values against the wrong columns would delete in-range rows)
-		return nil, nil
-	}
-	sp := chunk.Planner{
-		Table:       p.srcS.Table,
-		KeyCols:     p.srcS.Key,
-		KeyFamilies: compare.KeyFamilies(p.srcS),
-		Where:       r.o.Cmp.Where,
-	}
-	minV, maxV, err := sp.Extremes(ctx, r.Src.Ctl())
-	if err != nil {
-		return nil, err
-	}
-	if minV == nil || maxV == nil {
-		// the source emptied between the count and the extremes read
-		// (Extremes returns both nil in that case; maxV is checked too
-		// because a nil bound would panic the strict comparators)
-		return nil, nil
-	}
+	return p.b, deleteBatchCap(r.o.Batch, len(p.dstS.Key))
+}
+
+// countOOR counts the destination rows whose key falls strictly outside
+// the source's key range (a COUNT, not a scan): the preflight reports it
+// without reading a single key — a 100M-row destination against a
+// 50M..60M source span reports ~40M out-of-range rows from one COUNT.
+// The --where filter applies (a filtered run deletes only the out-of-
+// range rows the filter matches).
+func (r *Runner) countOOR(ctx context.Context, p *prep, minV, maxV []driver.Value) (int64, error) {
 	pred, ok := r.oorPredicate(p, minV, maxV)
 	if !ok {
+		return 0, nil
+	}
+	q := fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE (%s)",
+		conn.QuoteIdent(p.dstS.Table), pred.SQL)
+	if r.o.Cmp.Where != "" {
+		q += " AND (" + r.o.Cmp.Where + ")"
+	}
+	var n int64
+	if err := r.Dst.Ctl().QueryRowContext(ctx, q, pred.Args...).Scan(&n); err != nil {
+		return 0, fmt.Errorf("dst %s: %w", p.dstS.Table, err)
+	}
+	return n, nil
+}
+
+// keySamples reads up to limit key rows from one side (ORDER BY the key,
+// LIMIT limit — a bounded sample, never a full scan): the dry run shows
+// what the stream deletes will address without reading the table.
+// Rendered as literals for DISPLAY only (read-side; the deletes bind).
+func (r *Runner) keySamples(ctx context.Context, side *conn.Side, s *conn.Schema, limit int) ([]string, error) {
+	if limit <= 0 || len(s.Key) == 0 {
 		return nil, nil
 	}
-	rows, err := p.e.scanKeyRows(ctx, r.Dst, p.dstS, pred, r.o.Cmp.Where)
+	idents := make([]string, len(s.Key))
+	fams := make([]string, len(s.Key))
+	pos := make(map[string]int, len(s.Cols))
+	for i, c := range s.Cols {
+		pos[strings.ToLower(c.Name)] = i
+	}
+	for i, k := range s.Key {
+		idents[i] = conn.QuoteIdent(k)
+		fams[i] = s.Cols[pos[strings.ToLower(k)]].Family
+	}
+	q := fmt.Sprintf("SELECT %s FROM %s", strings.Join(idents, ", "), conn.QuoteIdent(s.Table))
+	if r.o.Cmp.Where != "" {
+		q += " WHERE (" + r.o.Cmp.Where + ")"
+	}
+	q += " ORDER BY " + strings.Join(idents, ", ") + fmt.Sprintf(" LIMIT %d", limit)
+	rows, err := side.Ctl().QueryContext(ctx, q)
 	if err != nil {
 		return nil, err
 	}
-	if len(rows) == 0 {
-		return nil, nil
+	defer rows.Close()
+	vals := make([]driver.Value, len(s.Key))
+	ptrs := make([]any, len(s.Key))
+	for i := range vals {
+		ptrs[i] = &vals[i]
 	}
-	// deterministic order: the same normalized key identity the in-range
-	// deletes are sorted by
-	type keyed struct {
-		canon string
-		kv    []any
-	}
-	kr := make([]keyed, 0, len(rows))
-	buf := make([]byte, 0, 256)
-	for _, vals := range rows {
-		canon, err := p.e.dstKey.Normalize(vals, buf)
-		if err != nil {
+	var out []string
+	for rows.Next() {
+		for i := range vals {
+			vals[i] = nil
+		}
+		if err := rows.Scan(ptrs...); err != nil {
 			return nil, err
 		}
-		buf = canon[:0]
-		kr = append(kr, keyed{canon: string(canon), kv: vals})
+		parts := make([]string, len(vals))
+		for i, v := range vals {
+			parts[i] = literalFor(fams[i], v)
+		}
+		out = append(out, "("+strings.Join(parts, ", ")+")")
 	}
-	sort.Slice(kr, func(i, j int) bool { return kr[i].canon < kr[j].canon })
-	ops := make([]op, 0, len(kr))
-	for _, k := range kr {
-		ops = append(ops, op{kind: opDelete, key: k.kv})
+	return out, rows.Err()
+}
+
+// keysetCursor renders the strict "key > cursor" predicate with BINDABLE
+// arguments (bindArg per key-column family — a BIT or an unsigned-BIGINT
+// cursor binds the way it scanned, never as a raw byte blob): the
+// keyset pagination's advance term (page n+1 is "key > last row of page
+// n"; strict, so the cursor row itself is never re-read). The shape
+// mirrors the chunk package's strictCompare "greater" expansion; NULL
+// components (impossible for a usable key — primary key or NOT NULL
+// unique — kept for completeness) take the same terms.
+func (r *Runner) keysetCursor(p *prep, cursor []any) (string, []any) {
+	keyCols := p.dstS.Key
+	fams := make([]string, len(keyCols))
+	pos := make(map[string]int, len(p.dstS.Cols))
+	for i, c := range p.dstS.Cols {
+		pos[strings.ToLower(c.Name)] = i
 	}
-	return groupOps(ops, r.o.Batch), nil
+	for i, k := range keyCols {
+		fams[i] = p.dstS.Cols[pos[strings.ToLower(k)]].Family
+	}
+	var term func(i int) (string, []any)
+	term = func(i int) (string, []any) {
+		col := conn.QuoteIdent(keyCols[i])
+		v := cursor[i]
+		last := i == len(cursor)-1
+		if v == nil {
+			switch {
+			case last:
+				// the all-NULL (prefix) row is the cursor itself: every
+				// non-NULL row sits above it
+				return col + " IS NOT NULL", nil
+			default:
+				s, a := term(i + 1)
+				return fmt.Sprintf("(%s IS NULL AND %s) OR %s IS NOT NULL", col, s, col), a
+			}
+		}
+		b := bindArg(fams[i], v)
+		if last {
+			return fmt.Sprintf("%s > ?", col), []any{b}
+		}
+		s, a := term(i + 1)
+		return fmt.Sprintf("%s > ? OR (%s = ? AND %s)", col, col, s), append([]any{b, b}, a...)
+	}
+	return term(0)
+}
+
+// streamOORTail walks one out-of-range key tail (base is "key < srcMin"
+// or "key > srcMax", already parameterized) with KEYSET PAGINATION: page
+// n+1 adds "key > <last row of page n>" — no OFFSET (a deep OFFSET scan
+// re-reads the whole prefix per page), no whole-range in-memory sort
+// (the ORDER BY is an index walk the server does). The page IS the
+// delete batch: scan a page, batch-DELETE it in one transaction,
+// commit, advance, release. Peak memory is one page of key vectors
+// (O(batch)): a 90M-row tail streams, it is never buffered.
+//
+// Deleting while walking is safe: the cursor only moves forward (key >
+// cursor), the deleted rows are exactly the ones already walked, and a
+// row ahead of the cursor cannot move behind it (its key is its
+// identity). A mid-stream failure rolls back the page's transaction
+// only; the completed pages stay, and a re-run converges the rest (the
+// deletes are key-addressed and idempotent).
+func (r *Runner) streamOORTail(ctx context.Context, p *prep, base chunk.Pred, ap *Applier, st *Stats) error {
+	b, cap := r.deleteBatch(p)
+	if cap <= 0 {
+		return nil
+	}
+	cn, err := r.Dst.AcquireScan(ctx)
+	if err != nil {
+		return err
+	}
+	defer cn.Close()
+	idents := make([]string, len(p.dstS.Key))
+	for i, k := range p.dstS.Key {
+		idents[i] = conn.QuoteIdent(k)
+	}
+	var cursor []any
+	for {
+		conds := []string{"(" + base.SQL + ")"}
+		args := append([]any{}, base.Args...)
+		if cursor != nil {
+			cur, cargs := r.keysetCursor(p, cursor)
+			conds = append(conds, "("+cur+")")
+			args = append(args, cargs...)
+		}
+		if r.o.Cmp.Where != "" {
+			conds = append(conds, "("+r.o.Cmp.Where+")")
+		}
+		q := fmt.Sprintf("SELECT %s FROM %s WHERE %s ORDER BY %s LIMIT ?",
+			strings.Join(idents, ", "), conn.QuoteIdent(p.dstS.Table), strings.Join(conds, " AND "), strings.Join(idents, ", "))
+		args = append(args, cap)
+		rows, err := cn.QueryContext(ctx, q, args...)
+		if err != nil {
+			return err
+		}
+		vals := make([]any, len(p.dstS.Key))
+		ptrs := make([]any, len(p.dstS.Key))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		var keys [][]any
+		for rows.Next() {
+			for i := range vals {
+				vals[i] = nil
+			}
+			if err := rows.Scan(ptrs...); err != nil {
+				rows.Close()
+				return err
+			}
+			cp := make([]any, len(vals))
+			copy(cp, vals)
+			keys = append(keys, cp)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		rows.Close()
+		if len(keys) == 0 {
+			break
+		}
+		if len(keys) > st.MaxBufferedDeleteKeys {
+			st.MaxBufferedDeleteKeys = len(keys)
+		}
+		page := keys
+		if err := ap.applyTx(ctx, func(tx *sql.Tx) error {
+			stmt, bargs, err := b.DeleteBatchExec(page)
+			if err != nil {
+				return err
+			}
+			n, err := tx.ExecContext(ctx, stmt, bargs...)
+			if err != nil {
+				return err
+			}
+			na, _ := n.RowsAffected()
+			st.Deletes += int(na)
+			return nil
+		}); err != nil {
+			return err
+		}
+		if len(keys) < cap {
+			break
+		}
+		last := keys[len(keys)-1]
+		cursor = make([]any, len(last))
+		copy(cursor, last)
+	}
+	return nil
+}
+
+// streamOORDeletes deletes the destination rows whose key falls strictly
+// outside the source's key range: the lower tail (key < srcMin, walked
+// ascending from the smallest key) and the upper tail (key > srcMax),
+// each keyset-paginated (streamOORTail). It is a no-op for a keyless
+// table, a key the two sides disagree on (the bounds are the SOURCE's
+// key values rendered against the DESTINATION's key columns — with
+// --no-sync-schema the keys can drift, e.g. PK (a, b) vs (b, a), and
+// rendering them against the wrong columns would delete in-range rows),
+// and a source that emptied (nil extremes).
+//
+// With a --where filter, out-of-range rows that do not match the filter
+// are left in place: a filtered table cannot be truncated, so they are
+// the one documented residual (the verification reports the table
+// DIFFERENT and a plain, unfiltered comparison shows them).
+func (r *Runner) streamOORDeletes(ctx context.Context, p *prep, minV, maxV []driver.Value, ap *Applier, st *Stats) error {
+	if len(p.dstS.Key) == 0 || minV == nil || maxV == nil || !keyAgree(p.srcS, p.dstS) {
+		return nil
+	}
+	if !allNil(minV) {
+		// the all-NULL row is the minimum: nothing sits below it
+		lt := chunk.LessThan(p.dstS.Key, minV)
+		if lt.SQL != "1=0" {
+			if err := r.streamOORTail(ctx, p, lt, ap, st); err != nil {
+				return err
+			}
+		}
+	}
+	gt := chunk.GreaterThan(p.dstS.Key, maxV)
+	if gt.SQL != "1=0" {
+		if err := r.streamOORTail(ctx, p, gt, ap, st); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ApplyRowWork executes a planned row work (PlanRowWork) on the
+// destination write connection, in the destructive-safe order:
+//
+//  1. the out-of-range deletes, streamed (keyset-paginated, batch
+//     transactions) — they must commit BEFORE any in-range write: the
+//     in-range chunks only cover the source's key span, yet an
+//     out-of-range destination row can still block an in-range INSERT
+//     (it can hold a unique value an in-range row takes); deletes only
+//     free unique slots, so committing them first makes the sequence
+//     collision-free. The extremes are re-read at apply time (the OOR
+//     set is what it IS when the deletes run, not when the plan was
+//     made);
+//  2. the work itself: for an empty-source match set the stream-delete
+//     of the destination's match set (chunk-sized transactions),
+//     otherwise the differing chunks' ops (the applier's per-chunk
+//     transactions).
+//
+// A mid-stream failure stops the work: the completed transactions stay
+// (they converged), the failed one rolls back, and a re-run converges
+// the rest — every statement is key-addressed and idempotent.
+func (r *Runner) ApplyRowWork(ctx context.Context, p *prep, w rowWork, ap *Applier, st *Stats) {
+	if w.kind == rowWorkNone {
+		return
+	}
+	st.MaxBufferedOps = w.maxChunkOps
+	if w.kind == rowWorkChunks {
+		if w.oorDel > 0 {
+			sp := chunk.Planner{
+				Table:       p.srcS.Table,
+				KeyCols:     p.srcS.Key,
+				KeyFamilies: compare.KeyFamilies(p.srcS),
+				Where:       r.o.Cmp.Where,
+			}
+			minV, maxV, err := sp.Extremes(ctx, r.Src.Ctl())
+			if err != nil {
+				st.Error = fmt.Sprintf("key extremes: %v", err)
+				return
+			}
+			if err := r.streamOORDeletes(ctx, p, minV, maxV, ap, st); err != nil {
+				st.Error = fmt.Sprintf("out-of-range deletes: %v", err)
+				return
+			}
+		}
+		ap.ApplyOps(ctx, st, p.b, w.ops)
+		return
+	}
+	// rowWorkDstDelete: the source match set is empty — stream-delete
+	// the destination's (possibly filtered) match set, chunk by chunk.
+	freshDst, err := r.Count(ctx, r.Dst, p.dstS.Table)
+	if err != nil {
+		st.Error = fmt.Sprintf("recount dst: %v", err)
+		return
+	}
+	if freshDst <= 0 {
+		return // it converged in the meantime
+	}
+	if err := r.streamKeyDeletes(ctx, p, r.Dst, p.dstS, freshDst, ap, st); err != nil {
+		st.Error = fmt.Sprintf("stream delete: %v", err)
+	}
 }
 
 // StructPlan is the structure-sync verdict for one table: nil (from
@@ -1046,7 +1499,7 @@ func execDDL(ctx context.Context, ap *Applier, ddl []string) (int, error) {
 // on row-level sync, only a still-keyless pair stays on the full load.
 // The table state (AUTO_INCREMENT) is reconciled last; the caller
 // verifies.
-func (r *Runner) ApplyStructureTable(ctx context.Context, res compare.TableResult, sp *StructPlan, ap *Applier) TableSync {
+func (r *Runner) ApplyStructureTable(ctx context.Context, res compare.TableResult, sp *StructPlan, ap *Applier, scope DestructiveScope) TableSync {
 	ts := TableSync{Name: res.Name, SchemaChanged: true, SchemaSQL: sp.DDL, DstRows: 0}
 	if r.o.Progress != nil {
 		r.o.Progress("%-24s structure: in-place ALTER, %d DDL statement(s): %s", res.Name, len(sp.DDL), strings.Join(sp.Reasons, "; "))
@@ -1100,7 +1553,7 @@ func (r *Runner) ApplyStructureTable(ctx context.Context, res compare.TableResul
 		}
 		ts.SchemaSQL = applied
 	}
-	return r.convergeAfterDDL(ctx, res.Name, "structure sync", ap, &ts, preTruncated)
+	return r.convergeAfterDDL(ctx, res.Name, "structure sync", ap, &ts, preTruncated, scope)
 }
 
 // convergeAfterDDL converges a table whose structure work (a CREATE, or
@@ -1117,7 +1570,10 @@ func (r *Runner) ApplyStructureTable(ctx context.Context, res compare.TableResul
 // The data may have converged while the table state has not: any failed
 // step leaves the table FAILED and the next run re-plans from the current
 // facts.
-func (r *Runner) convergeAfterDDL(ctx context.Context, table, label string, ap *Applier, ts *TableSync, preTruncated bool) TableSync {
+// scope is the confirmed destructive scope (from the preflight plan the
+// user saw): the in-apply data path may TRUNCATE (the full-load
+// fallback) or run row rewrites only within it (P0).
+func (r *Runner) convergeAfterDDL(ctx context.Context, table, label string, ap *Applier, ts *TableSync, preTruncated bool, scope DestructiveScope) TableSync {
 	fail := func(format string, args ...any) TableSync {
 		ts.Mode, ts.Status, ts.Error = "ERROR", "FAILED", fmt.Sprintf(format, args...)
 		return *ts
@@ -1157,13 +1613,29 @@ func (r *Runner) convergeAfterDDL(ctx context.Context, table, label string, ap *
 		// fres.DstRows, not 0: after an in-place ALTER the destination
 		// still holds rows (an empty source with a non-empty destination
 		// must come back as key-addressed deletes)
-		ops, err := r.RowOps(ctx, p, fres, srcTotal, fres.DstRows)
-		if !errors.Is(err, errEscalateFull) {
-			if err != nil {
-				return fail("%v", err)
+		w, err := r.PlanRowWork(ctx, p, fres, srcTotal, fres.DstRows)
+		switch {
+		case errors.Is(err, errEscalateFull):
+			// A stale plan (data moved between the passes) needs the full
+			// load — which TRUNCATEs. It runs only within the confirmed
+			// scope; otherwise the table stops (P0-1).
+			if !scope.FullResync {
+				return fail("%s (%s): table %s — the re-plan after the %s requires the full resync, which the confirmed plan did not show; the table was stopped and no TRUNCATE was executed. Re-run so the new plan can be reviewed and confirmed",
+					ErrReplanRequired, ErrFullResyncRequired, table, label)
+			}
+			// fall through to the plain full load
+		case err != nil:
+			return fail("%v", err)
+		default:
+			if w.rewrites > 0 && !scope.RowRewrite {
+				// the structure preflight never planned rows, so the
+				// confirmed scope carries no rewrites: any rewrite here
+				// is new destructive scope, refused (P0)
+				return fail("%s: table %s — the re-plan after the %s needs %d destructive row rewrite group(s) (DELETE+INSERT), which the confirmed plan did not show; the table was stopped and no rewrite was executed. Re-run so the new plan can be reviewed and confirmed",
+					ErrReplanRequired, table, label, w.rewrites)
 			}
 			st := &Stats{Table: table, Mode: "ROWLEVEL"}
-			ap.ApplyOps(ctx, st, p.b, ops)
+			r.ApplyRowWork(ctx, p, w, ap, st)
 			if ts.Mode != "CREATE" {
 				ts.Mode = "ROWLEVEL"
 			}
@@ -1177,8 +1649,6 @@ func (r *Runner) convergeAfterDDL(ctx context.Context, table, label string, ap *
 			r.applyState(ctx, table, ap, ts)
 			return *ts
 		}
-		// A stale plan (data moved between the passes): fall through to the
-		// plain full load.
 	}
 	st := &Stats{Table: table, Mode: "FULL"}
 	if !preTruncated {
@@ -1213,7 +1683,7 @@ func (r *Runner) convergeAfterDDL(ctx context.Context, table, label string, ap *
 // offers a usable key, a plain full load otherwise). A successfully
 // created table is not a success until its data and table state have
 // converged: any failed step leaves it FAILED (the caller re-verifies).
-func (r *Runner) applyCreate(ctx context.Context, res compare.TableResult, d decision, ap *Applier) TableSync {
+func (r *Runner) applyCreate(ctx context.Context, res compare.TableResult, d decision, ap *Applier, scope DestructiveScope) TableSync {
 	ts := d.ts
 	if r.o.Progress != nil {
 		r.o.Progress("%-24s create: %s", res.Name, strings.Join(d.sp.Reasons, "; "))
@@ -1225,7 +1695,7 @@ func (r *Runner) applyCreate(ctx context.Context, res compare.TableResult, d dec
 		}
 	}
 	// a freshly created table is empty: no truncate anywhere on this path
-	return r.convergeAfterDDL(ctx, res.Name, "create", ap, &ts, true)
+	return r.convergeAfterDDL(ctx, res.Name, "create", ap, &ts, true, scope)
 }
 
 // samples renders up to limit sample statements from the ops. Each op kind
@@ -1301,9 +1771,9 @@ type decision struct {
 }
 
 // planDecision computes the sync DECISION for one pre-pass result without
-// the row-level re-scan: PlanTable adds the sample statements (and the
-// ops) on top, PlanSummary uses it as-is for the confirmation summary,
-// and ApplyTable routes on it.
+// the row-level re-scan: PlanTable adds the row work (and its samples)
+// on top, and ApplyTable routes on it (re-running the decision fresh
+// right before writing).
 //
 // A table missing on the destination becomes a CREATE (structure sync on,
 // no --where). A structure drift becomes the DDL, and the post-repair data
@@ -1424,35 +1894,37 @@ func createDataNote(keyed bool, rows int64, batch int) string {
 	return fmt.Sprintf("-- then INSERT all %d source rows in batches of %d", rows, batch)
 }
 
-// PlanSummary computes only the plan DECISION for one pre-pass result
-// (mode, reason, pre-pass counts, misconfiguration errors) without the
-// row-level re-scan: the --apply path uses it for the confirmation
-// summary, because ApplyTable re-plans, recounts and rescans right before
-// writing anyway — planning the ops here too would scan the differing
-// chunks twice for nothing the confirmation shows.
-func (r *Runner) PlanSummary(ctx context.Context, res compare.TableResult) TableSync {
-	return r.planDecision(ctx, res).ts
-}
-
-// PlanTable computes the dry-run outcome for one pre-pass result: mode,
-// counts and sample statements, without writing anything.
+// PlanTable computes the plan for one pre-pass result: mode, counts and
+// sample statements, without writing anything. For a row-level table it
+// is the PREFLIGHT (P0-3): it runs the same row planning the apply
+// re-runs, so the destructive scope the user confirms — a full resync
+// for a stale or cross-chunk plan, a destructive row rewrite — is
+// computed from a real plan and recorded in TableSync.Scope. The apply
+// re-plans right before writing and may only stay within it. The
+// preflight costs the differing chunks one extra scan; that is
+// deliberate — the confirmation must cover what actually runs.
 func (r *Runner) PlanTable(ctx context.Context, res compare.TableResult) TableSync {
 	d := r.planDecision(ctx, res)
 	if d.ts.Status == "FAILED" {
 		return d.ts
 	}
+	scope := DestructiveScope{}
 	switch {
 	case d.create:
 		// the CREATE DDL is already shown on the DDL line: the sample is
-		// only what the data sync does once the table exists
+		// only what the data sync does once the table exists. A freshly
+		// created table is empty, so the data path is all INSERTs — no
+		// destructive operation is in scope.
 		ts := d.ts
 		ts.SampleSQL = []string{createDataNote(d.keyed, ts.SrcRows, r.o.Batch)}
+		ts.Scope = scope
 		return ts
 	case d.sp != nil:
 		// structure drift: the DDL is already shown on the DDL lines; the
 		// sample is what the data sync does after the in-place repair
 		// (P1-3: no truncate by default). A still-keyless pair ends on
-		// the full load, which truncates right before the reload. The
+		// the full load, which truncates right before the reload — shown
+		// in the sample, so the scope carries the full resync. The
 		// pre-pass of a structure-mismatched table never counted, so
 		// count the source fresh for the sample line.
 		ts := d.ts
@@ -1463,16 +1935,21 @@ func (r *Runner) PlanTable(ctx context.Context, res compare.TableResult) TableSy
 		}
 		ts.SrcRows = srcTotal
 		if ts.Mode == "ROWLEVEL" {
+			// after the repair the data path is row-level: no TRUNCATE is
+			// shown, so none is in scope (a stale apply-time re-plan
+			// that would need one stops the table instead of truncating)
 			ts.SampleSQL = []string{createDataNote(true, srcTotal, r.o.Batch)}
 		} else {
+			scope.FullResync = true
 			ts.SampleSQL = []string{"TRUNCATE TABLE " + conn.QuoteIdent(res.Name),
 				createDataNote(false, srcTotal, r.o.Batch)}
 		}
+		ts.Scope = scope
 		return ts
 	case d.p != nil:
 		ts := d.ts
 		if d.ts.Mode == "ROWLEVEL" {
-			ops, err := r.RowOps(ctx, d.p, res, res.SrcRows, res.DstRows)
+			w, err := r.PlanRowWork(ctx, d.p, res, res.SrcRows, res.DstRows)
 			if errors.Is(err, errEscalateFull) {
 				if r.o.Cmp.Where != "" {
 					// the plan went stale and a filtered table cannot be
@@ -1485,26 +1962,67 @@ func (r *Runner) PlanTable(ctx context.Context, res compare.TableResult) TableSy
 				}
 				// the plan went stale; the dry-run shows what apply would do
 				ts.Mode, ts.Status = "FULL", "PLANNED"
+				scope.FullResync = true
 				ts.SampleSQL = r.fullSamples(d.p.b, res.SrcRows)
+				ts.Scope = scope
 				return ts
 			}
 			if err != nil {
 				ts.Mode, ts.Status, ts.Error = "ERROR", "FAILED", err.Error()
 				return ts
 			}
-			ts.Inserts, ts.Updates, ts.Deletes = Counts(ops)
-			ts.Chunks = len(ops)
-			ts.SampleSQL = r.samples(d.p.b, ops, r.o.SampleLimit)
-			if n := rewriteCount(ops); n > 0 {
-				// P0-2: the destructive rewrite is shown SEPARATELY in
-				// the confirmation summary — it is the only kind of
-				// statement that touches rows the user did not ask to
-				// change (FK/trigger side effects ride on it)
-				ts.SampleSQL = append(ts.SampleSQL, fmt.Sprintf("DESTRUCTIVE ROW REWRITE: %d row group(s) are deleted and re-inserted to free unique slots (permitted by --allow-row-rewrite)", n))
+			switch w.kind {
+			case rowWorkDstDelete:
+				// empty source match set: the apply streams the deletes
+				// (chunk-sized transactions). The dry run shows the
+				// COUNT plus a bounded key sample — it never scans the
+				// whole match set (a 100M-row empty-source match set is
+				// not scanned for a dry run).
+				dpl := chunk.Planner{
+					Table:       d.p.dstS.Table,
+					KeyCols:     d.p.dstS.Key,
+					KeyFamilies: compare.KeyFamilies(d.p.dstS),
+					ChunkSize:   r.o.Cmp.ChunkSize,
+					Where:       r.o.Cmp.Where,
+				}
+				if chunks, err := dpl.Plan(ctx, r.Dst.Ctl(), w.dstDel); err == nil {
+					ts.Chunks = len(chunks)
+				}
+				ts.Deletes = int(w.dstDel)
+				ts.SampleSQL = []string{fmt.Sprintf("STREAM DELETE ~%d destination rows by key (chunk-sized transactions)", w.dstDel)}
+				if ks, err := r.keySamples(ctx, r.Dst, d.p.dstS, r.o.SampleLimit); err == nil {
+					ts.SampleSQL = append(ts.SampleSQL, ks...)
+				}
+				if w.oorDel > 0 {
+					ts.SampleSQL = append(ts.SampleSQL, fmt.Sprintf("STREAM DELETE ~%d out-of-range destination rows by key (keyset-paginated batches)", w.oorDel))
+				}
+			case rowWorkNone:
+				// it converged in the meantime: nothing to show
+			default:
+				ts.Inserts, ts.Updates, ts.Deletes = Counts(w.ops)
+				ts.Deletes += int(w.oorDel)
+				ts.Chunks = len(w.ops)
+				ts.SampleSQL = r.samples(d.p.b, w.ops, r.o.SampleLimit)
+				if w.oorDel > 0 {
+					ts.SampleSQL = append(ts.SampleSQL, fmt.Sprintf("STREAM DELETE %d out-of-range destination rows by key (keyset-paginated batches, committed before the in-range writes)", w.oorDel))
+				}
+				if n := w.rewrites; n > 0 {
+					// the destructive rewrite is shown SEPARATELY in the
+					// confirmation summary — it is the only kind of
+					// statement that touches rows the user did not ask to
+					// change (FK/trigger side effects ride on it). The
+					// scope carries it, so the apply may run rewrites up
+					// to what the plan showed — no more.
+					scope.RowRewrite = true
+					ts.Rewrites = n
+					ts.SampleSQL = append(ts.SampleSQL, fmt.Sprintf("DESTRUCTIVE ROW REWRITE: %d row group(s) are deleted and re-inserted to free unique slots (permitted by --allow-row-rewrite)", n))
+				}
 			}
 		} else {
+			scope.FullResync = true
 			ts.SampleSQL = r.fullSamples(d.p.b, res.SrcRows)
 		}
+		ts.Scope = scope
 		return ts
 	}
 	return d.ts
@@ -1514,23 +2032,30 @@ func (r *Runner) PlanTable(ctx context.Context, res compare.TableResult) TableSy
 // destination write connection. A table missing on the destination is
 // created first (structure sync on, no --where); a structure-drifted
 // table is realigned and re-planned (ApplyStructureTable); everything
-// else is re-counted right before writing and routed through DecidePlan —
-// the row counts never force a full resync: extra rows on the
-// destination are row-level DELETEs, and the only escalation is a stale
-// row plan (data moved between the pre-pass and the re-plan), which has
-// no safe row-level interpretation. The table state (AUTO_INCREMENT) is
-// reconciled last; the caller re-verifies.
-func (r *Runner) ApplyTable(ctx context.Context, res compare.TableResult, ap *Applier) TableSync {
+// else is re-counted right before writing and routed through DecidePlan.
+// The row counts never force a full resync: extra rows on the
+// destination are row-level DELETEs.
+//
+// confirmed is the plan the user CONFIRMED (the preflight, read-only):
+// its Scope is the destructive budget this run may use for the table.
+// The re-plan may SHRINK it (the data converged: fewer writes, no
+// rewrite, a full plan that no longer needs the TRUNCATE) but never
+// expand it — a confirmed row-level plan can never TRUNCATE in this
+// run, and a rewrite runs only when the confirmed plan showed one (P0).
+// A scope expansion stops the table with ErrReplanRequired: zero
+// destructive statements for it, the operator re-runs and confirms the
+// new plan like any first plan.
+func (r *Runner) ApplyTable(ctx context.Context, res compare.TableResult, ap *Applier, confirmed TableSync) TableSync {
 	d := r.planDecision(ctx, res)
 	if d.ts.Status == "FAILED" {
 		return d.ts
 	}
 	if d.create {
-		return r.applyCreate(ctx, res, d, ap)
+		return r.applyCreate(ctx, res, d, ap, confirmed.Scope)
 	}
 	if d.sp != nil {
 		// planDecision already rejected --where (argument error).
-		return r.ApplyStructureTable(ctx, res, d.sp, ap)
+		return r.ApplyStructureTable(ctx, res, d.sp, ap, confirmed.Scope)
 	}
 	if d.p == nil {
 		if d.ts.Mode == "STATE" {
@@ -1558,7 +2083,7 @@ func (r *Runner) ApplyTable(ctx context.Context, res compare.TableResult, ap *Ap
 		return ts
 	}
 	mode := p.plan.Mode
-	var ops [][]op
+	var w rowWork
 	if mode == ModeRowLevel {
 		freshSrc, err := r.Count(ctx, r.Src, res.Name)
 		if err != nil {
@@ -1570,15 +2095,32 @@ func (r *Runner) ApplyTable(ctx context.Context, res compare.TableResult, ap *Ap
 		}
 		// the report shows the counts as of the apply, not the pre-pass
 		ts.SrcRows, ts.DstRows = freshSrc, freshDst
-		ops, err = r.RowOps(ctx, p, res, freshSrc, freshDst)
+		w, err = r.PlanRowWork(ctx, p, res, freshSrc, freshDst)
 		switch {
 		case errors.Is(err, errEscalateFull) && r.o.Cmp.Where != "":
 			return fail("%v (a filtered table cannot be fully resynced)", err)
 		case errors.Is(err, errEscalateFull):
+			// the re-plan needs the order-independent full resync (stale
+			// plan or a cross-chunk swap with --allow-row-rewrite). It
+			// runs ONLY when the confirmed plan is the one that shows
+			// the TRUNCATE; a confirmed row-level plan is stopped
+			// instead — never TRUNCATEd (P0-1).
+			if !confirmed.Scope.FullResync {
+				return fail("%s (%s): table %s — the re-plan requires the full resync, which the confirmed plan did not show; the table was stopped and no TRUNCATE was executed. Re-run so the new plan can be reviewed and confirmed",
+					ErrReplanRequired, ErrFullResyncRequired, res.Name)
+			}
 			mode = ModeFull
 		case err != nil:
 			return fail("%v", err)
 		}
+	}
+	// the destructive-scope gate (P0): whatever the re-plan produced,
+	// the destructive part of it must be within the confirmed scope —
+	// see scopeGate. An expansion stops the table; nothing destructive
+	// for it runs this run.
+	if what := scopeGate(mode, w, confirmed); what != "" {
+		return fail("%s: table %s — the re-plan needs %s, which the confirmed plan did not show; the table was stopped and no destructive statement was executed. Re-run so the new plan can be reviewed and confirmed",
+			ErrReplanRequired, res.Name, what)
 	}
 	switch mode {
 	case ModeFull:
@@ -1597,7 +2139,7 @@ func (r *Runner) ApplyTable(ctx context.Context, res compare.TableResult, ap *Ap
 		}
 	case ModeRowLevel:
 		st := &Stats{Table: res.Name, Mode: "ROWLEVEL"}
-		ap.ApplyOps(ctx, st, p.b, ops)
+		r.ApplyRowWork(ctx, p, w, ap, st)
 		ts.Mode, ts.Inserts, ts.Updates, ts.Deletes = "ROWLEVEL", st.Inserts, st.Updates, st.Deletes
 		ts.Chunks = st.Chunks
 		if st.Error != "" {

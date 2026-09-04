@@ -271,15 +271,16 @@ expect 1 "diff still differs after dry-run (zero writes)" --src "$SRC" --dst "$D
 # apply: row-level (same row counts) -> verified -> plain diff is clean.
 expect 0 "sync --apply --yes: row-level updates" sync --src "$SRC" --dst "$DST" --tables t_mut --apply --yes
 expect 0 "diff identical after row-level sync" --src "$SRC" --dst "$DST" --tables t_mut
-# dst has MORE rows than src (1498 vs 999): the extra rows are addressed
-# by their key and deleted one by one — the row counts never force a full
-# resync (no TRUNCATE).
+# dst has MORE rows than src (1500 vs 1000): the extra 500 rows all sit
+# OUTSIDE the source's key range, so they converge via the streaming
+# out-of-range delete (COUNT + keyset-paginated batches, never a full key
+# scan) — the row counts never force a full resync (no TRUNCATE).
 sql dst dstdb m_sync_more.sql
 expect 1 "sync dry-run: dst has more rows -> deletes planned" sync --src "$SRC" --dst "$DST" --tables t_mut
-if ! grep -q 'DELETE FROM `t_mut`' "$OUT"; then
-  echo "FAIL: dry-run showed no DELETE sample"; cat "$OUT"; exit 1
+if ! grep -q 'STREAM DELETE' "$OUT"; then
+  echo "FAIL: dry-run showed no STREAM DELETE plan for the out-of-range rows"; cat "$OUT"; exit 1
 fi
-echo "ok: dry-run shows the DELETE sample"
+echo "ok: dry-run streams the out-of-range deletes (counted, not scanned)"
 if grep -q 'TRUNCATE' "$OUT"; then
   echo "FAIL: extra rows escalated to a full resync"; cat "$OUT"; exit 1
 fi
@@ -308,14 +309,16 @@ expect 3 "keyless + --where: cannot sync" sync --src "$SRC" --dst "$DST" --table
 # --where with zero source matches: the source re-plan yields no chunks, so
 # the destination's matching rows are planned from the destination side and
 # deleted outright (a filtered table cannot be truncated — this is the only
-# path to convergence). m_sync_more left 500 rows with id 5001..5499 on the
+# path to convergence). m_sync_more left 500 rows with id 5001..5500 on the
 # dst, none of which exist on the src.
 sql dst dstdb m_sync_more.sql
 expect 1 "where dry-run: empty source match set planned" sync --src "$SRC" --dst "$DST" --tables t_mut --where "id >= 5001"
-if ! grep -q 'DELETE FROM `t_mut`' "$OUT"; then
-  echo "FAIL: where dry-run showed no DELETE sample"; cat "$OUT"; exit 1
+# the empty-source match set is STREAMED (COUNT + bounded key samples +
+# chunk-sized batched deletes), never scanned whole: the plan must say so
+if ! grep -q 'STREAM DELETE' "$OUT"; then
+  echo "FAIL: where dry-run showed no STREAM DELETE plan"; cat "$OUT"; exit 1
 fi
-echo "ok: where dry-run shows DELETE sample"
+echo "ok: where dry-run shows the STREAM DELETE plan (no full key scan)"
 expect 0 "sync --where: empty source match set -> deletes" sync --src "$SRC" --dst "$DST" --tables t_mut --where "id >= 5001" --apply --yes
 expect 0 "diff identical after where-delete sync" --src "$SRC" --dst "$DST" --tables t_mut --where "id >= 5001"
 # non-TTY --apply without --yes: no terminal to confirm in -> arg error.
@@ -339,15 +342,22 @@ sql dst dstdb m_mut_reseed.sql
 expect 0 "sync: identical table, nothing to do" sync --src "$SRC" --dst "$DST" --tables t_mut
 
 say "out-of-range sync"
-# (a) t_oor: dst loses 4 rows, 2 are changed, and 4 keys outside the
-# source's range (id 0 below, 101..103 above) are added — equal counts, so
-# row-level. The out-of-range rows converge only via the out-of-range scan.
+# (a) t_oor: dst loses 4 in-range rows (inserts), 2 are changed, and 4 keys
+# outside the source's range (id 0 below, 101..103 above) are added — equal
+# counts, so row-level. The out-of-range rows converge only via the
+# streaming out-of-range delete.
 sql dst dstdb m_oor_oor.sql
 expect 1 "oor dry-run: deletes planned" sync --src "$SRC" --dst "$DST" --tables t_oor
-if ! grep -q 'DELETE FROM `t_oor`' "$OUT"; then
-  echo "FAIL: oor dry-run showed no DELETE sample"; cat "$OUT"; exit 1
+if ! grep -q 'STREAM DELETE' "$OUT"; then
+  echo "FAIL: oor dry-run showed no STREAM DELETE plan"; cat "$OUT"; exit 1
 fi
-echo "ok: oor dry-run shows DELETE sample"
+echo "ok: oor dry-run plans the stream delete"
+# the out-of-range rows are counted (not scanned) and stream-deleted in
+# keyset-paginated batches BEFORE any in-range write
+if ! grep -q 'out-of-range' "$OUT"; then
+  echo "FAIL: oor dry-run showed no out-of-range stream-delete plan"; cat "$OUT"; exit 1
+fi
+echo "ok: oor dry-run plans the out-of-range stream delete"
 if grep -q 'TRUNCATE' "$OUT"; then
   echo "FAIL: equal-count oor table was planned as a full resync"; cat "$OUT"; exit 1
 fi
@@ -418,12 +428,14 @@ oor=$(qdst "SELECT COUNT(*) FROM t_mut WHERE id = 1002")
 echo "ok: non-matching residual (1002) left in place"
 # (f) t_mut (no --where, equal counts): first-round convergence without a
 # full resync — the pre-fix behavior escalated to TRUNCATE + resync here.
+# The 3 missing in-range rows are inserts; the 3 out-of-range rows are
+# streamed deletes.
 sql dst dstdb m_oor_converge.sql
 expect 1 "converge dry-run: row-level deletes planned" sync --src "$SRC" --dst "$DST" --tables t_mut
-if ! grep -q 'DELETE FROM `t_mut`' "$OUT"; then
-  echo "FAIL: converge dry-run showed no DELETE sample"; cat "$OUT"; exit 1
+if ! grep -q 'STREAM DELETE' "$OUT"; then
+  echo "FAIL: converge dry-run showed no STREAM DELETE plan"; cat "$OUT"; exit 1
 fi
-echo "ok: converge dry-run shows DELETE sample"
+echo "ok: converge dry-run plans the stream delete"
 if grep -q 'TRUNCATE' "$OUT"; then
   echo "FAIL: equal-count table escalated to a full resync"; cat "$OUT"; exit 1
 fi
@@ -674,14 +686,15 @@ expect 0 "excluded table: whole-database run is clean" sync --src "$SRC2" --dst 
 n=$(qdb dst dstdb2 "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA='dstdb2' AND TABLE_NAME='t_extra'")
 [ "$n" = "1" ] || { echo "FAIL: --exclude-tables dropped the excluded table (count=$n)"; exit 1; }
 echo "ok: --exclude-tables spares the extra table"
-# (h) a stray row on a keyed table (3 vs 4): one row-level DELETE, never a
+# (h) a stray row on a keyed table (3 vs 4), OUTSIDE the source's key
+# range: it converges via the streaming out-of-range delete — never a
 # full resync.
 sql dst dstdb2 m_dst2_plain_stray.sql
 expect 1 "stray row: DELETE planned (dry-run)" sync --src "$SRC2" --dst "$DST2" --tables t_plain
-if ! grep -q 'DELETE FROM `t_plain`' "$OUT"; then
-  echo "FAIL: no DELETE sample for the stray row"; cat "$OUT"; exit 1
+if ! grep -q 'STREAM DELETE' "$OUT"; then
+  echo "FAIL: no STREAM DELETE plan for the stray row"; cat "$OUT"; exit 1
 fi
-echo "ok: dry-run shows the DELETE sample"
+echo "ok: dry-run streams the stray-row delete"
 if grep -q 'TRUNCATE' "$OUT"; then
   echo "FAIL: a stray row escalated to a full resync"; cat "$OUT"; exit 1
 fi
@@ -738,21 +751,20 @@ echo "ok: the unique --key yields row-level updates"
 expect 0 "unique --key --apply: converged" sync --src "$SRC" --dst "$DST" --tables t_swap --key v --apply --yes
 # Address change: when the unique key's OWN value changes, the row address
 # moved — delete + insert is the only correct shape (never an UPDATE).
-# The 'Z' row is OUTSIDE the source's key span (src has 'A','B'), so it
-# converges via the out-of-range scan: that delete must commit BEFORE the
-# insert, or the insert duplicates the PK the out-of-range row still holds
-# (regression: duplicate entry for PRIMARY at apply time).
+# The 'Z' row is OUTSIDE the source's key span (src has 'A','B'), so its
+# delete is STREAMED (counted, never scanned) and the plan states it
+# commits BEFORE the in-range writes — otherwise the insert would
+# duplicate the PK the out-of-range row still holds (regression:
+# duplicate entry for PRIMARY at apply time).
 sql dst dstdb m_swap_addr.sql
 expect 1 "unique --key, changed key value: delete+insert" sync --src "$SRC" --dst "$DST" --tables t_swap --key v
-if ! grep -q 'INSERT INTO `t_swap`' "$OUT" || ! grep -q 'DELETE FROM `t_swap`' "$OUT"; then
+if ! grep -q 'INSERT INTO `t_swap`' "$OUT"; then
   echo "FAIL: a changed unique key value must convert to delete+insert"; cat "$OUT"; exit 1
 fi
-dl=$(grep -n 'DELETE FROM `t_swap`' "$OUT" | head -1 | cut -d: -f1)
-il=$(grep -n 'INSERT INTO `t_swap`' "$OUT" | head -1 | cut -d: -f1)
-if [ -z "$dl" ] || [ -z "$il" ] || [ "$dl" -gt "$il" ]; then
-  echo "FAIL: the out-of-range delete must precede the insert (dl=$dl il=$il)"; cat "$OUT"; exit 1
+if ! grep -q 'STREAM DELETE.*committed before' "$OUT"; then
+  echo "FAIL: the out-of-range stream delete must precede the insert"; cat "$OUT"; exit 1
 fi
-echo "ok: the changed key value is delete+insert, delete first (no TRUNCATE)"
+echo "ok: the changed key value is delete+insert, stream delete first (no TRUNCATE)"
 expect 0 "unique --key, changed key value --apply" sync --src "$SRC" --dst "$DST" --tables t_swap --key v --apply --yes
 expect 0 "unique --key + --where: allowed (identical)" --src "$SRC" --dst "$DST" --tables t_swap --key v --where "id < 5"
 

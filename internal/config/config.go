@@ -70,10 +70,13 @@ type Options struct {
 	AllowStructureTruncate bool `yaml:"allow_structure_truncate"`
 	// AllowRowRewrite: permit the destructive row rewrite for a
 	// unique-value conflict (swap/cycle/holder) — DELETE+INSERT of the
-	// affected rows, and the order-independent full resync for a
-	// cross-chunk swap. Default false: the table is REFUSED instead,
-	// because the rewrite fires FK ON DELETE CASCADE, triggers and audit
-	// logs for rows the user never asked to change.
+	// affected rows. It authorizes the row rewrite ONLY: a cross-chunk
+	// swap becomes a full-resync plan (TRUNCATE + reload), executed only
+	// when the confirmed plan showed that TRUNCATE (a confirmed
+	// row-level plan never escalates to it in the same run). Default
+	// false: the table is REFUSED instead, because the rewrite fires FK
+	// ON DELETE CASCADE, triggers and audit logs for rows the user never
+	// asked to change.
 	AllowRowRewrite bool `yaml:"allow_row_rewrite"`
 }
 

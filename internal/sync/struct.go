@@ -74,6 +74,15 @@ func DiffStructure(src, dst *conn.Struct, srcDef, dstDef string) ([]Change, erro
 			}
 			out = append(out, ch)
 		case colDiffers(sc, dc, srcDef, dstDef):
+			if sc.Generated && (!sc.GenExprReadable || !dc.GenExprReadable) {
+				// a generated column whose expression one side cannot
+				// read: the drift is REAL but unprovable (both sides
+				// unreadable would still be a drift — not an equality),
+				// so refuse with a message that says why, instead of the
+				// generic "cannot reproduce" (the column may in fact be
+				// identical)
+				return nil, fmt.Errorf("generated column %s: generation expression is unreadable on one or both sides; schema equality cannot be proven safely — align the column manually or use --no-sync-schema", sc.Name)
+			}
 			if err := addable(sc); err != nil {
 				return nil, err
 			}
@@ -170,13 +179,21 @@ func colDiffers(sc, dc conn.ColMeta, srcDef, dstDef string) bool {
 // (P1-1). Normalization is deliberately conservative: it folds
 // surrounding whitespace and outermost paren wrapping, and NOTHING else
 // (no AST re-print, no identifier case-folding, no operator rewriting) —
-// an expression that differs in any other way is a real difference. An
-// expression either side cannot read ("" — the backend does not expose
-// GENERATION_EXPRESSION) never matches a readable one: not comparable is
-// not the same as equal, so the pair counts as a drift and the structure
-// sync refuses rather than guessing. Two unreadable expressions degrade
-// to the Generated/GenStorage check only.
+// an expression that differs in any other way is a real difference.
+//
+// An expression either side cannot READ (GenExprReadable false — the
+// backend does not expose GENERATION_EXPRESSION) is never comparable:
+// not comparable is not the same as equal, so the pair counts as a
+// drift and the structure sync refuses rather than guessing. This
+// includes BOTH sides unreadable: two empty expressions ("" == "") say
+// "neither side could be read", not "the expressions match" — a src
+// column x AS (a+b) and a dst column x AS (a-b) on backends that both
+// hide the expression are different columns, and treating them as equal
+// would be a false green.
 func genExprDiffers(sc, dc conn.ColMeta) bool {
+	if !sc.GenExprReadable || !dc.GenExprReadable {
+		return true
+	}
 	return normalizeGenerationExpr(sc.GenExpr) != normalizeGenerationExpr(dc.GenExpr)
 }
 
@@ -264,8 +281,8 @@ func colWhy(sc, dc conn.ColMeta) string {
 	case sc.Generated && !strings.EqualFold(sc.GenStorage, dc.GenStorage):
 		return fmt.Sprintf("generated storage %s -> %s", dc.GenStorage, sc.GenStorage)
 	case sc.Generated && genExprDiffers(sc, dc):
-		if sc.GenExpr == "" || dc.GenExpr == "" {
-			return "generated expression unreadable on one side"
+		if !sc.GenExprReadable || !dc.GenExprReadable {
+			return "generated expression unreadable on one or both sides; schema equality cannot be proven safely"
 		}
 		return "generated expression differs"
 	case !strings.EqualFold(sc.RawType, dc.RawType):

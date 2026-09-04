@@ -543,19 +543,22 @@ const (
 // resolves each foreign holder with a targeted point query, and never
 // buffers the table's unique values.
 //
-// oorSet is the out-of-range pass's own (server-side) scan result: a
-// holder in it is deleted before every in-range write, proven by the
-// scan itself — no client-side key ordering required, so it is the only
-// proof available for a case-insensitive or decimal key. lo/hi are the
-// source's GLOBAL key extremes (nil = unbounded side); a holder strictly
-// outside them yet NOT in oorSet is a --where residual that stays on the
-// destination (a conflict). oorActive says the out-of-range pass runs at
-// all (keyed on both sides, keys agree). A holder INSIDE the global
-// range belongs to another chunk and is resolved against the source (see
-// holderInOtherChunk); on a key whose order the client cannot reproduce
-// (orderKnown false) that resolution is impossible, so any in-range
-// foreign holder is a conflict: not provable is not safe.
-func (e *Engine) crossChunkCheck(ctx context.Context, src, dst *conn.Side, srcS, dstS *conn.Schema, ch chunk.Chunk, dstM map[string][]*srow, ops []op, lo, hi []driver.Value, oorSet map[string]bool, oorActive bool) (crossChunkVerdict, error) {
+// oorFlag is the out-of-range predicate (key < srcMin OR key > srcMax,
+// parameterized) carried as a per-row flag column on the holders query
+// itself (see holdersOf): a holder the flag marks out-of-range is
+// deleted by the UNFILTERED out-of-range pass, which the executor
+// commits before every in-range write — server-side authority, so it is
+// the only proof available for a case-insensitive or decimal key. lo/hi
+// are the source's GLOBAL key extremes (nil = unbounded side): a holder
+// the flag marks in-range yet the client orders strictly outside them
+// (data moved) is a conflict. oorActive says the unfiltered out-of-range
+// pass runs at all (keyed on both sides, keys agree, no filter). A
+// holder INSIDE the global range belongs to another chunk and is
+// resolved against the source (see holderInOtherChunk); on a key whose
+// order the client cannot reproduce (orderKnown false) that resolution
+// is impossible, so any such foreign holder is a conflict: not provable
+// is not safe.
+func (e *Engine) crossChunkCheck(ctx context.Context, src, dst *conn.Side, srcS, dstS *conn.Schema, ch chunk.Chunk, dstM map[string][]*srow, ops []op, lo, hi []driver.Value, oorFlag chunk.Pred, oorActive bool) (crossChunkVerdict, error) {
 	if len(e.uc) == 0 || len(ops) == 0 {
 		return crossSafe, nil
 	}
@@ -595,12 +598,12 @@ func (e *Engine) crossChunkCheck(ctx context.Context, src, dst *conn.Side, srcS,
 		if len(written[ci]) == 0 {
 			continue
 		}
-		hits, err := e.holdersOf(ctx, dst, dstS, ci, c, written[ci])
+		hits, err := e.holdersOf(ctx, dst, dstS, ci, c, written[ci], oorFlag, oorActive)
 		if err != nil {
 			return crossConflict, err
 		}
 		for _, h := range hits {
-			v, err := e.classifyHolder(ctx, src, srcS, ch, dstM, ci, c, h, written[ci], lo, hi, targeted, oorSet, oorActive, orderKnown)
+			v, err := e.classifyHolder(ctx, src, srcS, ch, dstM, ci, c, h, written[ci], lo, hi, targeted, oorActive, orderKnown)
 			if err != nil {
 				return crossConflict, err
 			}
@@ -620,16 +623,64 @@ func (e *Engine) crossChunkCheck(ctx context.Context, src, dst *conn.Side, srcS,
 // query returns is a holder of some written tuple — exactly, or by a
 // collation fold the local comparison cannot see (a conservative
 // holder either way).
-func (e *Engine) holdersOf(ctx context.Context, dst *conn.Side, dstS *conn.Schema, ci int, c uniqueConstraint, tuples map[string][]any) ([][]any, error) {
+//
+// When the unfiltered out-of-range pass runs (oorActive), each row
+// carries a computed flag column — the out-of-range predicate
+// (key < srcMin OR key > srcMax, parameterized) evaluated ON THE
+// SERVER: the holder classification then needs no client-side key order
+// and no second query (a case-insensitive or decimal key can still be
+// proven safe out-of-range, and in-range stays in-range by the
+// server's own comparison). The flag is a constant 0 when the pass does
+// not run (the caller conflicts such holders before consulting it).
+// holdersQuery renders one batch of the holders query: the key and
+// constraint columns, the optional server-side out-of-range flag column,
+// and the OR of the per-tuple equality terms.
+//
+// The argument order is part of the contract, not an implementation
+// detail: the driver binds positionally in the order the placeholders
+// APPEAR in the text. The flag column's placeholders sit in the SELECT
+// list — textually BEFORE the WHERE clause — so its args must LEAD the
+// list; the tuple args follow in term order. Appending the flag args
+// after the tuple args shifts every binding (the regression the t_mut
+// e2e caught: the WHERE then addressed the extreme values, not the
+// written tuples).
+func holdersQuery(dstS *conn.Schema, c uniqueConstraint, colIdents []string, tuples map[string][]any, keys []string, start, end int, oorFlag chunk.Pred, flagOn bool) (string, []any) {
+	keyIdents := make([]string, len(dstS.Key))
+	for i, k := range dstS.Key {
+		keyIdents[i] = conn.QuoteIdent(k)
+	}
+	terms := make([]string, 0, end-start)
+	args := make([]any, 0, (end-start)*len(colIdents)+len(oorFlag.Args))
+	if flagOn {
+		args = append(args, oorFlag.Args...)
+	}
+	for _, t := range keys[start:end] {
+		vs := tuples[t]
+		term := make([]string, len(colIdents))
+		for i := range colIdents {
+			term[i] = colIdents[i] + " = ?"
+			args = append(args, vs[i])
+		}
+		terms = append(terms, "("+strings.Join(term, " AND ")+")")
+	}
+	sel := make([]string, 0, len(keyIdents)+len(colIdents)+1)
+	sel = append(sel, keyIdents...)
+	sel = append(sel, colIdents...)
+	if flagOn {
+		sel = append(sel, "("+oorFlag.SQL+")")
+	} else {
+		sel = append(sel, "0")
+	}
+	return fmt.Sprintf("SELECT %s FROM %s WHERE %s",
+		strings.Join(sel, ", "), conn.QuoteIdent(dstS.Table), strings.Join(terms, " OR ")), args
+}
+
+func (e *Engine) holdersOf(ctx context.Context, dst *conn.Side, dstS *conn.Schema, ci int, c uniqueConstraint, tuples map[string][]any, oorFlag chunk.Pred, oorActive bool) ([]holderRow, error) {
 	cn, err := dst.AcquireScan(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer cn.Close()
-	keyIdents := make([]string, len(dstS.Key))
-	for i, k := range dstS.Key {
-		keyIdents[i] = conn.QuoteIdent(k)
-	}
 	colIdents := make([]string, len(c.cols))
 	for i, n := range c.cols {
 		colIdents[i] = conn.QuoteIdent(n)
@@ -639,34 +690,21 @@ func (e *Engine) holdersOf(ctx context.Context, dst *conn.Side, dstS *conn.Schem
 		keys = append(keys, t)
 	}
 	sort.Strings(keys)
-	var out [][]any
+	var out []holderRow
+	flagOn := oorActive && oorFlag.SQL != ""
 	for start := 0; start < len(keys); start += holderBatch {
 		end := start + holderBatch
 		if end > len(keys) {
 			end = len(keys)
 		}
-		terms := make([]string, 0, end-start)
-		args := make([]any, 0, (end-start)*len(colIdents))
-		for _, t := range keys[start:end] {
-			vs := tuples[t]
-			term := make([]string, len(colIdents))
-			for i := range colIdents {
-				term[i] = colIdents[i] + " = ?"
-				args = append(args, vs[i])
-			}
-			terms = append(terms, "("+strings.Join(term, " AND ")+")")
-		}
-		sel := make([]string, 0, len(keyIdents)+len(colIdents))
-		sel = append(sel, keyIdents...)
-		sel = append(sel, colIdents...)
-		query := fmt.Sprintf("SELECT %s FROM %s WHERE %s",
-			strings.Join(sel, ", "), conn.QuoteIdent(dstS.Table), strings.Join(terms, " OR "))
+		query, args := holdersQuery(dstS, c, colIdents, tuples, keys, start, end, oorFlag, flagOn)
+		selCount := len(dstS.Key) + len(c.cols) + 1
 		rows, err := cn.QueryContext(ctx, query, args...)
 		if err != nil {
 			return nil, err
 		}
-		vals := make([]any, len(sel))
-		ptrs := make([]any, len(sel))
+		vals := make([]any, selCount)
+		ptrs := make([]any, selCount)
 		for i := range vals {
 			ptrs[i] = &vals[i]
 		}
@@ -678,9 +716,18 @@ func (e *Engine) holdersOf(ctx context.Context, dst *conn.Side, dstS *conn.Schem
 				rows.Close()
 				return nil, err
 			}
-			keyPart := make([]any, len(keyIdents))
-			copy(keyPart, vals[:len(keyIdents)])
-			out = append(out, keyPart)
+			keyPart := make([]any, len(dstS.Key))
+			copy(keyPart, vals[:len(dstS.Key)])
+			h := holderRow{key: keyPart}
+			if flagOn {
+				switch f := vals[selCount-1].(type) {
+				case int64:
+					h.oor = f != 0
+				case bool:
+					h.oor = f
+				}
+			}
+			out = append(out, h)
 		}
 		if err := rows.Err(); err != nil {
 			rows.Close()
@@ -691,18 +738,25 @@ func (e *Engine) holdersOf(ctx context.Context, dst *conn.Side, dstS *conn.Schem
 	return out, nil
 }
 
+// holderRow is one foreign holder as the holders query returns it: the
+// raw key plus the server-side out-of-range flag (see holdersOf).
+type holderRow struct {
+	key []any
+	oor bool // the row's key is strictly outside the source's key range
+}
+
 // classifyHolder resolves one foreign holder (a destination key row the
 // holder query matched, outside this chunk's addressed groups) against
-// the chunk, the out-of-range pass and the source. oorSet is the
-// out-of-range pass's OWN scan result (normalized destination keys): a
-// membership there is server-side authority that the row is deleted
-// before any in-range write, and needs no client-side key ordering —
-// so it is the one proof a case-insensitive or decimal key can still
-// get. Everything past it (the chunk positioning) requires the client
+// the chunk, the out-of-range pass and the source. The holder's oor
+// flag is the out-of-range predicate evaluated ON THE SERVER: a marked
+// holder is deleted by the unfiltered out-of-range pass, which the
+// executor commits before every in-range write — safe regardless of the
+// key's collation (the one proof a case-insensitive or decimal key can
+// get). Everything past it (the chunk positioning) requires the client
 // to be able to reproduce the server's key order (orderKnown).
-func (e *Engine) classifyHolder(ctx context.Context, src *conn.Side, srcS *conn.Schema, ch chunk.Chunk, dstM map[string][]*srow, ci int, c uniqueConstraint, h []any, tuples map[string][]any, lo, hi []driver.Value, targeted, oorSet map[string]bool, oorActive, orderKnown bool) (crossChunkVerdict, error) {
+func (e *Engine) classifyHolder(ctx context.Context, src *conn.Side, srcS *conn.Schema, ch chunk.Chunk, dstM map[string][]*srow, ci int, c uniqueConstraint, h holderRow, tuples map[string][]any, lo, hi []driver.Value, targeted map[string]bool, oorActive, orderKnown bool) (crossChunkVerdict, error) {
 	buf := make([]byte, 0, 256)
-	id, err := e.dstKey.Normalize(h, buf)
+	id, err := e.dstKey.Normalize(h.key, buf)
 	if err != nil {
 		return crossConflict, err
 	}
@@ -719,17 +773,15 @@ func (e *Engine) classifyHolder(ctx context.Context, src *conn.Side, srcS *conn.
 		// is not provably safe
 		return crossConflict, nil
 	}
-	if oorSet[idS] {
-		// the out-of-range pass (scanned on the SERVER, committed before
-		// every in-range chunk group) deletes this exact row: safe
-		// regardless of the key's collation
-		return crossSafe, nil
-	}
 	if !oorActive {
-		// no out-of-range pass will run (the keys disagree, or the scan
-		// found nothing to delete beyond what is buffered here): a
-		// foreign holder cannot be proven removed
+		// no unfiltered out-of-range pass will run (the keys disagree,
+		// or a filter is on): a foreign holder cannot be proven removed
 		return crossConflict, nil
+	}
+	if h.oor {
+		// the out-of-range pass (committed before every in-range write)
+		// deletes this exact row: safe regardless of the key's collation
+		return crossSafe, nil
 	}
 	if !orderKnown {
 		// inside the global range on a key whose order the client cannot
@@ -740,21 +792,21 @@ func (e *Engine) classifyHolder(ctx context.Context, src *conn.Side, srcS *conn.
 		return crossConflict, nil
 	}
 	if lo != nil {
-		if cmp, ok := keyCmp(h, toAny(lo), -1); ok && cmp < 0 {
-			// strictly below the source's minimum yet NOT in the
-			// out-of-range set: a --where residual that stays on the
-			// destination and keeps the slot
+		if cmp, ok := keyCmp(h.key, toAny(lo), -1); ok && cmp < 0 {
+			// the client orders it strictly below the source's minimum
+			// yet the server marks it in-range: the row moved (or the
+			// two disagree) — not provably deleted, a conflict
 			return crossConflict, nil
 		}
 	}
 	if hi != nil {
-		if cmp, ok := keyCmp(h, toAny(hi), -1); ok && cmp > 0 {
-			// strictly above the source's maximum: ditto
+		if cmp, ok := keyCmp(h.key, toAny(hi), -1); ok && cmp > 0 {
+			// ditto, strictly above the source's maximum
 			return crossConflict, nil
 		}
 	}
 	// inside the global range: another chunk
-	return e.holderInOtherChunk(ctx, src, srcS, ch, ci, c, h, tuples)
+	return e.holderInOtherChunk(ctx, src, srcS, ch, ci, c, h.key, tuples)
 }
 
 // holderInOtherChunk resolves a holder inside the source's global key
