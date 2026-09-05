@@ -231,7 +231,7 @@ func syncRunE(cmd *cobra.Command, _ []string) error {
 		printSyncReport(allPlans, false)
 		return nil
 	}
-	proceed, err := confirmApply(syncOpt.apply, syncOpt.yes, syncSummary(allPlans))
+	proceed, err := confirmApply(syncOpt.apply, syncOpt.yes, syncSummary(allPlans, cfg.Opts.AllowStructureTruncate))
 	if err != nil {
 		return err
 	}
@@ -407,7 +407,14 @@ func allSkip(plans []msync.TableSync) bool {
 // unique slot) get their own section: they touch rows the user did not
 // ask to change, and they run only because this very summary showed
 // them (P0-3).
-func syncSummary(plans []msync.TableSync) string {
+//
+// allowStructureTruncate is the RESOLVED value (CLI flag over YAML
+// config over default) — the same value the runner uses to decide. The
+// summary must never read the CLI global: a YAML
+// allow_structure_truncate: true with the flag unset must warn here,
+// or the user would confirm a run whose apply may TRUNCATE a table
+// without the summary ever saying so.
+func syncSummary(plans []msync.TableSync, allowStructureTruncate bool) string {
 	var full, row, skip, create, drop, state, stateNote, fail int
 	var names, destructive, rewrites []string
 	for _, p := range plans {
@@ -458,8 +465,8 @@ func syncSummary(plans []msync.TableSync) string {
 	if len(names) > 0 {
 		summary += ": " + strings.Join(names, ", ")
 	}
-	if syncOpt.structTruncate {
-		summary += "\nNOTE: --allow-structure-truncate is set — if an in-place structure ALTER fails, the destination table is TRUNCATED and the DDL re-applied on the empty table"
+	if allowStructureTruncate {
+		summary += "\nNOTE: allow_structure_truncate is set (flag or config) — if an in-place structure ALTER fails, the destination table is TRUNCATED and the DDL re-applied on the empty table"
 	}
 	if len(destructive) > 0 {
 		summary += fmt.Sprintf("\nDESTRUCTIVE: %d irreversible statement(s) will be executed:", len(destructive))

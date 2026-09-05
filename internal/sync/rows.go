@@ -53,6 +53,12 @@ type op struct {
 	// the first row's key would leave the rest behind.
 	delKeys [][]any
 	rows    [][]any
+	// rewriteFP is the rewrite group's STABLE IDENTITY (P0): the
+	// confirmed scope carries one fingerprint per group, and the apply
+	// may run only groups the confirmed plan showed — a re-plan that
+	// keeps the count but changes the group is a scope expansion.
+	// Set only for opRewrite ("" otherwise).
+	rewriteFP string
 }
 
 // srow is one buffered row.
@@ -1266,17 +1272,30 @@ func (e *Engine) diffUniqueProtected(keys []string, srcM, dstM map[string][]*sro
 	}
 	// a no-op group holding a written tuple must be rewritten (its row
 	// never moves on its own, so without the rewrite it still holds the
-	// tuple when the writer's insert runs):
-	rewrite := make(map[int]bool, len(groups))
+	// tuple when the writer's insert runs). rewriteCols records, per
+	// group, the column sets of EVERY constraint that forces the rewrite
+	// (constraint index order) — the input to the group's identity
+	// fingerprint (P0: the confirmed scope authorizes the GROUP, not a
+	// count).
+	rewriteCols := make(map[int][][]string, len(groups))
 	for i, g := range groups {
 		if g.kind != 2 {
 			continue
 		}
+		seen := make(map[string]bool)
 		for ci, c := range e.uc {
+			hit := false
 			for _, r := range g.d {
 				if t, _, ok := tupleOf(ci, &c, r.vals, c.dstIdx); ok && written[ci][t] {
-					rewrite[i] = true
+					hit = true
 					break
+				}
+			}
+			if hit {
+				id := strings.Join(c.cols, "\x00")
+				if !seen[id] {
+					seen[id] = true
+					rewriteCols[i] = append(rewriteCols[i], c.cols)
 				}
 			}
 		}
@@ -1300,7 +1319,7 @@ func (e *Engine) diffUniqueProtected(keys []string, srcM, dstM map[string][]*sro
 			for _, r := range g.d {
 				ops = append(ops, del(r))
 			}
-		case g.kind == 2 && rewrite[i]:
+		case g.kind == 2 && len(rewriteCols[i]) > 0:
 			// delete EVERY destination row of the group (not just the
 			// first): the group's rows can carry distinct raw keys that
 			// only fold together under the normalizer, so a single-key
@@ -1309,7 +1328,7 @@ func (e *Engine) diffUniqueProtected(keys []string, srcM, dstM map[string][]*sro
 			for _, r := range g.d {
 				dk = append(dk, e.keyVals(r.vals))
 			}
-			ops = append(ops, op{kind: opRewrite, key: e.keyVals(g.d[0].vals), delKeys: dk, rows: rowsOf(g.s)})
+			ops = append(ops, op{kind: opRewrite, key: e.keyVals(g.d[0].vals), delKeys: dk, rows: rowsOf(g.s), rewriteFP: rewriteFingerprint(rewriteCols[i], dk)})
 		}
 	}
 	// phase 2: every insert (new rows, replaced groups, converted
@@ -1396,6 +1415,21 @@ func rewriteCount(chunked [][]op) int {
 		}
 	}
 	return n
+}
+
+// rewriteFingerprints collects the STABLE IDENTITY of the rewrite groups
+// the ops carry (P0): the confirmed scope keeps this set, and the
+// apply-time re-plan may run a subset of it and nothing else.
+func rewriteFingerprints(chunked [][]op) []string {
+	var fps []string
+	for _, ops := range chunked {
+		for _, o := range ops {
+			if o.kind == opRewrite && o.rewriteFP != "" {
+				fps = append(fps, o.rewriteFP)
+			}
+		}
+	}
+	return fps
 }
 
 // groupOps splits ops into groups of at most batch (batch < 1: one group):

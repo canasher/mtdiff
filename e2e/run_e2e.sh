@@ -562,6 +562,31 @@ qdb src srcdb2 "SELECT 1" >/dev/null 2>&1 || \
 $COMPOSE -f e2e/docker-compose.yml exec -T -e MYSQL_PWD=rootpw mysql-dst \
   mysql -uroot -e "DROP DATABASE IF EXISTS dstdb2; CREATE DATABASE dstdb2"
 sql src srcdb2 seed_src2.sql
+# (0) real-MySQL regression for the destructive re-gates: the DROP
+# TOCTOU re-check (a source table appearing after the confirmed plan
+# refuses the drop) and the destructive-scope re-gate (an apply-time
+# escalation to the full resync that the confirmed plan never showed
+# stops the table, zero writes). Go tests against this same pair; they
+# own two throwaway tables (t_droprace, t_xid) and drop them again, so
+# the scenarios below are unaffected.
+# Skips cleanly when the host has no Go toolchain (the container hosts
+# of this suite do not always have one).
+GOCMD=""
+if command -v go >/dev/null 2>&1; then
+  GOCMD=go
+elif [ -x /home/liukl/sdk/go/bin/go ]; then
+  GOCMD=/home/liukl/sdk/go/bin/go
+fi
+if [ -n "$GOCMD" ]; then
+  if MTDIFF_E2E_DSN_SRC="$SRC2" MTDIFF_E2E_DSN_DST="$DST2" \
+    "$GOCMD" test -count=1 -timeout 10m -run 'TestDropRaceRealMySQL|TestScopeEscalationRealMySQL' ./internal/sync/; then
+    echo "ok: real-MySQL destructive re-gates (drop TOCTOU re-check + scope escalation refusal)"
+  else
+    echo "FAIL: real-MySQL destructive re-gate regression"; exit 1
+  fi
+else
+  echo "note: no go toolchain on the host; skipping the real-MySQL re-gate regression"
+fi
 # (a) empty dst database: the dry-run plans a CREATE for every source
 # table (t_new included) and writes nothing.
 expect 1 "empty dst: dry-run plans the creates" sync --src "$SRC2" --dst "$DST2"

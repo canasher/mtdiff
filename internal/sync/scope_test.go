@@ -32,47 +32,61 @@ func TestScopeGateRowLevelNeverTruncates(t *testing.T) {
 	}
 }
 
-// TestScopeGateRewriteCount is spec items 2 and 4: a confirmed plan that
-// showed no rewrites refuses any rewrite the re-plan needs (a unique
-// swap that appeared, or a cross-chunk conflict), and a plan that showed
-// N refuses more than N (the difference means data moved). Shrinkage is
-// always allowed: a confirmed plan that showed rewrites may run fewer or
-// none (the data converged).
-func TestScopeGateRewriteCount(t *testing.T) {
+// TestScopeGateRewriteIdentity is the P0 rewrite rule: authorization is
+// by GROUP IDENTITY, not count. The re-plan may run the confirmed groups
+// (all, some, or none) and nothing else — a re-plan that keeps the COUNT
+// but swaps the group ({A,B} -> {A,C}) is an expansion and must stop.
+func TestScopeGateRewriteIdentity(t *testing.T) {
 	cases := []struct {
 		name     string
 		conf     TableSync
 		mode     Mode
-		rewrites int
+		current  []string
 		wantGate bool
 	}{
-		{"no rewrite confirmed, re-plan needs one", confirmed("ROWLEVEL", DestructiveScope{}, 0), ModeRowLevel, 1, true},
-		{"no rewrite confirmed, re-plan needs three", confirmed("ROWLEVEL", DestructiveScope{}, 0), ModeRowLevel, 3, true},
-		{"rewrite confirmed, re-plan needs more", confirmed("ROWLEVEL", DestructiveScope{RowRewrite: true}, 2), ModeRowLevel, 5, true},
-		{"rewrite confirmed, re-plan needs the same", confirmed("ROWLEVEL", DestructiveScope{RowRewrite: true}, 2), ModeRowLevel, 2, false},
-		{"rewrite confirmed, re-plan needs fewer (converged)", confirmed("ROWLEVEL", DestructiveScope{RowRewrite: true}, 2), ModeRowLevel, 0, false},
-		{"no rewrites at all", confirmed("ROWLEVEL", DestructiveScope{}, 0), ModeRowLevel, 0, false},
-		{"confirmed full resync, row-level re-plan with no rewrites (shrink)", confirmed("FULL", DestructiveScope{FullResync: true}, 0), ModeRowLevel, 0, false},
+		{"no rewrite confirmed, re-plan needs one", confirmed("ROWLEVEL", DestructiveScope{}, 0), ModeRowLevel, []string{"A"}, true},
+		{"no rewrite confirmed, re-plan needs three", confirmed("ROWLEVEL", DestructiveScope{}, 0), ModeRowLevel, []string{"A", "B", "C"}, true},
+		{"same group, confirmed and current", confirmed("ROWLEVEL", DestructiveScope{RowRewrite: true, RewriteFingerprints: []string{"A", "B"}}, 2), ModeRowLevel, []string{"A", "B"}, false},
+		{"same group, current in swapped order (order is not identity)", confirmed("ROWLEVEL", DestructiveScope{RowRewrite: true, RewriteFingerprints: []string{"A", "B"}}, 2), ModeRowLevel, []string{"B", "A"}, false},
+		{"subset of the confirmed groups (converged)", confirmed("ROWLEVEL", DestructiveScope{RowRewrite: true, RewriteFingerprints: []string{"A", "B"}}, 2), ModeRowLevel, []string{"A"}, false},
+		{"nothing left to rewrite (fully converged)", confirmed("ROWLEVEL", DestructiveScope{RowRewrite: true, RewriteFingerprints: []string{"A", "B"}}, 2), ModeRowLevel, nil, false},
+		{"SAME COUNT but a different group: {A,B} -> {A,C}", confirmed("ROWLEVEL", DestructiveScope{RowRewrite: true, RewriteFingerprints: []string{"A", "B"}}, 2), ModeRowLevel, []string{"A", "C"}, true},
+		{"one confirmed group, one unconfirmed group: {A,B} -> {C}", confirmed("ROWLEVEL", DestructiveScope{RowRewrite: true, RewriteFingerprints: []string{"A", "B"}}, 2), ModeRowLevel, []string{"C"}, true},
+		{"a superset of the confirmed groups: {A,B} -> {A,B,C}", confirmed("ROWLEVEL", DestructiveScope{RowRewrite: true, RewriteFingerprints: []string{"A", "B"}}, 2), ModeRowLevel, []string{"A", "B", "C"}, true},
+		{"no rewrites at all", confirmed("ROWLEVEL", DestructiveScope{}, 0), ModeRowLevel, nil, false},
+		{"confirmed full resync, row-level re-plan with no rewrites (shrink)", confirmed("FULL", DestructiveScope{FullResync: true}, 0), ModeRowLevel, nil, false},
 	}
 	for _, c := range cases {
-		what := scopeGate(c.mode, rowWork{rewrites: c.rewrites}, c.conf)
+		what := scopeGate(c.mode, rowWork{rewrites: len(c.current), rewriteFPs: c.current}, c.conf)
 		if (what != "") != c.wantGate {
 			t.Errorf("%s: gate = %q, want gated=%v", c.name, what, c.wantGate)
 		}
 	}
 }
 
-// TestScopeGateMessageNamesTheDifference pins the operator-facing text:
-// the refusal must say what the re-plan needs and what the confirmed
-// plan showed, so the operator can see the scope expansion at a glance.
+// TestScopeGateMessageLeadsWithCountsAndNoValues pins the operator-facing
+// text: the refusal names the counts (confirmed / current / new) so the
+// operator sees the scope change at a glance, and it must NEVER print
+// the keys themselves — the message is shown to the operator, not to
+// the data, and key values are business data.
 func TestScopeGateMessageNamesTheDifference(t *testing.T) {
-	conf := confirmed("ROWLEVEL", DestructiveScope{RowRewrite: true}, 2)
-	what := scopeGate(ModeRowLevel, rowWork{rewrites: 5}, conf)
-	if !strings.Contains(what, "5") || !strings.Contains(what, "2") {
-		t.Errorf("gate must name both counts, got: %s", what)
+	// real fingerprints from real key material: the gate message must
+	// carry only the digest-derived counts, never "Alice" or 1001
+	fa := rewriteFingerprint([][]string{{"u"}}, [][]any{{"Alice"}})
+	fb := rewriteFingerprint([][]string{{"u"}}, [][]any{{"Bob"}})
+	fc := rewriteFingerprint([][]string{{"u"}}, [][]any{{int64(1001)}})
+	conf := confirmed("ROWLEVEL", DestructiveScope{RowRewrite: true, RewriteFingerprints: []string{fa, fb}}, 2)
+	what := scopeGate(ModeRowLevel, rowWork{rewrites: 3, rewriteFPs: []string{fa, fb, fc}}, conf)
+	if !strings.Contains(what, "3") || !strings.Contains(what, "2") || !strings.Contains(what, "1") {
+		t.Errorf("gate must name confirmed/current/new counts, got: %s", what)
 	}
 	if !strings.Contains(what, "DELETE+INSERT") {
 		t.Errorf("gate must name the operation it refuses, got: %s", what)
+	}
+	for _, leak := range []string{"Alice", "Bob", "1001", fa, fb, fc} {
+		if strings.Contains(what, leak) {
+			t.Errorf("gate must not leak key material (%q), got: %s", leak, what)
+		}
 	}
 }
 

@@ -76,6 +76,15 @@ type DestructiveScope struct {
 	// cross-chunk plan with --allow-row-rewrite, or a structure repair
 	// that ends on the full load).
 	FullResync bool
+	// RewriteFingerprints: the IDENTITY of each rewrite group the plan
+	// showed (P0): one stable digest per group (triggering constraints +
+	// the group's destination keys, order-independent — see
+	// fingerprint.go). The apply-time re-plan may run this set or a
+	// SUBSET of it, and nothing else: a re-plan that keeps the COUNT
+	// but swaps the group (data moved between confirmation and the
+	// re-plan) is an expansion and stops the table. The digest carries
+	// no business value.
+	RewriteFingerprints []string
 }
 
 // scopeGate judges the re-plan's destructive part against the CONFIRMED
@@ -89,19 +98,22 @@ type DestructiveScope struct {
 //   - the full resync: a re-plan that needs the TRUNCATE runs only when
 //     the confirmed plan is the one that showed it (a confirmed
 //     row-level plan can never TRUNCATE in the same run — P0-1);
-//   - the rewrites: the re-plan's destructive rewrite count may not
-//     exceed what the confirmed plan SHOWED (a plan that showed 2
-//     rewrite groups may not run 5: the difference means data moved,
-//     and the new plan needs a fresh confirmation). Shrinking — fewer
-//     rewrites, a full plan that no longer needs the TRUNCATE — always
-//     passes: it never touches rows the confirmed plan would not.
+//   - the rewrites: by IDENTITY, not count (P0). The re-plan's rewrite
+//     groups must be a SUBSET of the groups the confirmed plan SHOWED:
+//     the same groups, fewer of them, or none pass; a group that was
+//     not in the confirmed set (data moved between the confirmation and
+//     the re-plan — even with the SAME count) stops the table. A count
+//     cannot prove this: confirmed {A,B} and current {A,C} both show 2.
+//     The message names counts only — never key values (the refusal
+//     must not leak business data).
 func scopeGate(mode Mode, w rowWork, confirmed TableSync) string {
 	switch {
 	case mode == ModeFull && !confirmed.Scope.FullResync:
 		return "the full resync (TRUNCATE + reload)"
-	case mode == ModeRowLevel && w.rewrites > confirmed.Rewrites:
-		return fmt.Sprintf("%d destructive row rewrite group(s) (DELETE+INSERT); the confirmed plan showed %d",
-			w.rewrites, confirmed.Rewrites)
+	case mode == ModeRowLevel && !fingerprintSubset(w.rewriteFPs, confirmed.Scope.RewriteFingerprints):
+		return fmt.Sprintf("%d destructive row rewrite group(s) (DELETE+INSERT) — %d of them were not part of the confirmed plan (confirmed=%d, current=%d)",
+			w.rewrites, fingerprintNew(w.rewriteFPs, confirmed.Scope.RewriteFingerprints),
+			confirmed.Rewrites, w.rewrites)
 	}
 	return ""
 }
@@ -214,6 +226,13 @@ type Runner struct {
 	// allocator, e.g. TiDB's batch allocation), or is an unknown backend
 	// decided per table by its reported gap.
 	stateSrc, stateDst *sideState
+
+	// Pre-DROP existence probes (ApplyDrop's TOCTOU re-gate): nil in
+	// production, where each probe queries the side's information
+	// schema; unit tests override them to drive the re-check branches.
+	srcDropRecheck   func(ctx context.Context, table string) (bool, error)
+	dstDropRecheck   func(ctx context.Context, table string) (bool, error)
+	dstDropPostcheck func(ctx context.Context, table string) (bool, error)
 }
 
 // stateGapLimit: the largest distance a side's reported next
@@ -671,6 +690,10 @@ type rowWork struct {
 	// rewrites is the number of destructive row-rewrite groups the plan
 	// shows (0 when the plan rewrites nothing).
 	rewrites int
+	// rewriteFPs is the IDENTITY of those groups (one fingerprint each,
+	// see fingerprint.go): the confirmed scope carries this set, and the
+	// apply-time re-plan may run a SUBSET of it and nothing else (P0).
+	rewriteFPs []string
 	// maxChunkOps is the largest single chunk group's op count (the
 	// ordinary path's per-group memory peak, O(chunk delta)).
 	maxChunkOps int
@@ -866,7 +889,7 @@ func (r *Runner) PlanRowWork(ctx context.Context, p *prep, res compare.TableResu
 			maxChunkOps = len(ops)
 		}
 	}
-	w := rowWork{kind: rowWorkChunks, ops: out, oorDel: oorDel, rewrites: rewriteCount(out), maxChunkOps: maxChunkOps}
+	w := rowWork{kind: rowWorkChunks, ops: out, oorDel: oorDel, rewrites: rewriteCount(out), rewriteFPs: rewriteFingerprints(out), maxChunkOps: maxChunkOps}
 	return w, nil
 }
 
@@ -2015,6 +2038,7 @@ func (r *Runner) PlanTable(ctx context.Context, res compare.TableResult) TableSy
 					// to what the plan showed — no more.
 					scope.RowRewrite = true
 					ts.Rewrites = n
+					scope.RewriteFingerprints = w.rewriteFPs
 					ts.SampleSQL = append(ts.SampleSQL, fmt.Sprintf("DESTRUCTIVE ROW REWRITE: %d row group(s) are deleted and re-inserted to free unique slots (permitted by --allow-row-rewrite)", n))
 				}
 			}
@@ -2174,16 +2198,52 @@ func DropPlanFor(table string) TableSync {
 // connection, then confirms the table is gone (a DROP that reports success
 // but leaves the table is still a failure). A failure marks the table
 // FAILED: the next run re-discovers it and converges it again.
+//
+// TOCTOU re-gate: the pre-pass discovered this table as destination-only
+// at an EARLIER moment, and the source may have created it since (or the
+// destination table may have vanished out-of-band). A DROP is a
+// destructive statement, so both facts are re-queried right before it
+// executes, and any metadata anomaly vetoes it (fail closed):
+//
+//   - the source NOW HAS the table: the confirmed plan is stale — it said
+//     "drop a table the source lacks". REFUSE (ErrReplanRequired): the
+//     destination is untouched, nothing was executed, and the re-run
+//     reviews the new plan (the table may now be a normal sync target).
+//   - either re-check query fails: fail closed, DROP not executed.
+//   - the destination table is already GONE: the goal state (absence)
+//     was achieved without this run — converged, nothing executed.
 func (r *Runner) ApplyDrop(ctx context.Context, table string, ap *Applier) TableSync {
 	ts := DropPlanFor(table)
 	if r.o.Progress != nil {
 		r.o.Progress("%-24s drop (destination-only table)", table)
 	}
+	srcExists, err := r.dropProbe(ctx, r.Src, table, r.srcDropRecheck)
+	if err != nil {
+		ts.Status, ts.Error = "FAILED", fmt.Sprintf("re-check source before drop: %v — fail closed, DROP not executed", err)
+		return ts
+	}
+	if srcExists {
+		ts.Status, ts.Error = "FAILED", fmt.Sprintf("%s: source table %q appeared after the plan was confirmed — the destination table is untouched and the DROP was not executed. Re-run to re-plan: the table may now be a normal sync target",
+			ErrReplanRequired, table)
+		return ts
+	}
+	dstExists, err := r.dropProbe(ctx, r.Dst, table, r.dstDropRecheck)
+	if err != nil {
+		ts.Status, ts.Error = "FAILED", fmt.Sprintf("re-check destination before drop: %v — fail closed, DROP not executed", err)
+		return ts
+	}
+	if !dstExists {
+		if r.o.Progress != nil {
+			r.o.Progress("%-24s drop: already absent (converged, nothing executed)", table)
+		}
+		ts.Status, ts.Verified = "APPLIED", "OK"
+		return ts
+	}
 	if err := ap.execDirect(ctx, ts.SchemaSQL[0]); err != nil {
 		ts.Status, ts.Error = "FAILED", fmt.Sprintf("drop table: %v", err)
 		return ts
 	}
-	exists, err := conn.TableExists(ctx, r.Dst.Ctl(), table)
+	exists, err := r.dropProbe(ctx, r.Dst, table, r.dstDropPostcheck)
 	if err != nil {
 		ts.Status, ts.Error = "FAILED", fmt.Sprintf("verify drop: %v", err)
 		return ts
@@ -2194,4 +2254,15 @@ func (r *Runner) ApplyDrop(ctx context.Context, table string, ap *Applier) Table
 	}
 	ts.Status, ts.Verified = "APPLIED", "OK"
 	return ts
+}
+
+// dropProbe is one side's table-existence check around a DROP: the unit
+// hooks (srcDropRecheck / dstDropRecheck / dstDropPostcheck) drive the
+// branches in tests; nil in production, where it queries the side's
+// information schema.
+func (r *Runner) dropProbe(ctx context.Context, side *conn.Side, table string, hook func(context.Context, string) (bool, error)) (bool, error) {
+	if hook != nil {
+		return hook(ctx, table)
+	}
+	return conn.TableExists(ctx, side.Ctl(), table)
 }

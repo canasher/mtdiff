@@ -3,7 +3,9 @@
 package config
 
 import (
+	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"regexp"
 
@@ -91,14 +93,41 @@ var envRe = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
 
 // LoadFile loads a YAML config file. ${ENV} references in string values are
 // replaced with the environment variable's value (empty if unset).
+//
+// Parsing is STRICT: unknown fields are an error (KnownFields), at every
+// level — top-level, endpoint, options. mtdiff can execute DROP TABLE,
+// TRUNCATE and destructive rewrites, so a misspelled option (e.g.
+// exclude_table instead of exclude_tables) must fail closed at parse
+// time, not be silently dropped and let the mis-scoped table enter the
+// sync/drop set. A file with more than one YAML document is refused
+// outright: this config is a single document, and reading only the first
+// would hide a second half the operator believes is in effect.
 func LoadFile(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	var c Config
-	if err := yaml.Unmarshal(expandEnv(data), &c); err != nil {
+	c, err := Parse(expandEnv(data))
+	if err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	return c, nil
+}
+
+// Parse decodes one YAML document into a Config, strictly: unknown
+// fields at any level are an error, and a second document is refused.
+// Exported so config-resolution tests can exercise the same strict
+// decoding a file goes through (LoadFile wraps it with env expansion).
+func Parse(data []byte) (*Config, error) {
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+	var c Config
+	if err := dec.Decode(&c); err != nil {
+		return nil, err
+	}
+	var next Config
+	if err := dec.Decode(&next); err != io.EOF {
+		return nil, fmt.Errorf("multiple YAML documents: this configuration is a single document (the first document parsed, the rest ignored — refused rather than silently half-applied)")
 	}
 	return &c, nil
 }

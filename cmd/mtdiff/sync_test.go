@@ -2,6 +2,8 @@ package mtdiff
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -14,7 +16,9 @@ import (
 func intPtr(v int) *int { return &v }
 
 // newSyncCommand builds a command carrying the sync flags with all values
-// reset to their defaults, mirroring newDiffCommand.
+// reset to their defaults, mirroring newDiffCommand. It binds the same
+// flag set production init() does (including the two security flags), so
+// the resolution tests exercise the real Changed/override behavior.
 func newSyncCommand(t *testing.T) *cobra.Command {
 	t.Helper()
 	syncOpt = syncOpts{}
@@ -26,6 +30,8 @@ func newSyncCommand(t *testing.T) *cobra.Command {
 	f.IntVar(&syncOpt.batchSize, "batch-size", 0, "")
 	f.IntVar(&syncOpt.sampleLimit, "sample-limit", 0, "")
 	f.BoolVar(&syncOpt.noSyncSchema, "no-sync-schema", false, "")
+	f.BoolVar(&syncOpt.structTruncate, "allow-structure-truncate", false, "")
+	f.BoolVar(&syncOpt.rowRewrite, "allow-row-rewrite", false, "")
 	return cmd
 }
 
@@ -120,7 +126,96 @@ func TestAllSkipWithNewModes(t *testing.T) {
 	}
 }
 
-// TestApplySyncOpts covers batch-size / sample-limit handling: an explicit
+// TestSyncSummaryStructureTruncate pins the confirmation-summary fix: the
+// destructive TRUNCATE note follows the RESOLVED allow_structure_truncate
+// value (the argument), not a CLI global — a YAML config that enables it
+// must warn in the summary the user confirms, or the apply could TRUNCATE
+// a table the user never saw coming.
+func TestSyncSummaryStructureTruncate(t *testing.T) {
+	plans := []msync.TableSync{{Name: "t1", Mode: "ROWLEVEL", Status: "PLANNED"}}
+
+	// resolved true: the note is present and names both the capability
+	// and the consequence
+	summary := syncSummary(plans, true)
+	if !strings.Contains(summary, "allow_structure_truncate") {
+		t.Errorf("resolved true must name the capability:\n%s", summary)
+	}
+	if !strings.Contains(summary, "TRUNCATED") {
+		t.Errorf("resolved true must state the TRUNCATE consequence:\n%s", summary)
+	}
+
+	// resolved false: no risk note at all
+	if s := syncSummary(plans, false); strings.Contains(s, "allow_structure_truncate") {
+		t.Errorf("resolved false must carry no truncate note:\n%s", s)
+	}
+}
+
+// TestSyncSummaryResolvedConfigResolution is the config-resolution level
+// of the same fix: the value the summary is shown with is what the
+// runner will use — YAML wins when the flag is unset (the old code
+// showed the CLI default false and hid it), and an EXPLICIT flag
+// overrides the YAML (same precedence as every other option).
+func TestSyncSummaryResolvedConfigResolution(t *testing.T) {
+	plans := []msync.TableSync{{Name: "t1", Mode: "ROWLEVEL", Status: "PLANNED"}}
+	load := func(yaml string) *config.Config {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "cfg.yaml")
+		if err := os.WriteFile(path, []byte(yaml), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		c, err := config.LoadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	const yamlTrue = "src:\n  host: h\ndst:\n  host: d\noptions:\n  allow_structure_truncate: true\n"
+	const yamlFalse = "src:\n  host: h\ndst:\n  host: d\noptions:\n  allow_structure_truncate: false\n"
+
+	// case 3 (the reported bug): flag UNSET (CLI default false), YAML true
+	// -> the resolved value is true, and the summary must show it
+	cfg := load(yamlTrue)
+	cmd := newSyncCommand(t)
+	if err := applySyncOpts(cmd, &syncOpt, cfg); err != nil {
+		t.Fatalf("no flags: %v", err)
+	}
+	if !cfg.Opts.AllowStructureTruncate {
+		t.Fatalf("unset flag must not mask the YAML value: %+v", cfg.Opts)
+	}
+	if s := syncSummary(plans, cfg.Opts.AllowStructureTruncate); !strings.Contains(s, "allow_structure_truncate") {
+		t.Errorf("YAML=true + flag unset must show the note:\n%s", s)
+	}
+
+	// explicit --allow-structure-truncate=false overrides the YAML true
+	// (documented CLI-over-YAML precedence, same as every other option)
+	cfg = load(yamlTrue)
+	cmd = newSyncCommand(t)
+	cmd.Flags().Set("allow-structure-truncate", "false")
+	if err := applySyncOpts(cmd, &syncOpt, cfg); err != nil {
+		t.Fatalf("explicit false: %v", err)
+	}
+	if cfg.Opts.AllowStructureTruncate {
+		t.Fatalf("explicit false must override YAML true: %+v", cfg.Opts)
+	}
+	if s := syncSummary(plans, cfg.Opts.AllowStructureTruncate); strings.Contains(s, "allow_structure_truncate") {
+		t.Errorf("explicit false must not show the note:\n%s", s)
+	}
+
+	// the mirror: explicit true overrides a YAML false
+	cfg = load(yamlFalse)
+	cmd = newSyncCommand(t)
+	cmd.Flags().Set("allow-structure-truncate", "true")
+	if err := applySyncOpts(cmd, &syncOpt, cfg); err != nil {
+		t.Fatalf("explicit true: %v", err)
+	}
+	if !cfg.Opts.AllowStructureTruncate {
+		t.Fatalf("explicit true must override YAML false: %+v", cfg.Opts)
+	}
+	if s := syncSummary(plans, cfg.Opts.AllowStructureTruncate); !strings.Contains(s, "allow_structure_truncate") {
+		t.Errorf("explicit true must show the note:\n%s", s)
+	}
+}
+
 // value (Flags().Changed) must be legal and override YAML, while an unset
 // flag leaves the YAML value for ApplyDefaults to fill.
 func TestApplySyncOpts(t *testing.T) {

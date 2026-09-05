@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -100,6 +101,152 @@ options:
 	}
 	if c.Src.Password != "pw-from-env" {
 		t.Errorf("ResolvePassword: got %q", c.Src.Password)
+	}
+}
+
+// validConfig is a fully-populated config exercising the option fields a
+// real file carries; strict parsing must keep accepting it.
+const validConfig = `
+src:
+  host: h1
+  port: 3306
+  user: u
+  password: p
+  database: db1
+dst:
+  host: h2
+  user: u
+  database: db2
+options:
+  tables: [t1, t2]
+  exclude_tables: [t3]
+  parallel: 8
+  chunk_size: 5000
+  sample_limit: 3
+  batch_size: 2000
+  no_sync_schema: true
+  allow_unenforced_readonly: true
+  allow_structure_truncate: true
+  allow_row_rewrite: true
+`
+
+func TestParseStrictValidConfig(t *testing.T) {
+	c, err := Parse([]byte(validConfig))
+	if err != nil {
+		t.Fatalf("a legal config must parse: %v", err)
+	}
+	if c.Src.Host != "h1" || c.Dst.Database != "db2" {
+		t.Errorf("fields not parsed: %+v", c)
+	}
+	if c.Opts.Parallel != 8 || c.Opts.ChunkSize != 5000 || c.Opts.BatchSize != 2000 {
+		t.Errorf("options not parsed: %+v", c.Opts)
+	}
+	if c.Opts.SampleLimit == nil || *c.Opts.SampleLimit != 3 {
+		t.Errorf("sample_limit not parsed: %+v", c.Opts.SampleLimit)
+	}
+	if !c.Opts.NoSyncSchema || !c.Opts.AllowUnenforcedReadOnly ||
+		!c.Opts.AllowStructureTruncate || !c.Opts.AllowRowRewrite {
+		t.Errorf("destructive/behavior flags not parsed: %+v", c.Opts)
+	}
+}
+
+// The strict-parser regressions: every misspelling below used to be
+// SILENTLY IGNORED — e.g. "exclude_table" (singular) would drop out and
+// the excluded table would enter the sync/drop set. Each must now fail
+// at parse time.
+func TestParseStrictUnknownFields(t *testing.T) {
+	cases := []struct {
+		name    string
+		doc     string
+		wantSub string
+	}{
+		{
+			name: "unknown top-level field",
+			doc: `
+srcc:
+  host: h
+`,
+			wantSub: "srcc",
+		},
+		{
+			name: "unknown endpoint field",
+			doc: `
+src:
+  host: h
+  hostname: also-h
+`,
+			wantSub: "hostname",
+		},
+		{
+			name: "unknown options field",
+			doc: `
+src:
+  host: h
+dst:
+  host: d
+options:
+  exclude_table:
+    - audit_log
+`,
+			wantSub: "exclude_table",
+		},
+		{
+			name: "misspelled destructive option",
+			doc: `
+src:
+  host: h
+dst:
+  host: d
+options:
+  allow_structure_trancate: true
+`,
+			wantSub: "allow_structure_trancate",
+		},
+		{
+			name:    "misspelled option in a full config",
+			doc:     "options:\n  allow_unenforced_readonly: true\n  allow_unenforced_readonl: true\n",
+			wantSub: "allow_unenforced_readonl",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, err := Parse([]byte(tc.doc))
+			if err == nil {
+				t.Fatalf("must refuse unknown fields, parsed %+v", c)
+			}
+			if !strings.Contains(err.Error(), tc.wantSub) {
+				t.Errorf("error %q must name the unknown field %q", err, tc.wantSub)
+			}
+		})
+	}
+}
+
+func TestParseStrictMultipleDocuments(t *testing.T) {
+	_, err := Parse([]byte(validConfig + "\n---\ndst:\n  host: other\n"))
+	if err == nil {
+		t.Fatal("a second YAML document must be refused (reading only the first would hide it)")
+	}
+	if !strings.Contains(err.Error(), "multiple YAML documents") {
+		t.Errorf("error %q must say a second document was found", err)
+	}
+}
+
+// Env expansion must keep working through the strict decoder (the
+// expansion is a raw-text substitution BEFORE parsing, but the decoder
+// change must not regress it).
+func TestLoadFileStrictWithEnvExpansion(t *testing.T) {
+	t.Setenv("MTDIFF_TEST_HOST2", "envhost2")
+	path := filepath.Join(t.TempDir(), "cfg.yaml")
+	content := "src:\n  host: ${MTDIFF_TEST_HOST2}\ndst:\n  host: d\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c, err := LoadFile(path)
+	if err != nil {
+		t.Fatalf("env expansion through the strict parser must not break: %v", err)
+	}
+	if c.Src.Host != "envhost2" {
+		t.Errorf("env expansion failed: %+v", c.Src)
 	}
 }
 

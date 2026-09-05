@@ -44,6 +44,10 @@ type Applier struct {
 	// Progress receives apply phase updates (truncate, committed-chunk
 	// percentages). nil = no progress output.
 	Progress func(format string, args ...any)
+
+	// execHook, when set, replaces execDirect's statement execution
+	// (unit tests count calls and force failures); nil in production.
+	execHook func(ctx context.Context, query string) error
 }
 
 // ApplyFull runs the FULL mode: TRUNCATE the destination table, then
@@ -435,6 +439,9 @@ func (a *Applier) applyTx(ctx context.Context, fn func(tx *sql.Tx) error) error 
 // execDirect runs a statement outside any transaction (used for the
 // TRUNCATE, which is DDL and commits implicitly).
 func (a *Applier) execDirect(ctx context.Context, query string) error {
+	if a.execHook != nil {
+		return a.execHook(ctx, query)
+	}
 	cn, err := a.W.Conn(ctx)
 	if err != nil {
 		return err
