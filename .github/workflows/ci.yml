@@ -1,8 +1,11 @@
 name: ci
 
 on:
+  # security-fixes carries the review-fix rounds: it has no PR yet (no API
+  # credentials to open one), so its pushes run the full CI themselves.
+  # Once it is merged to main, remove it from this list.
   push:
-    branches: [main]
+    branches: [main, security-fixes]
   pull_request:
 
 jobs:
