@@ -26,17 +26,43 @@ lint:
 clean:
 	rm -rf bin
 
-# Push the working tree to the remote: stage everything, commit it (only
-# if there is anything), and push the CURRENT branch to origin (creating
-# the upstream if it does not exist yet):
-#   make push m="round-5: fix the thing"
-#   make push m="..." CHECK=1     # run lint + unit tests before pushing
+# Push the current branch to origin. Two independent steps, in order:
+#
+#   1. COMMIT (conditional): commits ONLY what is already staged — the
+#      user stages deliberately with `git add`. The working tree is
+#      never auto-staged (no `git add -A`): an untracked file (a secret,
+#      a DSN, an editor backup) must not ride along by default. Nothing
+#      staged -> no commit.
+#   2. PUSH (final): always runs — local commits made outside this
+#      target (or a clean tree that is ahead) still reach the remote.
+#
+#   git add <files>
+#   m="message" make push       # commit the staged files, then push
+#   make push                   # no commit; push existing local commits
+#   m="..." make push CHECK=1   # run lint + unit tests before pushing
+#
+# The message is an environment variable and the recipe references it as
+# $$m: make leaves a literal $m in the script text (it does NOT expand
+# the value — make's own expansion is textual and would hand the value's
+# quotes to the shell's parser), and the SHELL expands the environment
+# value inside the double quotes, where an expansion result is never
+# re-parsed. So quotes, semicolons, backticks, newlines and $(...) in
+# the message are literal message text, never commands. (A make command-
+# line m=... must be avoided: make strips double quotes from it.)
+export m
 push:
-	@if [ -z "$(m)" ]; then echo 'usage: make push m="commit message" [CHECK=1]'; exit 1; fi
 	@if [ "$(CHECK)" = "1" ]; then $(MAKE) lint test; fi
-	git add -A
-	if git diff --cached --quiet; then \
-		echo "nothing to commit; nothing pushed"; \
+	@rc=$$(git diff --cached --quiet 2>/dev/null; echo $$?); \
+	if [ "$$rc" = 1 ]; then \
+		if [ -z "$$m" ]; then \
+			echo 'usage: m="commit message" make push (stage nothing to push without committing) [CHECK=1]'; \
+			exit 1; \
+		fi; \
+		git commit -m "$$m"; \
+	elif [ "$$rc" = 0 ]; then \
+		echo "nothing staged: no commit (the push still runs below)"; \
 	else \
-		git commit -m "$(m)" && git push -u origin HEAD; \
-	fi
+		echo "git diff --cached failed (rc=$$rc): not a git repository, or an unhealthy index — refusing to commit or push"; \
+		exit 1; \
+	fi; \
+	git push -u origin HEAD

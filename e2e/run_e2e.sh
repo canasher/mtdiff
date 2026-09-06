@@ -562,13 +562,16 @@ qdb src srcdb2 "SELECT 1" >/dev/null 2>&1 || \
 $COMPOSE -f e2e/docker-compose.yml exec -T -e MYSQL_PWD=rootpw mysql-dst \
   mysql -uroot -e "DROP DATABASE IF EXISTS dstdb2; CREATE DATABASE dstdb2"
 sql src srcdb2 seed_src2.sql
-# (0) real-MySQL regression for the destructive re-gates: the DROP
-# TOCTOU re-check (a source table appearing after the confirmed plan
-# refuses the drop) and the destructive-scope re-gate (an apply-time
-# escalation to the full resync that the confirmed plan never showed
-# stops the table, zero writes). Go tests against this same pair; they
-# own two throwaway tables (t_droprace, t_xid) and drop them again, so
-# the scenarios below are unaffected.
+# (0) real-MySQL regression for the destructive re-gates and the
+# parallel=1 liveness edge: the DROP TOCTOU re-check (a source table
+# appearing after the confirmed plan refuses the drop), the
+# destructive-scope re-gate (an apply-time escalation to the full
+# resync that the confirmed plan never showed stops the table, zero
+# writes), and the unique-holder check at parallel=1 (the plan pins the
+# pool's ONLY scan connection per side; the check must reuse it, and a
+# watchdog catches the pre-fix self-deadlock). Go tests against this
+# same pair; they own three throwaway tables (t_droprace, t_xid,
+# t_hold1) and drop them again, so the scenarios below are unaffected.
 # Skips cleanly when the host has no Go toolchain (the container hosts
 # of this suite do not always have one).
 GOCMD=""
@@ -579,10 +582,10 @@ elif [ -x /home/liukl/sdk/go/bin/go ]; then
 fi
 if [ -n "$GOCMD" ]; then
   if MTDIFF_E2E_DSN_SRC="$SRC2" MTDIFF_E2E_DSN_DST="$DST2" \
-    "$GOCMD" test -count=1 -timeout 10m -run 'TestDropRaceRealMySQL|TestScopeEscalationRealMySQL' ./internal/sync/; then
-    echo "ok: real-MySQL destructive re-gates (drop TOCTOU re-check + scope escalation refusal)"
+    "$GOCMD" test -count=1 -timeout 10m -run 'TestDropRaceRealMySQL|TestScopeEscalationRealMySQL|TestUniqueHolderParallelOneDoesNotDeadlock|TestRealScanReplacementReinitialized' ./internal/sync/ ./internal/conn/; then
+    echo "ok: real-MySQL destructive re-gates + parallel=1 holder liveness (drop TOCTOU re-check, scope escalation refusal, pinned-connection holder check)"
   else
-    echo "FAIL: real-MySQL destructive re-gate regression"; exit 1
+    echo "FAIL: real-MySQL re-gate / parallel=1 regression"; exit 1
   fi
 else
   echo "note: no go toolchain on the host; skipping the real-MySQL re-gate regression"

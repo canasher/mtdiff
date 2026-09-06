@@ -1,12 +1,12 @@
 package sync
 
-// Real-MySQL regression for the two destructive re-gates (run by
+// Real-MySQL regression for the destructive re-gates (run by
 // e2e/run_e2e.sh against the e2e's srcdb2/dstdb2 pair; the plain
 // `go test ./...` skips them — see skipNoE2EDSNs).
 //
-// These tests own two throwaway tables (t_droprace, t_xid) in the e2e
-// databases and drop them again on the way out: they must not
-// disturb the other e2e scenarios that use the same pair.
+// These tests own three throwaway tables (t_droprace, t_xid, t_hold1)
+// in the e2e databases and drop them again on the way out: they must
+// not disturb the other e2e scenarios that use the same pair.
 
 import (
 	"context"
@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"mtdiff/internal/compare"
 	"mtdiff/internal/config"
@@ -105,20 +106,19 @@ func rawRows(t *testing.T, db *sql.DB, query string) map[int64]string {
 }
 
 // newE2ERunner opens the guarded sides, the write connection and a
-// runner for the pair. parallel=2: the unique-holder check (holdersOf)
-// acquires a SECOND scan connection from a side whose first one the
-// table's plan already holds, so a 1-connection pool deadlocks against
-// it (a pre-existing liveness edge of --parallel 1, noted in the
-// round-4 report).
+// runner for the pair. parallel=1 is the deliberate, strictest setting:
+// the scan pool then holds exactly one connection per side, and the
+// plan's pinned-connection holder check (crossChunkCheck) must reuse
+// them — the configuration that deadlocked before the R5-1 fix.
 func newE2ERunner(t *testing.T, srcDSN, dstDSN string) (*Runner, *Applier) {
 	t.Helper()
 	ctx := context.Background()
-	srcSide, err := conn.OpenSide(ctx, "src", dsnToEndpoint(t, srcDSN), 0, 2, false)
+	srcSide, err := conn.OpenSide(ctx, "src", dsnToEndpoint(t, srcDSN), 0, 1, false)
 	if err != nil {
 		t.Fatalf("open src: %v", err)
 	}
 	t.Cleanup(func() { srcSide.Close() })
-	dstSide, err := conn.OpenSide(ctx, "dst", dsnToEndpoint(t, dstDSN), 0, 2, false)
+	dstSide, err := conn.OpenSide(ctx, "dst", dsnToEndpoint(t, dstDSN), 0, 1, false)
 	if err != nil {
 		t.Fatalf("open dst: %v", err)
 	}
@@ -129,7 +129,7 @@ func newE2ERunner(t *testing.T, srcDSN, dstDSN string) (*Runner, *Applier) {
 	}
 	t.Cleanup(func() { w.Close() })
 	runner := NewRunner(srcSide, dstSide, Options{
-		Cmp:             compare.Options{Parallel: 2, ChunkSize: 1},
+		Cmp:             compare.Options{Parallel: 1, ChunkSize: 1},
 		Batch:           100,
 		SampleLimit:     3,
 		SyncSchema:      true,
@@ -321,5 +321,126 @@ func TestScopeEscalationRealMySQL(t *testing.T) {
 	}
 	if got := rawRows(t, dstRaw, "SELECT id, v FROM "+table); got[1] != "A" || got[2] != "B" || got[3] != "C" || got[4] != "D" {
 		t.Fatalf("convergence must match the source, dst=%v", got)
+	}
+}
+
+// TestUniqueHolderParallelOneDoesNotDeadlock is the liveness regression
+// for the pinned-connection holder check. With parallel=1 the scan pool
+// holds exactly ONE connection per side and the plan pins it for the
+// whole table; before the R5-1 fix the unique-holder check asked the
+// pool for a SECOND connection and blocked against its own pin forever
+// (a deterministic self-deadlock, hit live in the round-4 tests). The
+// check must reuse the pinned connections instead, and BOTH verdict
+// directions must still come out of it:
+//
+//   - safe: the destination holds a written unique value in a row that
+//     sorts BEFORE the chunk that writes it (an earlier chunk's update
+//     frees the slot first). The row-level verdict is only reachable
+//     through the destination holders query (it found the foreign
+//     holder) AND the source point query (the holder's key holds a
+//     DIFFERENT value on the source — the same value would be
+//     crossDuplicate);
+//   - conflict: the same pair then swaps the two values, so the holder
+//     sorts AFTER the chunk that needs its slot — the holder check
+//     must ESCALATE the plan to the full resync, and it must arrive at
+//     that verdict within the watchdog, not time out.
+//
+// Every plan call runs under a context watchdog: the pre-fix deadlock
+// blocked the plan until the deadline, so a finishing plan is the
+// liveness proof (a panic is not — the deadlock never panics).
+//
+// Connection census (parallel=1 needs no second scan connection): the
+// steady-state PROCESSLIST per database must be exactly the pre-opened
+// set — one raw test connection, the ONE pre-warmed scan connection
+// and the one control connection per side, plus the write connection
+// on the destination. A pool pre-warmed to two, or a back-door
+// connection the holder check opens, shows up here.
+func TestUniqueHolderParallelOneDoesNotDeadlock(t *testing.T) {
+	srcDSN, dstDSN := skipNoE2EDSNs(t)
+	srcRaw := openRaw(t, srcDSN)
+	dstRaw := openRaw(t, dstDSN)
+	runner, ap := newE2ERunner(t, srcDSN, dstDSN) // parallel=1
+
+	const table = "t_hold1"
+	execRaw(t, srcRaw, "DROP TABLE IF EXISTS "+table)
+	execRaw(t, dstRaw, "DROP TABLE IF EXISTS "+table)
+	defer execRaw(t, srcRaw, "DROP TABLE IF EXISTS "+table)
+	defer execRaw(t, dstRaw, "DROP TABLE IF EXISTS "+table)
+	execRaw(t, srcRaw, "CREATE TABLE "+table+" (id INT PRIMARY KEY, v VARCHAR(8) NOT NULL UNIQUE)")
+	execRaw(t, dstRaw, "CREATE TABLE "+table+" (id INT PRIMARY KEY, v VARCHAR(8) NOT NULL UNIQUE)")
+	// safe setup: dst row 1 holds the value chunk 2 writes ('B'), but row
+	// 1 sorts BEFORE chunk 2 — chunk 1's update (row 1: B -> A) frees the
+	// slot before chunk 2's write of 'B' runs
+	execRaw(t, srcRaw, "INSERT INTO "+table+" VALUES (1,'A'),(2,'B')")
+	execRaw(t, dstRaw, "INSERT INTO "+table+" VALUES (1,'B'),(2,'Z')")
+
+	// the steady-state census: one raw + one scan + one ctl per side,
+	// plus the writer on the destination
+	srcDB, dstDB := dsnToEndpoint(t, srcDSN).Database, dsnToEndpoint(t, dstDSN).Database
+	countDB := func(raw *sql.DB, db string) int {
+		var n int
+		if err := raw.QueryRow("SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE DB = ?", db).Scan(&n); err != nil {
+			t.Fatalf("processlist %s: %v", db, err)
+		}
+		return n
+	}
+	if n := countDB(srcRaw, srcDB); n != 3 {
+		t.Fatalf("%s steady state: %d connections, want 3 (1 raw + 1 scan + 1 ctl) — at parallel=1 the scan pool must be sized to ONE", srcDB, n)
+	}
+	if n := countDB(dstRaw, dstDB); n != 4 {
+		t.Fatalf("%s steady state: %d connections, want 4 (1 raw + 1 scan + 1 ctl + 1 writer)", dstDB, n)
+	}
+
+	// (1) safe verdict: every plan call under a watchdog — the pre-fix
+	// deadlock blocked here until the context deadline
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	results, err := runner.PrePass(ctx, []string{table})
+	if err != nil {
+		t.Fatalf("pre-pass (parallel=1, watchdog 10s): %v", err)
+	}
+	conf := runner.PlanTable(ctx, results[0])
+	if conf.Mode != "ROWLEVEL" || conf.Scope.FullResync || conf.Rewrites != 0 {
+		t.Fatalf("the safe holder (before the writing chunk) must preflight row-level, got mode=%s scope=%+v rewrites=%d (%s)",
+			conf.Mode, conf.Scope, conf.Rewrites, conf.Error)
+	}
+	ts := runner.ApplyTable(ctx, results[0], ap, conf)
+	if ts.Status != "APPLIED" {
+		t.Fatalf("apply: status=%s err=%s", ts.Status, ts.Error)
+	}
+	if got := rawRows(t, dstRaw, "SELECT id, v FROM "+table); got[1] != "A" || got[2] != "B" {
+		t.Fatalf("convergence must match the source, dst=%v", got)
+	}
+
+	// (2) conflict verdict: the same pair now swaps the two unique values
+	// (three steps so the UNIQUE column stays legal throughout) — the
+	// holder (row 1) sorts AFTER the chunk that needs its slot: no
+	// row-level order applies it, the plan must escalate to the full
+	// resync, still within the watchdog
+	for _, s := range []string{
+		"UPDATE " + table + " SET v='__t1__' WHERE id=1",
+		"UPDATE " + table + " SET v='A' WHERE id=2",
+		"UPDATE " + table + " SET v='B' WHERE id=1",
+	} {
+		execRaw(t, dstRaw, s)
+	}
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel2()
+	results2, err := runner.PrePass(ctx2, []string{table})
+	if err != nil {
+		t.Fatalf("re-pass (parallel=1, watchdog 10s): %v", err)
+	}
+	conf2 := runner.PlanTable(ctx2, results2[0])
+	if conf2.Mode != "FULL" || !conf2.Scope.FullResync {
+		t.Fatalf("the cross-chunk holder must escalate the plan to the full resync, got mode=%s scope=%+v (%s)",
+			conf2.Mode, conf2.Scope, conf2.Error)
+	}
+	// the escalated plan is a dry run: the destination must be exactly
+	// the swapped state (and the source untouched)
+	if got := rawRows(t, dstRaw, "SELECT id, v FROM "+table); got[1] != "B" || got[2] != "A" {
+		t.Fatalf("the escalated plan must not have written, dst=%v", got)
+	}
+	if got := rawRows(t, srcRaw, "SELECT id, v FROM "+table); got[1] != "A" || got[2] != "B" {
+		t.Fatalf("the source must be untouched, src=%v", got)
 	}
 }

@@ -13,7 +13,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 
 	_ "github.com/go-sql-driver/mysql"
 
@@ -27,24 +26,15 @@ import (
 // dedicated connections are pinned to workers so the session safety policy
 // stays in effect for the whole scan.
 //
-// The policy (applySession) is applied per PHYSICAL connection, tracked in
-// inited: the pre-warm in OpenSide cannot guarantee it — database/sql
-// hands the same idle connection back to consecutive Conn() calls, so a
-// parallel=4 pre-warm may have touched far fewer than four physical
-// connections, and any connection opened lazily later (or replacing a
-// dead one) would run without the read-only session. AcquireScan therefore
-// applies the policy (idempotent, see applySession) on the first checkout
-// of every connection it has not initialized, and only then returns it.
-//
-// The map is keyed by the server-assigned CONNECTION_ID, not by the
-// *sql.Conn pointer: database/sql allocates a FRESH *sql.Conn wrapper on
-// every DB.Conn() call (the pooled object is an internal driverConn), so
-// pointer identity never matches and the memo would be dead — the SET
-// batch would re-run on every checkout and the map would grow without
-// bound. The connection ID is stable for the life of the physical
-// connection (and, on a server restart during a run, a recycled ID can at
-// worst skip the idempotent re-set on a connection mtdiff still only
-// issues SELECTs on).
+// The policy (applySession) is re-applied on EVERY scan checkout, not
+// remembered per physical connection. A CONNECTION_ID memo cannot be
+// the identity of a physical session: the server's counter resets
+// across a restart, and a recycled ID on a NEW physical connection
+// must not inherit the old one's "initialized" mark (the new session
+// has no policy in it). applySession is idempotent, so the re-apply
+// costs a handful of cheap SETs per checkout — safety over saved round
+// trips. A connection the policy cannot be applied to is closed and
+// never handed out.
 type Side struct {
 	Name          string
 	Version       string
@@ -52,8 +42,6 @@ type Side struct {
 	scan          *sql.DB
 	ctl           *sql.DB
 	allowUnforced bool
-	initMu        *sync.Mutex
-	inited        map[int64]bool
 }
 
 // BuildDSN assembles the driver DSN. parseTime=true&loc=UTC is mandatory:
@@ -93,17 +81,20 @@ func buildDSN(ep config.Endpoint, maxAllowedPacket, writeTimeoutSec int) string 
 	return b.String()
 }
 
+// openDB is the pool constructor. A test seam: unit tests swap in a
+// fake driver to exercise the checkout/policy logic without a server;
+// production always opens the real go-sql-driver/mysql.
+var openDB = func(name, dsn string) (*sql.DB, error) { return sql.Open(name, dsn) }
+
 // OpenSide opens both pools, preconditions the control connection and
 // pre-warms the scan pool, then verifies the server answers.
 //
 // The pre-warm is a latency optimization, NOT the correctness mechanism:
 // it opens `parallel` DISTINCT physical connections up front (holding each
 // until all are open, so the idle pool cannot hand one connection back for
-// several iterations), and connections opened lazily later, or replacing a
-// dead one, get the policy from AcquireScan's memo before first use. The
-// application is cheap — once per physical connection (the memo remembers
-// by CONNECTION_ID) — and applySession is idempotent, so even a
-// re-application on a reused session is a no-op.
+// several iterations). Correctness comes from AcquireScan, which re-applies
+// the idempotent policy on EVERY checkout — a connection opened lazily
+// later, or replacing a dead one, gets its policy on first use.
 //
 // allowUnenforcedReadOnly is config.Options.AllowUnenforcedReadOnly; see
 // applySession for what it relaxes.
@@ -112,11 +103,11 @@ func OpenSide(ctx context.Context, name string, ep config.Endpoint, maxAllowedPa
 		parallel = 1
 	}
 	dsn := BuildDSN(ep, maxAllowedPacket)
-	scanDB, err := sql.Open("mysql", dsn)
+	scanDB, err := openDB("mysql", dsn)
 	if err != nil {
 		return nil, err
 	}
-	ctlDB, err := sql.Open("mysql", dsn)
+	ctlDB, err := openDB("mysql", dsn)
 	if err != nil {
 		scanDB.Close()
 		return nil, err
@@ -128,21 +119,6 @@ func OpenSide(ctx context.Context, name string, ep config.Endpoint, maxAllowedPa
 	ctlDB.SetMaxOpenConns(1)
 	ctlDB.SetConnMaxLifetime(0)
 
-	inited := make(map[int64]bool)
-	var initMu sync.Mutex
-	// remember marks a physical connection as policy-applied, keyed by
-	// its server-assigned CONNECTION_ID (the *sql.Conn wrapper cannot
-	// identify it — see the Side.inited doc).
-	remember := func(ctx context.Context, c *sql.Conn) error {
-		var id int64
-		if err := c.QueryRowContext(ctx, "SELECT CONNECTION_ID()").Scan(&id); err != nil {
-			return fmt.Errorf("connection id: %w", err)
-		}
-		initMu.Lock()
-		inited[id] = true
-		initMu.Unlock()
-		return nil
-	}
 	c, err := ctlDB.Conn(ctx)
 	if err != nil {
 		scanDB.Close()
@@ -150,12 +126,6 @@ func OpenSide(ctx context.Context, name string, ep config.Endpoint, maxAllowedPa
 		return nil, fmt.Errorf("%s: connect to %s: %w", name, ep.MaskedDSN(), err)
 	}
 	if err := applySession(ctx, c, allowUnenforcedReadOnly); err != nil {
-		c.Close()
-		scanDB.Close()
-		ctlDB.Close()
-		return nil, fmt.Errorf("%s: %s: %w", name, ep.MaskedDSN(), err)
-	}
-	if err := remember(ctx, c); err != nil {
 		c.Close()
 		scanDB.Close()
 		ctlDB.Close()
@@ -198,16 +168,10 @@ func OpenSide(ctx context.Context, name string, ep config.Endpoint, maxAllowedPa
 			ctlDB.Close()
 			return nil, fmt.Errorf("%s: pre-warm scan pool: %s: %w", name, ep.MaskedDSN(), err)
 		}
-		if err := remember(ctx, sc); err != nil {
-			sc.Close()
-			scanDB.Close()
-			ctlDB.Close()
-			return nil, fmt.Errorf("%s: pre-warm scan pool: %s: %w", name, ep.MaskedDSN(), err)
-		}
 		prewarmed = append(prewarmed, sc)
 	}
 	for _, sc := range prewarmed {
-		sc.Close() // back to the idle pool, policy already in effect
+		sc.Close() // back to the idle pool (AcquireScan re-applies the policy anyway)
 	}
 	return &Side{
 		Name:          name,
@@ -216,8 +180,6 @@ func OpenSide(ctx context.Context, name string, ep config.Endpoint, maxAllowedPa
 		scan:          scanDB,
 		ctl:           ctlDB,
 		allowUnforced: allowUnenforcedReadOnly,
-		initMu:        &initMu,
-		inited:        inited,
 	}, nil
 }
 
@@ -295,48 +257,22 @@ func bestEffort(ctx context.Context, c *sql.Conn, stmt string) {
 }
 
 // AcquireScan returns a dedicated scan connection whose session safety
-// policy (read-only enforcement and guardrails) has been applied. The
-// policy is applied once per PHYSICAL connection (the inited map
-// remembers it by CONNECTION_ID), so a warm checkout costs one small
-// CONNECTION_ID() lookup and the first use of a freshly opened
-// connection costs one SET batch. A connection the map does not know
-// (opened lazily by database/sql, or replacing a dead one) is
-// initialized here before it may be used: this is what makes "every
-// connection that actually scans is read-only" hold for parallel > 1,
-// regardless of how the pre-warm interleaved. Callers must Close it
-// when done.
+// policy (read-only enforcement and guardrails) is in effect. The
+// policy is re-applied on EVERY checkout, not remembered per physical
+// connection: a CONNECTION_ID memo cannot be a session's identity (the
+// server's counter resets across a restart, and a recycled ID on a NEW
+// physical connection must not inherit the old one's initialization),
+// and applySession is idempotent, so the cost is a handful of SETs per
+// checkout. A connection the policy cannot be applied to is closed and
+// NOT handed out. Callers must Close it when done.
 func (s *Side) AcquireScan(ctx context.Context) (*sql.Conn, error) {
 	c, err := s.scan.Conn(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("%s: acquire scan connection: %w", s.Name, err)
 	}
-	var id int64
-	if err := c.QueryRowContext(ctx, "SELECT CONNECTION_ID()").Scan(&id); err != nil {
+	if err := applySession(ctx, c, s.allowUnforced); err != nil {
 		c.Close()
-		return nil, fmt.Errorf("%s: connection id: %w", s.Name, err)
-	}
-	s.initMu.Lock()
-	first := !s.inited[id]
-	s.initMu.Unlock()
-	if first {
-		// Apply the policy BEFORE marking (P1-3): a failed applySession
-		// must not leave the connection behind in the memo — the next
-		// checkout of the same physical connection (a recycled
-		// CONNECTION_ID after a server restart, or the pool reusing the
-		// slot) would then be trusted to be read-only without the policy
-		// ever having been set. Marking is a no-op duplicate when two
-		// paths race: a physical connection is exclusively checked out
-		// (DB.Conn pins it), so only one caller can ever initialize it,
-		// and the map is guarded by initMu either way. The SET batch
-		// itself runs outside the lock (another worker may wait on it
-		// while this round trip runs).
-		if err := applySession(ctx, c, s.allowUnforced); err != nil {
-			c.Close()
-			return nil, fmt.Errorf("%s: init scan connection: %w", s.Name, err)
-		}
-		s.initMu.Lock()
-		s.inited[id] = true
-		s.initMu.Unlock()
+		return nil, fmt.Errorf("%s: init scan connection: %w", s.Name, err)
 	}
 	return c, nil
 }

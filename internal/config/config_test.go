@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -232,8 +233,8 @@ func TestParseStrictMultipleDocuments(t *testing.T) {
 }
 
 // Env expansion must keep working through the strict decoder (the
-// expansion is a raw-text substitution BEFORE parsing, but the decoder
-// change must not regress it).
+// expansion is a structure-aware substitution of the parsed tree, and
+// the strict decode must not regress it).
 func TestLoadFileStrictWithEnvExpansion(t *testing.T) {
 	t.Setenv("MTDIFF_TEST_HOST2", "envhost2")
 	path := filepath.Join(t.TempDir(), "cfg.yaml")
@@ -344,6 +345,139 @@ func TestAllowUnenforcedReadOnlyYAML(t *testing.T) {
 	}
 	if !o.AllowUnenforcedReadOnly {
 		t.Errorf("allow_unenforced_readonly not parsed: %+v", o)
+	}
+}
+
+// The R5-2 regressions: the ${ENV} substitution runs on the PARSED
+// value scalars only, byte-exactly, and can never touch structure.
+
+// Special characters in an environment value must survive the
+// parse-substitute-reencode round trip byte for byte (the raw-text era
+// broke on a '#' comment, a 'a: b' colon, an embedded quote, a real
+// newline, a backslash or non-ASCII bytes).
+func TestEnvExpansionSpecialChars(t *testing.T) {
+	values := []string{
+		`p#ss`,       // '#' starts a comment in raw text
+		`a: b`,       // a colon+space is a mapping separator
+		`a"b`,        // an embedded quote
+		"abc\ndef",   // a real newline
+		`p\w`,        // a backslash (escape sequences)
+		`中文密码`,       // non-ASCII bytes
+		`${LITERAL}`, // literal ${} text inside the VALUE is final (no re-expansion)
+		`tab\there`,  // a real tab
+		`'single'`,   // embedded single quotes
+	}
+	for i, v := range values {
+		t.Run(fmt.Sprintf("value%02d", i), func(t *testing.T) {
+			name := fmt.Sprintf("MTDIFF_TEST_SPECIAL_%02d", i)
+			t.Setenv(name, v)
+			path := filepath.Join(t.TempDir(), "cfg.yaml")
+			content := fmt.Sprintf("src:\n  host: h\n  password: ${%s}\ndst:\n  host: d\n", name)
+			if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			c, err := LoadFile(path)
+			if err != nil {
+				t.Fatalf("a special-character value must not break parsing: %v", err)
+			}
+			if c.Src.Password != v {
+				t.Errorf("byte-exact round trip failed:\n got  %q\n want %q", c.Src.Password, v)
+			}
+		})
+	}
+}
+
+// An environment value carrying YAML structure (a newline plus an
+// options block) must land ENTIRELY in the one value it replaced: the
+// destination flag it "injects" must not be set, and the value itself
+// must be byte-exact. Under the raw-text substitution this flipped
+// allow_structure_truncate on.
+func TestEnvExpansionStructuralInjection(t *testing.T) {
+	t.Setenv("MTDIFF_TEST_INJECT", "abc\noptions:\n  allow_structure_truncate: true")
+	path := filepath.Join(t.TempDir(), "cfg.yaml")
+	content := "src:\n  host: h\n  password: ${MTDIFF_TEST_INJECT}\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c, err := LoadFile(path)
+	if err != nil {
+		t.Fatalf("a value containing newlines/colons is still a value: %v", err)
+	}
+	if c.Src.Password != "abc\noptions:\n  allow_structure_truncate: true" {
+		t.Errorf("the value must be byte-exact, got %q", c.Src.Password)
+	}
+	if c.Opts.AllowStructureTruncate {
+		t.Error("the environment value INJECTED a second options block and flipped a safety flag — structure must be un-injectable")
+	}
+}
+
+// A reference to an UNSET variable is a parse error naming the
+// variable (fail closed): the raw-text era substituted a silent empty
+// string, and the failure surfaced later as an incomprehensible
+// server-side auth error.
+func TestEnvExpansionUnsetError(t *testing.T) {
+	os.Unsetenv("MTDIFF_TEST_DEFINITELY_UNSET")
+	path := filepath.Join(t.TempDir(), "cfg.yaml")
+	content := "src:\n  host: h\n  password: ${MTDIFF_TEST_DEFINITELY_UNSET}\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c, err := LoadFile(path)
+	if err == nil {
+		t.Fatalf("an unset variable must fail closed, parsed %+v", c)
+	}
+	if !strings.Contains(err.Error(), "MTDIFF_TEST_DEFINITELY_UNSET") {
+		t.Errorf("the error must name the unset variable, got %q", err)
+	}
+}
+
+// Substituted text is final: a value that CONTAINS a ${OTHER} sequence
+// (OTHER set, for contrast) is not expanded a second time.
+func TestEnvExpansionNoRecursiveExpansion(t *testing.T) {
+	t.Setenv("MTDIFF_TEST_OUTER", "${MTDIFF_TEST_INNER}")
+	t.Setenv("MTDIFF_TEST_INNER", "expanded-second-time")
+	path := filepath.Join(t.TempDir(), "cfg.yaml")
+	content := "src:\n  host: h\n  password: ${MTDIFF_TEST_OUTER}\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c, err := LoadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Src.Password != "${MTDIFF_TEST_INNER}" {
+		t.Errorf("substituted text must be final, got %q", c.Src.Password)
+	}
+}
+
+// Mapping KEYS are never expansion targets: a ${...} in a key position
+// stays literal. Here it surfaces as the KnownFields error for an
+// unknown field — NOT as an environment error (the variable is unset
+// on purpose: had the key been expanded, the failure would have named
+// the variable instead of the field).
+func TestEnvExpansionKeysNeverExpanded(t *testing.T) {
+	os.Unsetenv("MTDIFF_TEST_KEYVAR")
+	_, err := Parse([]byte("src:\n  ${MTDIFF_TEST_KEYVAR}: x\n"))
+	if err == nil {
+		t.Fatal("an unknown (literal) field must be refused by KnownFields")
+	}
+	if strings.Contains(err.Error(), "is not set") {
+		t.Errorf("a mapping key was env-expanded (structure injection): %v", err)
+	}
+	if !strings.Contains(err.Error(), "MTDIFF_TEST_KEYVAR") {
+		t.Errorf("the KnownFields error must name the literal key, got %q", err)
+	}
+}
+
+// Sequence items are values too: expansion must reach into lists.
+func TestEnvExpansionSequenceItems(t *testing.T) {
+	t.Setenv("MTDIFF_TEST_TBL", "audit_log")
+	c, err := Parse([]byte("src:\n  host: h\ndst:\n  host: d\noptions:\n  exclude_tables:\n    - ${MTDIFF_TEST_TBL}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.Opts.ExcludeTables) != 1 || c.Opts.ExcludeTables[0] != "audit_log" {
+		t.Errorf("sequence items must expand, got %v", c.Opts.ExcludeTables)
 	}
 }
 

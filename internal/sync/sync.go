@@ -863,7 +863,9 @@ func (r *Runner) PlanRowWork(ctx context.Context, p *prep, res compare.TableResu
 				errUniqueRewriteRefused, res.Name)
 		}
 		if len(p.e.uc) > 0 {
-			v, err := p.e.crossChunkCheck(ctx, r.Src, r.Dst, p.srcS, p.dstS, ch, dstM, ops, loV, hiV, oorFlag, oorActive)
+			// on the pinned connections: at parallel=1 the pool holds no
+			// second connection, a checkout here would self-deadlock
+			v, err := p.e.crossChunkCheck(ctx, srcCn, dstCn, p.srcS, p.dstS, ch, dstM, ops, loV, hiV, oorFlag, oorActive)
 			if err != nil {
 				return rowWork{}, fmt.Errorf("unique holder check, chunk %d: %w", ch.ID, err)
 			}

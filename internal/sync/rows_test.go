@@ -750,7 +750,10 @@ func TestClassifyHolderOorFlag(t *testing.T) {
 		if inChunk {
 			dstM[idS] = []*srow{{vals: h}}
 		}
-		return e.classifyHolder(context.Background(), nil, srcS, chunk.Chunk{}, dstM, 0, c, holderRow{key: h, oor: oor}, map[string][]any{}, lo, hi, targeted, oorActive, keyOrderKnown(srcS))
+		// nil for the pinned source connection: none of the cases below
+		// reach the source point query (holderInOtherChunk is the only
+		// path that uses it)
+		return e.classifyHolderConn(context.Background(), nil, srcS, chunk.Chunk{}, dstM, 0, c, holderRow{key: h, oor: oor}, map[string][]any{}, lo, hi, targeted, oorActive, keyOrderKnown(srcS))
 	}
 	cases := []struct {
 		name      string

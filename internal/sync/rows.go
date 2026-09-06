@@ -549,6 +549,15 @@ const (
 // resolves each foreign holder with a targeted point query, and never
 // buffers the table's unique values.
 //
+// srcCn/dstCn are the caller's PINNED scan connections: the plan holds
+// one per side for the whole table, and at parallel=1 the pool holds no
+// second connection to hand the holder queries (a pool checkout against
+// a fully checked-out pool blocks until the caller returns — a
+// self-deadlock), so the safety queries reuse the very connections the
+// plan already owns. The queries run strictly between chunk scans on
+// those connections, never concurrently with them. Callers without a
+// pinned connection use the pool wrappers holdersOf / srcRowByKey.
+//
 // oorFlag is the out-of-range predicate (key < srcMin OR key > srcMax,
 // parameterized) carried as a per-row flag column on the holders query
 // itself (see holdersOf): a holder the flag marks out-of-range is
@@ -564,7 +573,7 @@ const (
 // order the client cannot reproduce (orderKnown false) that resolution
 // is impossible, so any such foreign holder is a conflict: not provable
 // is not safe.
-func (e *Engine) crossChunkCheck(ctx context.Context, src, dst *conn.Side, srcS, dstS *conn.Schema, ch chunk.Chunk, dstM map[string][]*srow, ops []op, lo, hi []driver.Value, oorFlag chunk.Pred, oorActive bool) (crossChunkVerdict, error) {
+func (e *Engine) crossChunkCheck(ctx context.Context, srcCn, dstCn *sql.Conn, srcS, dstS *conn.Schema, ch chunk.Chunk, dstM map[string][]*srow, ops []op, lo, hi []driver.Value, oorFlag chunk.Pred, oorActive bool) (crossChunkVerdict, error) {
 	if len(e.uc) == 0 || len(ops) == 0 {
 		return crossSafe, nil
 	}
@@ -604,12 +613,12 @@ func (e *Engine) crossChunkCheck(ctx context.Context, src, dst *conn.Side, srcS,
 		if len(written[ci]) == 0 {
 			continue
 		}
-		hits, err := e.holdersOf(ctx, dst, dstS, ci, c, written[ci], oorFlag, oorActive)
+		hits, err := e.holdersOfConn(ctx, dstCn, dstS, ci, c, written[ci], oorFlag, oorActive)
 		if err != nil {
 			return crossConflict, err
 		}
 		for _, h := range hits {
-			v, err := e.classifyHolder(ctx, src, srcS, ch, dstM, ci, c, h, written[ci], lo, hi, targeted, oorActive, orderKnown)
+			v, err := e.classifyHolderConn(ctx, srcCn, srcS, ch, dstM, ci, c, h, written[ci], lo, hi, targeted, oorActive, orderKnown)
 			if err != nil {
 				return crossConflict, err
 			}
@@ -681,12 +690,22 @@ func holdersQuery(dstS *conn.Schema, c uniqueConstraint, colIdents []string, tup
 		strings.Join(sel, ", "), conn.QuoteIdent(dstS.Table), strings.Join(terms, " OR ")), args
 }
 
+// holdersOf is the pool variant: it takes a scan connection from the
+// side's pool (blocking while every pooled connection is checked out —
+// a caller that already PINS the pool's only connection must use
+// holdersOfConn with that connection instead, see crossChunkCheck).
 func (e *Engine) holdersOf(ctx context.Context, dst *conn.Side, dstS *conn.Schema, ci int, c uniqueConstraint, tuples map[string][]any, oorFlag chunk.Pred, oorActive bool) ([]holderRow, error) {
 	cn, err := dst.AcquireScan(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer cn.Close()
+	return e.holdersOfConn(ctx, cn, dstS, ci, c, tuples, oorFlag, oorActive)
+}
+
+// holdersOfConn is the query over a caller-owned scan connection (the
+// plan's pinned connection — see crossChunkCheck).
+func (e *Engine) holdersOfConn(ctx context.Context, cn *sql.Conn, dstS *conn.Schema, ci int, c uniqueConstraint, tuples map[string][]any, oorFlag chunk.Pred, oorActive bool) ([]holderRow, error) {
 	colIdents := make([]string, len(c.cols))
 	for i, n := range c.cols {
 		colIdents[i] = conn.QuoteIdent(n)
@@ -751,16 +770,17 @@ type holderRow struct {
 	oor bool // the row's key is strictly outside the source's key range
 }
 
-// classifyHolder resolves one foreign holder (a destination key row the
-// holder query matched, outside this chunk's addressed groups) against
-// the chunk, the out-of-range pass and the source. The holder's oor
+// classifyHolderConn resolves one foreign holder (a destination key row
+// the holder query matched, outside this chunk's addressed groups)
+// against the chunk, the out-of-range pass and the source (over the
+// caller's pinned scan connection, see crossChunkCheck). The holder's oor
 // flag is the out-of-range predicate evaluated ON THE SERVER: a marked
 // holder is deleted by the unfiltered out-of-range pass, which the
 // executor commits before every in-range write — safe regardless of the
 // key's collation (the one proof a case-insensitive or decimal key can
 // get). Everything past it (the chunk positioning) requires the client
 // to be able to reproduce the server's key order (orderKnown).
-func (e *Engine) classifyHolder(ctx context.Context, src *conn.Side, srcS *conn.Schema, ch chunk.Chunk, dstM map[string][]*srow, ci int, c uniqueConstraint, h holderRow, tuples map[string][]any, lo, hi []driver.Value, targeted map[string]bool, oorActive, orderKnown bool) (crossChunkVerdict, error) {
+func (e *Engine) classifyHolderConn(ctx context.Context, srcCn *sql.Conn, srcS *conn.Schema, ch chunk.Chunk, dstM map[string][]*srow, ci int, c uniqueConstraint, h holderRow, tuples map[string][]any, lo, hi []driver.Value, targeted map[string]bool, oorActive, orderKnown bool) (crossChunkVerdict, error) {
 	buf := make([]byte, 0, 256)
 	id, err := e.dstKey.Normalize(h.key, buf)
 	if err != nil {
@@ -812,7 +832,7 @@ func (e *Engine) classifyHolder(ctx context.Context, src *conn.Side, srcS *conn.
 		}
 	}
 	// inside the global range: another chunk
-	return e.holderInOtherChunk(ctx, src, srcS, ch, ci, c, h.key, tuples)
+	return e.holderInOtherChunk(ctx, srcCn, srcS, ch, ci, c, h.key, tuples)
 }
 
 // holderInOtherChunk resolves a holder inside the source's global key
@@ -830,8 +850,8 @@ func (e *Engine) classifyHolder(ctx context.Context, src *conn.Side, srcS *conn.
 //
 // A position that cannot be established (mixed or unknown key types, a
 // lead-prefix bound) is a conflict: not provable is not safe.
-func (e *Engine) holderInOtherChunk(ctx context.Context, src *conn.Side, srcS *conn.Schema, ch chunk.Chunk, ci int, c uniqueConstraint, h []any, tuples map[string][]any) (crossChunkVerdict, error) {
-	row, found, err := e.srcRowByKey(ctx, src, srcS, h, c)
+func (e *Engine) holderInOtherChunk(ctx context.Context, srcCn *sql.Conn, srcS *conn.Schema, ch chunk.Chunk, ci int, c uniqueConstraint, h []any, tuples map[string][]any) (crossChunkVerdict, error) {
+	row, found, err := e.srcRowByKeyConn(ctx, srcCn, srcS, h, c)
 	if err != nil {
 		return crossConflict, err
 	}
@@ -930,12 +950,20 @@ func (e *Engine) holderPosition(h []any, ch chunk.Chunk) holderPos {
 // it is a unique sequence; two rows at one key is itself the "not a
 // unique address" signal the caller needs, and the query must not scan
 // the table. found is false when the source has no row at the key.
+// srcRowByKey is the pool variant (see holdersOf): a caller that already
+// pins the side's only scan connection uses srcRowByKeyConn instead.
 func (e *Engine) srcRowByKey(ctx context.Context, src *conn.Side, srcS *conn.Schema, h []any, c uniqueConstraint) (row []any, found bool, err error) {
 	cn, err := src.AcquireScan(ctx)
 	if err != nil {
 		return nil, false, err
 	}
 	defer cn.Close()
+	return e.srcRowByKeyConn(ctx, cn, srcS, h, c)
+}
+
+// srcRowByKeyConn is the point query over a caller-owned scan
+// connection (the plan's pinned connection — see crossChunkCheck).
+func (e *Engine) srcRowByKeyConn(ctx context.Context, cn *sql.Conn, srcS *conn.Schema, h []any, c uniqueConstraint) (row []any, found bool, err error) {
 	sel := make([]string, 0, len(srcS.Key)+len(c.cols))
 	for _, k := range srcS.Key {
 		sel = append(sel, conn.QuoteIdent(k))

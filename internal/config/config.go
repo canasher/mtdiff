@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"regexp"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -91,8 +92,9 @@ type Config struct {
 
 var envRe = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
 
-// LoadFile loads a YAML config file. ${ENV} references in string values are
-// replaced with the environment variable's value (empty if unset).
+// LoadFile loads a YAML config file. ${ENV} references in string values
+// are replaced with the environment variable's value (see Parse for the
+// safe, structure-aware expansion).
 //
 // Parsing is STRICT: unknown fields are an error (KnownFields), at every
 // level — top-level, endpoint, options. mtdiff can execute DROP TABLE,
@@ -107,36 +109,119 @@ func LoadFile(path string) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	c, err := Parse(expandEnv(data))
+	c, err := Parse(data)
 	if err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
 	return c, nil
 }
 
-// Parse decodes one YAML document into a Config, strictly: unknown
-// fields at any level are an error, and a second document is refused.
-// Exported so config-resolution tests can exercise the same strict
-// decoding a file goes through (LoadFile wraps it with env expansion).
+// Parse decodes one YAML document into a Config, strictly.
+//
+// ${ENV} references in string values are replaced with the environment
+// variable's value — but the substitution happens AFTER the document's
+// structure is parsed: the YAML node tree is walked and only VALUE
+// scalars are expanded (mapping keys are structure, never expansion
+// targets). The expanded tree is re-encoded and decoded with
+// KnownFields. Raw-text substitution is deliberately NOT used: an
+// environment value containing newlines, colons or quotes must land in
+// ONE value, byte for byte — it can never inject a second document, a
+// new mapping key or a flipped safety flag (a password of "abc
+// \n options:\n allow_structure_truncate: true" is a value, not a new
+// options block). A reference to an UNSET variable is an error naming
+// the variable (fail closed): substituting a silent empty string would
+// turn a typo into an incomprehensible server-side auth failure.
+//
+// Unknown fields at any level are an error, and a second document is
+// refused: this config is a single document, and reading only the first
+// would hide a second half the operator believes is in effect.
 func Parse(data []byte) (*Config, error) {
 	dec := yaml.NewDecoder(bytes.NewReader(data))
-	dec.KnownFields(true)
-	var c Config
-	if err := dec.Decode(&c); err != nil {
+	var root yaml.Node
+	if err := dec.Decode(&root); err != nil {
 		return nil, err
 	}
-	var next Config
-	if err := dec.Decode(&next); err != io.EOF {
+	// a second document in the same stream is refused outright (checked
+	// on the ORIGINAL stream, before the expanded tree is re-encoded)
+	var second yaml.Node
+	if err := dec.Decode(&second); err != io.EOF {
 		return nil, fmt.Errorf("multiple YAML documents: this configuration is a single document (the first document parsed, the rest ignored — refused rather than silently half-applied)")
+	}
+	if err := expandEnvValue(&root); err != nil {
+		return nil, err
+	}
+	expanded, err := yaml.Marshal(&root)
+	if err != nil {
+		return nil, err
+	}
+	strict := yaml.NewDecoder(bytes.NewReader(expanded))
+	strict.KnownFields(true)
+	var c Config
+	if err := strict.Decode(&c); err != nil {
+		return nil, err
 	}
 	return &c, nil
 }
 
-func expandEnv(data []byte) []byte {
-	return envRe.ReplaceAllFunc(data, func(m []byte) []byte {
-		name := m[2 : len(m)-1]
-		return []byte(os.Getenv(string(name)))
-	})
+// expandEnvValue walks an already-parsed YAML tree and replaces ${NAME}
+// references in VALUE scalars only — never in mapping keys (a key is
+// structure: an environment value must be able to rename no field).
+// The parsed style of every node is preserved, so a value that was
+// quoted stays a string, and the re-encoding quotes substituted content
+// whenever the new content would otherwise be ambiguous (a value
+// containing a colon or a newline cannot become a new mapping).
+func expandEnvValue(n *yaml.Node) error {
+	switch n.Kind {
+	case yaml.DocumentNode:
+		for _, item := range n.Content {
+			if err := expandEnvValue(item); err != nil {
+				return err
+			}
+		}
+	case yaml.MappingNode:
+		// pairs (key, value): the value sits at the ODD index
+		for i := 1; i < len(n.Content); i += 2 {
+			if err := expandEnvValue(n.Content[i]); err != nil {
+				return err
+			}
+		}
+	case yaml.SequenceNode:
+		for _, item := range n.Content {
+			if err := expandEnvValue(item); err != nil {
+				return err
+			}
+		}
+	case yaml.ScalarNode:
+		return expandEnvScalar(n)
+	}
+	return nil
+}
+
+// expandEnvScalar replaces every ${NAME} reference in one scalar's
+// value. A reference to an UNSET variable is a configuration error
+// naming the variable (fail closed). The substituted text is final —
+// it is not re-scanned, so a value containing a literal "${OTHER}" is
+// not expanded a second time.
+func expandEnvScalar(n *yaml.Node) error {
+	matches := envRe.FindAllStringIndex(n.Value, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	var b strings.Builder
+	last := 0
+	for _, m := range matches {
+		b.WriteString(n.Value[last:m[0]])
+		name := n.Value[m[0]+2 : m[1]-1]
+		v, ok := os.LookupEnv(name)
+		if !ok {
+			return fmt.Errorf("environment variable %q (referenced in value %q) is not set: refusing to substitute an empty value", name, n.Value)
+		}
+		b.WriteString(v)
+		last = m[1]
+	}
+	b.WriteString(n.Value[last:])
+	n.Value = b.String()
+	return nil
 }
 
 // PromptFunc asks the user for a secret (e.g. a password) on a terminal.
