@@ -582,8 +582,8 @@ elif [ -x /home/liukl/sdk/go/bin/go ]; then
 fi
 if [ -n "$GOCMD" ]; then
   if MTDIFF_E2E_DSN_SRC="$SRC2" MTDIFF_E2E_DSN_DST="$DST2" \
-    "$GOCMD" test -count=1 -timeout 10m -run 'TestDropRaceRealMySQL|TestScopeEscalationRealMySQL|TestUniqueHolderParallelOneDoesNotDeadlock|TestRealScanReplacementReinitialized|TestRealControlReplacementReinitialized|TestRealWriterReplacementReinitialized' ./internal/sync/ ./internal/conn/; then
-    echo "ok: real-MySQL destructive re-gates + parallel=1 holder liveness + connection-replacement policy (drop TOCTOU re-check, scope escalation refusal, pinned-connection holder check, scan/control/writer replacement re-initialization)"
+    "$GOCMD" test -count=1 -timeout 10m -run 'TestDropRaceRealMySQL|TestScopeEscalationRealMySQL|TestUniqueHolderParallelOneDoesNotDeadlock|TestRealWriterKillReconnectApplyPath|TestRealScanReplacementReinitialized|TestRealControlReplacementReinitialized|TestRealActiveControlKillRecovers|TestRealWriterReplacementReinitialized' ./internal/sync/ ./internal/conn/; then
+    echo "ok: real-MySQL destructive re-gates + parallel=1 holder liveness + connection-replacement policy (drop TOCTOU re-check, scope escalation refusal, pinned-connection holder check, scan/control/writer replacement re-initialization, active-session KILL recovery, writer KILL recovery through the production apply path)"
   else
     echo "FAIL: real-MySQL re-gate / parallel=1 regression"; exit 1
   fi

@@ -56,6 +56,13 @@ type fakeServer struct {
 	conns    []*fakeConn
 	fixedID  int64 // the id EVERY physical connection reports
 	refuseRO bool  // reject BOTH read-only tiers (the session is not read-only)
+	// killErr is what operations on a KILLED connection return
+	// (default: driver.ErrBadConn, which database/sql auto-releases;
+	// a test may set the driver's plain ErrInvalidConn, which it does
+	// not — that is the real driver's report for a KILLed idle
+	// socket's read failure, see TestControlActiveInvalidConn
+	// DoesNotDeadlock)
+	killErr error
 }
 
 func (s *fakeServer) newConn() *fakeConn {
@@ -65,6 +72,32 @@ func (s *fakeServer) newConn() *fakeConn {
 	c := &fakeConn{srv: s, id: s.next, state: map[string]string{}}
 	s.conns = append(s.conns, c)
 	return c
+}
+
+// killError is the configured dead-connection error.
+func (s *fakeServer) killError() error {
+	if s.killErr != nil {
+		return s.killErr
+	}
+	return driver.ErrBadConn
+}
+
+// deadError is what an operation on a KILLed connection returns. The
+// FIRST operation after the KILL reports the configured dead-connection
+// error (default: driver.ErrBadConn; a test sets the driver's plain
+// ErrInvalidConn — the real driver's report for a KILLed IDLE socket:
+// the client's write succeeds, the read gets EOF/RST, and the driver
+// returns its unclassified sentinel, so database/sql does NOT release
+// the pinned connection). The real driver closes the connection after
+// such a read failure (readPacket → mc.close), so every LATER operation
+// on the same physical connection hits the driver's closed check and
+// reports driver.ErrBadConn — which database/sql discards.
+func (c *fakeConn) deadError() error {
+	if !c.sawDead {
+		c.sawDead = true
+		return c.srv.killError()
+	}
+	return driver.ErrBadConn
 }
 
 type fakeConn struct {
@@ -78,6 +111,9 @@ type fakeConn struct {
 	queries []string
 	dead    bool
 	closed  bool
+	// sawDead: the KILLed connection has already reported its first
+	// dead-connection error (see deadError)
+	sawDead bool
 }
 
 func (c *fakeConn) connID() int64 { return c.srv.fixedID }
@@ -106,7 +142,7 @@ func (c *fakeConn) ExecContext(ctx context.Context, query string, args []driver.
 	if c.dead || c.closed {
 		// the real driver reports a killed connection as a bad
 		// connection; database/sql discards it from the pool
-		return nil, driver.ErrBadConn
+		return nil, c.deadError()
 	}
 	u := strings.ToUpper(strings.TrimSpace(query))
 	switch {
@@ -137,7 +173,7 @@ func (c *fakeConn) QueryContext(ctx context.Context, query string, args []driver
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.dead || c.closed {
-		return nil, driver.ErrBadConn
+		return nil, c.deadError()
 	}
 	c.queries = append(c.queries, query)
 	switch strings.ToUpper(strings.TrimSpace(query)) {

@@ -158,3 +158,27 @@ func TestApplyDropStaleVerifyKeepsFailing(t *testing.T) {
 		t.Errorf("the DROP itself ran once, got %d", n)
 	}
 }
+
+// TestExecDirectFailsFastNoAutoRetry pins the unknown-outcome boundary
+// (P1/P2-3): a statement that fails in the executor (a DML/DDL lost
+// mid-network whose effect MAY have landed on the server) is reported
+// as-is — the hook runs exactly once per call. Retrying it would
+// double-write: the decision to retry belongs to the caller, never to
+// execDirect, and the only connection-level recovery is the pre-
+// transaction replacement in Writer.Conn.
+func TestExecDirectFailsFastNoAutoRetry(t *testing.T) {
+	ap := &Applier{}
+	calls := 0
+	ap.execHook = func(ctx context.Context, query string) error {
+		calls++
+		return errors.New("injected: network reset mid-statement")
+	}
+	for i := 0; i < 2; i++ {
+		if err := ap.execDirect(context.Background(), "TRUNCATE TABLE t_x"); err == nil {
+			t.Fatalf("call %d: the injected failure must surface as-is", i)
+		}
+	}
+	if calls != 2 {
+		t.Fatalf("execDirect must not auto-retry internally: %d executor calls for two explicit attempts (replaying a statement whose effect may have landed would double-write)", calls)
+	}
+}

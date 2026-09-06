@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -708,5 +709,67 @@ func TestValidateAndDefaults(t *testing.T) {
 	c4.Opts.ChunkSize = MinChunkSize
 	if err := c4.Validate(); err != nil {
 		t.Errorf("chunk_size %d must be accepted: %v", MinChunkSize, err)
+	}
+}
+
+// TestValidateRejectsNonFiniteTolerance pins the config-entry gate for
+// the silent-false-identical tolerance (P0-1): NaN/±Inf (and negative
+// finite values) are configuration errors, and only 0 or a finite
+// positive value is legal. The Go-level construction covers the CLI
+// flag path (--tolerance inf / nan reach the same Validate through
+// pflag's ParseFloat).
+func TestValidateRejectsNonFiniteTolerance(t *testing.T) {
+	base := func() *Config {
+		return &Config{Src: Endpoint{Host: "a"}, Dst: Endpoint{Host: "b"}}
+	}
+	for _, tol := range []float64{math.Inf(1), math.Inf(-1), math.NaN()} {
+		c := base()
+		c.Opts.Tolerance = tol
+		if err := c.Validate(); err == nil {
+			t.Errorf("tolerance %v must fail Validate (a non-finite tolerance would normalize every float to the same rendering)", tol)
+		} else if !strings.Contains(err.Error(), "tolerance") {
+			t.Errorf("the error must name the tolerance: %v", err)
+		}
+	}
+	// 0 (bit-exact) and finite positive values stay legal
+	for _, tol := range []float64{0, 1e-9, 0.5} {
+		c := base()
+		c.Opts.Tolerance = tol
+		if err := c.Validate(); err != nil {
+			t.Errorf("tolerance %v must be accepted: %v", tol, err)
+		}
+	}
+}
+
+// TestYAMLNonFiniteToleranceFailsClosed covers the YAML construction
+// layer: .inf / -.inf / .nan decode as legal floats, so Parse accepts
+// the document — the config as a whole must still fail closed at the
+// Validate gate (every command path runs it before ApplyDefaults), and
+// a finite value keeps working.
+func TestYAMLNonFiniteToleranceFailsClosed(t *testing.T) {
+	for _, text := range []string{
+		"src:\n  host: a\ndst:\n  host: b\noptions:\n  tolerance: .inf\n",
+		"src:\n  host: a\ndst:\n  host: b\noptions:\n  tolerance: -.inf\n",
+		"src:\n  host: a\ndst:\n  host: b\noptions:\n  tolerance: .nan\n",
+	} {
+		c, err := Parse([]byte(text))
+		if err != nil {
+			continue // Parse itself refusing is fine: it fails closed either way
+		}
+		if err := c.Validate(); err == nil {
+			t.Errorf("YAML %q must fail closed (non-finite tolerance), got a usable config", text)
+		} else if !strings.Contains(err.Error(), "tolerance") {
+			t.Errorf("the error must name the tolerance: %v", err)
+		}
+	}
+	c, err := Parse([]byte("src:\n  host: a\ndst:\n  host: b\noptions:\n  tolerance: 0.001\n"))
+	if err != nil {
+		t.Fatalf("finite YAML tolerance must parse: %v", err)
+	}
+	if c.Opts.Tolerance != 0.001 {
+		t.Fatalf("finite YAML tolerance = %v, want 0.001", c.Opts.Tolerance)
+	}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("finite YAML tolerance must pass Validate: %v", err)
 	}
 }

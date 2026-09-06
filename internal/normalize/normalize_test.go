@@ -2,6 +2,7 @@ package normalize
 
 import (
 	"bytes"
+	"math"
 	"testing"
 	"time"
 
@@ -100,6 +101,41 @@ func TestFormatFloat(t *testing.T) {
 	// no tolerance: bit-exact difference is preserved
 	if gotA, gotB := formatFloat(a, 0, 64), formatFloat(b, 0, 64); gotA == gotB {
 		t.Errorf("bit-exact mode must distinguish %v from %v", a, b)
+	}
+}
+
+// TestNonFiniteToleranceSilentFalseIdentical demonstrates the hazard and
+// pins the normalizer's defense (the second line after Config.Validate):
+// with tol=+Inf the quantization is v/Inf = 0 and 0*Inf = NaN, so the
+// raw renderer collapses EVERY distinct value to "NaN" — 1 and 999 would
+// compare equal and a divergent table reports CONVERGED. The normal
+// tolerance path must therefore refuse a non-finite tolerance instead of
+// letting the collapse happen.
+func TestNonFiniteToleranceSilentFalseIdentical(t *testing.T) {
+	// the hazard itself (why the gate exists): the raw renderer, given a
+	// +Inf tolerance, collapses distinct values into one rendering
+	if r1, r999 := formatFloat(1, math.Inf(1), 64), formatFloat(999, math.Inf(1), 64); r1 != r999 {
+		t.Fatalf("precondition: the collapse scenario changed (1 -> %q, 999 -> %q); revisit the test", r1, r999)
+	}
+	// and the normal path must NOT reach it: the normalizer refuses
+	// every non-finite tolerance on both float families
+	for _, tol := range []float64{math.Inf(1), math.Inf(-1), math.NaN()} {
+		n := NewNormalizer([]conn.Column{col("f", conn.FamFLOAT), col("d", conn.FamDOUBLE)}, Options{Tolerance: tol})
+		if _, err := n.Normalize([]any{float32(1), 1.0}, nil); err == nil {
+			t.Errorf("tolerance %v must refuse to normalize (it would collapse every distinct value to the same rendering)", tol)
+		}
+		if _, err := n.encodeValue(col("d", conn.FamDOUBLE), 999.0); err == nil {
+			t.Errorf("tolerance %v must refuse DOUBLE 999 (formatFloat(999, %v) would render the same as 1)", tol, tol)
+		}
+	}
+	// legal tolerances keep working through the same path
+	n := NewNormalizer([]conn.Column{col("d", conn.FamDOUBLE)}, Options{Tolerance: 1e-9})
+	if _, err := n.Normalize([]any{1.0}, nil); err != nil {
+		t.Errorf("finite tolerance must normalize: %v", err)
+	}
+	n0 := NewNormalizer([]conn.Column{col("d", conn.FamDOUBLE)}, Options{})
+	if _, err := n0.Normalize([]any{1.0}, nil); err != nil {
+		t.Errorf("zero tolerance (bit-exact) must normalize: %v", err)
 	}
 }
 

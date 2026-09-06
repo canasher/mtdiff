@@ -13,6 +13,8 @@ import (
 	"database/sql"
 	"strings"
 	"testing"
+
+	"github.com/go-sql-driver/mysql"
 )
 
 func openFakeWriter(t *testing.T, srv *fakeServer) *Writer {
@@ -115,5 +117,55 @@ func TestWriterReappliesGuardrailsOnSamePhysicalCheckout(t *testing.T) {
 	}
 	if first.state["max_execution_time"] != "300000" {
 		t.Fatalf("the second checkout must re-apply the statement timeout, state=%v", first.state)
+	}
+}
+
+// TestWriterConnDeadDuringGuardrailReacquires pins the P1/P2-3 fix:
+// the first physical connection dies DURING the guardrail re-apply
+// (its first SET reports a dead-connection error, the driver's plain
+// ErrInvalidConn on a KILLed idle socket). Writer.Conn must NOT hand
+// out that dead connection: it closes it, checks out a SECOND physical
+// connection, re-applies the guardrails to it, and hands out only the
+// second one — before any transaction could start on the dead one.
+func TestWriterConnDeadDuringGuardrailReacquires(t *testing.T) {
+	srv := &fakeServer{killErr: mysql.ErrInvalidConn}
+	w := openFakeWriter(t, srv)
+	ctx := context.Background()
+
+	// the pool's first (and only) physical connection is alive at
+	// checkout — then dies before the guardrails can land
+	first := srv.conns[0]
+	first.kill()
+
+	c, err := w.Conn(ctx)
+	if err != nil {
+		t.Fatalf("Writer.Conn must recover from a dead checkout (replace once before handout), got: %v", err)
+	}
+	defer c.Close()
+	if !first.closed {
+		t.Fatal("the dead first connection must be closed — a dead session must never be handed out")
+	}
+	if len(srv.conns) != 2 {
+		t.Fatalf("the recovery must open a SECOND physical connection, got %d conns", len(srv.conns))
+	}
+	second := srv.conns[1]
+	if second.state["innodb_lock_wait_timeout"] != "5" || second.state["max_execution_time"] != "300000" ||
+		!strings.Contains(second.state["sql_mode"], "NO_ZERO_DATE") {
+		t.Fatalf("the second connection must be handed out WITH the guardrails re-applied: state=%v", second.state)
+	}
+	// and the handed-out connection actually works, on the second
+	// physical session
+	var one int
+	if err := c.QueryRowContext(ctx, "SELECT 1").Scan(&one); err != nil {
+		t.Fatalf("SELECT 1 on the handed-out connection: %v", err)
+	}
+	ran := false
+	for _, qq := range second.queries {
+		if strings.Contains(qq, "SELECT 1") {
+			ran = true
+		}
+	}
+	if !ran {
+		t.Fatalf("the query must run on the SECOND connection (the first is dead); its queries=%v", second.queries)
 	}
 }

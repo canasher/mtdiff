@@ -313,6 +313,111 @@ func TestRealControlReplacementReinitialized(t *testing.T) {
 	}
 }
 
+// TestRealActiveControlKillRecovers is the real-server counterpart of
+// TestControlActiveInvalidConnDoesNotDeadlock (P1-2): the control
+// session is held ACTIVE (checked out, never closed) while its physical
+// connection is KILLed, and the next query through that SAME session
+// must transparently recover — no Close, no re-Control, no caller-side
+// retry loop — on a NEW physical session with the full policy
+// re-applied. This is deliberately different from
+// TestRealControlReplacementReinitialized, which closes the session
+// first and re-acquires: the pre-fix swap deadlocked only when the
+// dead session was still pinning the pool's single slot.
+func TestRealActiveControlKillRecovers(t *testing.T) {
+	dsn := os.Getenv("MTDIFF_E2E_DSN_SRC")
+	if dsn == "" {
+		t.Skip("MTDIFF_E2E_DSN_SRC not set (run via e2e/run_e2e.sh)")
+	}
+	ctx := context.Background()
+	ep := e2eEndpoint(t, dsn)
+
+	raw, err := sql.Open("mysql", BuildDSN(ep, 0))
+	if err != nil {
+		t.Fatalf("open raw: %v", err)
+	}
+	if err := raw.Ping(); err != nil {
+		raw.Close()
+		t.Fatalf("ping raw: %v", err)
+	}
+	defer raw.Close()
+
+	side, err := OpenSide(ctx, "src", ep, 0, 1, false)
+	if err != nil {
+		t.Fatalf("open side: %v", err)
+	}
+	defer side.Close()
+
+	// an ACTIVE control session: checked out and held, never closed
+	q, err := side.Control(ctx)
+	if err != nil {
+		t.Fatalf("control checkout: %v", err)
+	}
+	defer q.Close()
+
+	// the physical id, learned through the session itself
+	var oldID int64
+	if err := OneRow(ctx, q, "SELECT CONNECTION_ID()", []any{&oldID}); err != nil {
+		t.Fatalf("CONNECTION_ID through the active session: %v", err)
+	}
+
+	// KILL the session's physical connection while q still holds it
+	if _, err := raw.ExecContext(ctx, "KILL "+strconv.FormatInt(oldID, 10)); err != nil {
+		t.Fatalf("kill %d: %v", oldID, err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var one int
+		err := raw.QueryRowContext(ctx, "SELECT 1 FROM information_schema.PROCESSLIST WHERE ID = ?", oldID).Scan(&one)
+		if err != nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("killed control connection still visible in PROCESSLIST after 10s")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// watchdog for the recovery: the pre-fix swap would have waited on
+	// the pool's single slot — pinned by this very session — until the
+	// context gave up
+	wctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	// the query goes through the SAME active session: no Close, no
+	// re-Control, no caller-side retry loop
+	var one int
+	if err := OneRow(wctx, q, "SELECT 1", []any{&one}); err != nil {
+		t.Fatalf("the active session's query must recover after the KILL: %v", err)
+	}
+	// the recovery must run on a NEW physical session
+	var newID int64
+	if err := OneRow(wctx, q, "SELECT CONNECTION_ID()", []any{&newID}); err != nil {
+		t.Fatalf("CONNECTION_ID after the KILL: %v", err)
+	}
+	if newID == oldID {
+		t.Fatalf("the session recovered on the KILLED connection (id %d)", oldID)
+	}
+	// the fresh session must be policy-initialized again
+	var wait int
+	if err := OneRow(wctx, q, "SELECT @@SESSION.innodb_lock_wait_timeout", []any{&wait}); err != nil {
+		t.Fatalf("lock wait after the KILL: %v", err)
+	}
+	if wait != 5 {
+		t.Fatalf("the replacement control session was not policy-initialized: innodb_lock_wait_timeout=%d (server default is 50)", wait)
+	}
+	var mode string
+	if err := OneRow(wctx, q, "SELECT @@SESSION.sql_mode", []any{&mode}); err != nil {
+		t.Fatalf("sql_mode after the KILL: %v", err)
+	}
+	if !strings.Contains(mode, "NO_ZERO_DATE") {
+		t.Fatalf("the replacement control session lacks the sql_mode guardrail: %q", mode)
+	}
+	// and a real metadata query runs on the recovered active session
+	if _, err := TableExists(wctx, q, "information_schema"); err != nil {
+		t.Fatalf("metadata query on the recovered active session: %v", err)
+	}
+}
+
 // TestRealWriterReplacementReinitialized is the writer-side counterpart
 // (R6-3): the single write connection is KILLed and the replacement —
 // a fresh physical session at the SERVER DEFAULTS — must come back

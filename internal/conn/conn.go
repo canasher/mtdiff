@@ -242,30 +242,66 @@ func applySession(ctx context.Context, c *sql.Conn, allowUnenforced bool) error 
 			fmt.Fprintf(os.Stderr, "warn: cannot enforce a read-only session on this backend (read_only: %v; transaction read only: %v); continuing per --allow-unenforced-readonly, read connections issue SELECTs only\n", err, err2)
 		}
 	}
+	// and the guardrails on top. The guardrail failure is ignored HERE
+	// (best-effort, see applyGuardrails): a read connection whose
+	// guardrails cannot be applied because the session is DEAD has
+	// already failed the read-only tiers above (a dead socket fails
+	// both SETs), and its checkout is refused there.
 	applyGuardrails(ctx, c)
 	return nil
 }
 
-// applyGuardrails applies the best-effort session guardrails without the
-// read-only enforcement. It is shared by the read-only pools (via
-// applySession) and the destination write pool (which is intentionally not
-// read-only — see OpenWriter in writer.go).
-func applyGuardrails(ctx context.Context, c *sql.Conn) {
-	bestEffort(ctx, c, "SET SESSION innodb_lock_wait_timeout = 5")
-	bestEffort(ctx, c, "SET SESSION max_execution_time = 300000")
-	addSQLModeFlags(ctx, c)
+// applyGuardrails applies the best-effort session guardrails (lock-wait
+// timeout, statement timeout, zero-date sql_mode flags) and reports a
+// DEAD-CONNECTION failure. A guardrail the backend does not SUPPORT
+// (MariaDB has no max_execution_time; a proxy layer may lack either
+// variable) is a warning, and the remaining guardrails still run — that
+// is the best-effort part. A statement that fails because the SESSION
+// is dead (a KILLed socket, a dropped network) is returned so the
+// caller can REPLACE the connection instead of handing out a dead one
+// (see Writer.Conn / connChecked). It is shared by the read-only pools
+// (via applySession, which ignores the result) and the destination
+// write pool (which is intentionally not read-only and acts on the
+// result).
+func applyGuardrails(ctx context.Context, c *sql.Conn) error {
+	if err := guardrail(ctx, c, "SET SESSION innodb_lock_wait_timeout = 5"); err != nil {
+		return err
+	}
+	if err := guardrail(ctx, c, "SET SESSION max_execution_time = 300000"); err != nil {
+		return err
+	}
+	return addSQLModeFlags(ctx, c)
+}
+
+// guardrail runs one best-effort guardrail statement and distinguishes
+// its two failure modes: UNSUPPORTED (the backend lacks the variable)
+// is a warning — the remaining guardrails still run; DEAD is returned
+// to the caller, which must replace the connection rather than use it.
+func guardrail(ctx context.Context, c *sql.Conn, stmt string) error {
+	if _, err := c.ExecContext(ctx, stmt); err != nil {
+		if DeadConn(err) {
+			return err
+		}
+		fmt.Fprintf(os.Stderr, "warn: %s failed: %v\n", stmt, err)
+	}
+	return nil
 }
 
 // addSQLModeFlags ensures the zero-date guard flags are in the session
 // sql_mode. Unlike a blind CONCAT-append (which grew the mode by 31
 // characters per execution until it exceeded sql_max_mode_size, 255 on
 // 8.0, and warned on every later statement), it appends each flag at most
-// once, so re-applying the policy to a connection is a no-op.
-func addSQLModeFlags(ctx context.Context, c *sql.Conn) {
+// once, so re-applying the policy to a connection is a no-op. A dead
+// session (the SELECT probe or the SET failing on a dead socket) is
+// returned; a failed/unsupported statement is a warning.
+func addSQLModeFlags(ctx context.Context, c *sql.Conn) error {
 	var mode string
 	if err := c.QueryRowContext(ctx, "SELECT @@SESSION.sql_mode").Scan(&mode); err != nil {
+		if DeadConn(err) {
+			return err
+		}
 		fmt.Fprintf(os.Stderr, "warn: SELECT @@SESSION.sql_mode failed: %v\n", err)
-		return
+		return nil
 	}
 	var add []string
 	for _, flag := range []string{"NO_ZERO_DATE", "NO_ZERO_IN_DATE"} {
@@ -274,18 +310,12 @@ func addSQLModeFlags(ctx context.Context, c *sql.Conn) {
 		}
 	}
 	if len(add) == 0 {
-		return
+		return nil
 	}
 	// Join, don't concatenate literals: an empty current mode must not
 	// render as an empty string literal glued onto the new one.
 	newMode := strings.Join(append([]string{mode}, add...), ",")
-	bestEffort(ctx, c, "SET SESSION sql_mode = '"+strings.ReplaceAll(newMode, "'", "''")+"'")
-}
-
-func bestEffort(ctx context.Context, c *sql.Conn, stmt string) {
-	if _, err := c.ExecContext(ctx, stmt); err != nil {
-		fmt.Fprintf(os.Stderr, "warn: %s failed: %v\n", stmt, err)
-	}
+	return guardrail(ctx, c, "SET SESSION sql_mode = '"+strings.ReplaceAll(newMode, "'", "''")+"'")
 }
 
 // AcquireScan returns a dedicated scan connection whose session safety
@@ -385,12 +415,23 @@ func (s *Side) AcquireControl(ctx context.Context) (*sql.Conn, error) {
 // policy-applied checkout, with transparent dead-connection recovery.
 // A dead physical connection (server KILL, network partition, a
 // restart) surfaces as a bad-connection error on the next query; the
-// old connection is then closed, a FRESH one checked out — the policy
-// applied FIRST, via AcquireControl — and the query retried exactly
-// once on it. Query-first / policy-later is impossible: the retry runs
-// only on a connection whose policy application already succeeded, and
-// a session whose replacement fails is sticky-dead (every later query
-// fails loudly; the Row queries below surface the dead driver error).
+// session then swaps in a FRESH one — the policy applied FIRST, via
+// AcquireControl — and the query is retried exactly once on it.
+// Query-first / policy-later is impossible: the retry runs only on a
+// connection whose policy application already succeeded, and a session
+// whose replacement fails is sticky-dead (every later query fails
+// loudly with the replacement/policy error, not the original dead one).
+//
+// The swap closes the dead checkout BEFORE checking out the
+// replacement (P1-2): the control pool holds a SINGLE connection
+// (MaxOpenConns=1) and this session is pinning it. A dead-connection
+// error that is NOT driver.ErrBadConn — the go-sql-driver reports a
+// KILLed idle socket's read failure as its plain ErrInvalidConn, and
+// database/sql only releases a pinned connection on ErrBadConn — would
+// otherwise keep the slot pinned, and a swap that checked out the
+// replacement first would wait on its own slot forever (a self-
+// deadlock). Closing first frees the slot in every case (a truly
+// discarded connection just has nothing left to return).
 //
 // A Row query on this session does not auto-recover: database/sql
 // surfaces the dead-connection error at Scan time, past the point this
@@ -438,10 +479,15 @@ func (t *ControlQueryer) QueryContext(ctx context.Context, query string, args ..
 	rows, err := t.cn.QueryContext(ctx, query, args...)
 	if err != nil && !t.retried && DeadConn(err) {
 		t.retried = true
-		t.err = t.swap(ctx)
-		if t.err == nil {
-			rows, err = t.cn.QueryContext(ctx, query, args...)
+		if err := t.swap(ctx); err != nil {
+			// the replacement (or its policy) failed: report THAT
+			// error, not the original dead-connection error — a caller
+			// seeing the sticky failure must learn why the session is
+			// unusable, not that one query hit a dead socket
+			t.err = err
+			return nil, err
 		}
+		return t.cn.QueryContext(ctx, query, args...)
 	}
 	return rows, err
 }
@@ -460,18 +506,27 @@ func (t *ControlQueryer) Close() error {
 	return cn.Close()
 }
 
-// swap discards the dead connection and takes a fresh one: the new
-// checkout re-applies the full policy before the retried query may run.
-// On failure the session keeps the (dead) connection, so later queries
+// swap discards the dead connection and takes a fresh one, whose
+// checkout re-applies the full policy (AcquireControl) before the
+// retried query may run. The ORDER is the point (P1-2): the old
+// checkout is closed BEFORE the replacement is checked out. This
+// session pins the control pool's single slot, and a dead connection
+// whose error is not driver.ErrBadConn (the driver's plain
+// ErrInvalidConn on a KILLed idle socket) is NOT released by
+// database/sql — acquiring first would wait on our own slot forever.
+// On failure the session keeps the (closed) handle, so later queries
 // fail loudly instead of hitting a nil.
 func (t *ControlQueryer) swap(ctx context.Context) error {
 	old := t.cn
+	t.cn = nil
+	if old != nil {
+		_ = old.Close() // free the pool slot before the replacement checkout
+	}
 	fresh, err := t.side.AcquireControl(ctx)
 	if err != nil {
-		t.cn = old
+		t.cn = old // the closed handle: later queries fail loudly via t.err
 		return fmt.Errorf("%s: replace dead control connection: %w", t.side.Name, err)
 	}
-	_ = old.Close()
 	t.cn = fresh
 	return nil
 }

@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"regexp"
 	"strconv"
@@ -359,8 +360,19 @@ func (c *Config) Validate() error {
 	if c.Opts.DrillLimit < 0 {
 		return fmt.Errorf("drill_limit must be >= 0, got %d", c.Opts.DrillLimit)
 	}
-	if c.Opts.Tolerance < 0 {
-		return fmt.Errorf("tolerance must be >= 0, got %v", c.Opts.Tolerance)
+	// Tolerance is allowed to be 0 or a finite positive value — nothing
+	// else. A NON-FINITE tolerance is not a nonsense setting, it is a
+	// silent false identical: the normalizer quantizes by v/tol, and
+	// with tol=+Inf every finite value gives v/Inf = 0, and 0*Inf =
+	// NaN — so ALL distinct float values normalize to the rendering
+	// "NaN" and compare equal, and a divergent table reports CONVERGED
+	// (tol=NaN poisons the same way). Reject NaN/±Inf (and negative
+	// finite values) here, at the config entry, fail closed: the CLI
+	// flag and the YAML decode both land in this check. The normalizer
+	// refuses non-finite tolerances on its own as the second line of
+	// defense (normalize.encodeValue).
+	if math.IsNaN(c.Opts.Tolerance) || math.IsInf(c.Opts.Tolerance, 0) || c.Opts.Tolerance < 0 {
+		return fmt.Errorf("tolerance must be 0 or a finite positive value, got %v (a non-finite tolerance would normalize every float to the same rendering and hide all differences)", c.Opts.Tolerance)
 	}
 	if c.Opts.BatchSize < 0 {
 		return fmt.Errorf("batch_size must be >= 0, got %d", c.Opts.BatchSize)

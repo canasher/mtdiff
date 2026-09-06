@@ -421,6 +421,18 @@ func (a *Applier) streamChunk(ctx context.Context, tx *sql.Tx, st *Stats, b *Bui
 	return flush()
 }
 
+// applyTx runs one chunk group (or one resync chunk) as ONE transaction
+// on the dedicated write connection.
+//
+// There is deliberately NO retry here — and none may be added (P1/P2-3):
+// the only safe place to recover from a dead writer connection is in
+// Writer.Conn, BEFORE the transaction starts. Once BeginTx has
+// succeeded, any network/dead error on a DML or on the COMMIT itself
+// leaves the commit outcome UNKNOWN (a COMMIT lost in the network may
+// have landed on the server), and replaying the transaction would
+// double-write. A failure here therefore fails fast: the group is
+// rolled back, the error recorded, and the table stops — the caller
+// (not the applier) decides what to do next.
 func (a *Applier) applyTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
 	cn, err := a.W.Conn(ctx)
 	if err != nil {

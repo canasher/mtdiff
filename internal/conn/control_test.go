@@ -15,6 +15,9 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/go-sql-driver/mysql"
 )
 
 // The control-side counterpart of TestAcquireScanReappliesPolicyOn
@@ -155,5 +158,78 @@ func TestControlPolicyFailureNoQueryNoHandout(t *testing.T) {
 			!strings.Contains(strings.ToUpper(qq), "SELECT @@SESSION.SQL_MODE") {
 			t.Fatalf("the refused connection served a query: %q", qq)
 		}
+	}
+}
+
+// TestControlActiveInvalidConnDoesNotDeadlock pins the P1-2 fix: the
+// pre-fix swap checked out the replacement BEFORE closing the dead
+// checkout. The control pool holds a SINGLE connection (MaxOpenConns=1)
+// and the session is pinning it. The error the real driver reports for
+// a KILLed IDLE socket's read failure is its plain mysql.ErrInvalidConn
+// — not driver.ErrBadConn — and database/sql only releases a pinned
+// connection on ErrBadConn. The dead checkout therefore kept pinning
+// the only slot, and the pre-fix swap waited on its own slot forever (a
+// self-deadlock; the pre-fix code is verified to hit the watchdog, see
+// the negative control below). The fix closes the dead checkout FIRST:
+// the slot is free, the replacement comes back policy-initialized from
+// a fresh physical session, and the active query recovers on it.
+func TestControlActiveInvalidConnDoesNotDeadlock(t *testing.T) {
+	srv := &fakeServer{fixedID: 7, killErr: mysql.ErrInvalidConn}
+	side := openFakeSide(t, srv)
+
+	// watchdog: the pre-fix implementation never returned before this
+	// deadline (blocked on the slot the same session was pinning)
+	wctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// an ACTIVE session: checked out and held (never Closed)
+	q, err := side.Control(wctx)
+	if err != nil {
+		t.Fatalf("control checkout: %v", err)
+	}
+	defer q.Close()
+	first := srv.conns[0]
+	var one int
+	if err := OneRow(wctx, q, "SELECT 1", []any{&one}); err != nil {
+		t.Fatalf("query before the kill: %v", err)
+	}
+
+	// the KILL lands while q still holds the session
+	first.kill()
+
+	// the query on the active session must recover WITHIN the watchdog:
+	// the swap closes the dead checkout (freeing the only pool slot),
+	// checks out a fresh physical connection — the full policy
+	// re-applied to it before the retry may run — and the query
+	// succeeds there.
+	rows, err := q.QueryContext(wctx, "SELECT 1")
+	if err != nil {
+		t.Fatalf("the query on the active KILLed session must recover within the 5s watchdog; pre-fix this call waited out the watchdog on its own slot. got: %v", err)
+	}
+	if rows == nil {
+		t.Fatal("rows must be non-nil on success")
+	}
+	defer rows.Close()
+	if len(srv.conns) != 3 {
+		t.Fatalf("the recovery must run on a NEW physical connection, got %d conns", len(srv.conns))
+	}
+	second := srv.conns[2]
+	if second.state["innodb_lock_wait_timeout"] != "5" || second.state["txn_read_only"] != "1" ||
+		!strings.Contains(second.state["sql_mode"], "NO_ZERO_DATE") {
+		t.Fatalf("the replacement connection was handed out WITHOUT the full policy: state=%v", second.state)
+	}
+	ran := false
+	for _, qq := range second.queries {
+		if strings.Contains(qq, "SELECT 1") {
+			ran = true
+		}
+	}
+	if !ran {
+		t.Fatalf("the retried query must run on the replacement connection; its queries=%v", second.queries)
+	}
+	// the dead checkout was closed (its slot freed) before the
+	// replacement was checked out
+	if !first.closed {
+		t.Fatal("the dead checkout must be closed before the replacement checkout")
 	}
 }

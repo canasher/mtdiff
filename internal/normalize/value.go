@@ -37,6 +37,9 @@ func (n *Normalizer) encodeValue(c conn.Column, v driver.Value) ([]byte, error) 
 		}
 		return []byte(normalizeDecimal(s)), nil
 	case conn.FamFLOAT:
+		if !usableTolerance(n.opts.Tolerance) {
+			return nil, toleranceRefused(n.opts.Tolerance)
+		}
 		// The driver delivers FLOAT as float32 or float64 depending on
 		// version/parameters; accept both (float32 is exact in float64).
 		var f64 float64
@@ -50,6 +53,9 @@ func (n *Normalizer) encodeValue(c conn.Column, v driver.Value) ([]byte, error) 
 		}
 		return []byte(formatFloat(f64, n.opts.Tolerance, 32)), nil
 	case conn.FamDOUBLE:
+		if !usableTolerance(n.opts.Tolerance) {
+			return nil, toleranceRefused(n.opts.Tolerance)
+		}
 		f, ok := v.(float64)
 		if !ok {
 			return nil, fmt.Errorf("expected float64, got %T", v)
@@ -129,11 +135,35 @@ func (n *Normalizer) stringOpts(s string) string {
 	return s
 }
 
+// usableTolerance reports a tolerance the float quantizer may use: exactly
+// 0 (bit-exact) or a finite positive value. This is the SECOND line of
+// defense against a silent false identical — the FIRST is Config.Validate,
+// which refuses NaN/±Inf/negative at the config entry. With tol=+Inf the
+// quantization is v/Inf = 0 and 0*Inf = NaN, so every DISTINCT float value
+// would normalize to the same rendering "NaN" and compare equal: a full
+// diff of a divergent table reports CONVERGED. A non-finite tolerance must
+// therefore refuse to normalize (an error the caller surfaces), never fall
+// back to a comparison the operator did not configure.
+func usableTolerance(tol float64) bool {
+	// NaN fails both comparisons (NaN == 0 and NaN > 0 are false);
+	// -Inf and negative finite values fail tol > 0; +Inf fails IsInf.
+	return tol == 0 || (tol > 0 && !math.IsInf(tol, 0))
+}
+
+func toleranceRefused(tol float64) error {
+	return fmt.Errorf("tolerance %v is not usable (it must be 0 or a finite positive value): refusing to normalize float values — a non-finite tolerance would collapse every distinct value to the same rendering", tol)
+}
+
 // formatFloat renders a float canonically. Without tolerance the shortest
 // round-trip representation is used (bit-exact comparison). With tolerance
 // the value is quantized to the grid first: every value landing in the same
-// cell produces the same float64 (N * tol), so the rendering is identical for
-// all in-tolerance values.
+// cell produces the same float64 (N * tol), so the rendering is identical
+// for all in-tolerance values.
+//
+// Precondition (enforced by the callers, see usableTolerance): tol is 0 or
+// a finite positive value. A non-finite tol must NOT reach this function:
+// with tol=+Inf it would quantize every distinct value to 0*Inf = NaN and
+// render them all identically.
 func formatFloat(v, tol float64, prec int) string {
 	if math.IsNaN(v) {
 		return "NaN" // MySQL has no NaN; defensive only
