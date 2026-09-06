@@ -481,6 +481,161 @@ func TestEnvExpansionSequenceItems(t *testing.T) {
 	}
 }
 
+// The R6-4 regressions: a LONE ${ENV} on a TYPED field (int/bool/float
+// Go type — see typedEnvFields) decodes as that type: `parallel: ${P}`
+// with P=8 is the int 8, not the string "8" (the string-only expansion
+// of R5 left it as "8", which the strict decode refused). The
+// coercion is of the isolated scalar only: it can never read or create
+// structure, quoted placeholders stay deliberate strings, and
+// untyped fields keep their value as a string byte for byte.
+
+func TestEnvExpansionTypedScalars(t *testing.T) {
+	t.Setenv("MTDIFF_TEST_PORT", "3307")
+	t.Setenv("MTDIFF_TEST_PAR", "8")
+	t.Setenv("MTDIFF_TEST_SNAP", "true")
+	t.Setenv("MTDIFF_TEST_TOL", "0.001")
+	t.Setenv("MTDIFF_TEST_ST", "true")
+	t.Setenv("MTDIFF_TEST_ARW", "false")
+	c, err := Parse([]byte(`
+src:
+  host: h
+  port: ${MTDIFF_TEST_PORT}
+dst:
+  host: d
+options:
+  parallel: ${MTDIFF_TEST_PAR}
+  snapshot: ${MTDIFF_TEST_SNAP}
+  tolerance: ${MTDIFF_TEST_TOL}
+  allow_structure_truncate: ${MTDIFF_TEST_ST}
+  allow_row_rewrite: ${MTDIFF_TEST_ARW}
+`))
+	if err != nil {
+		t.Fatalf("typed env scalars must parse: %v", err)
+	}
+	if c.Src.Port != 3307 {
+		t.Errorf("port: ${ENV}=3307 must decode as the int 3307, got %d", c.Src.Port)
+	}
+	if c.Opts.Parallel != 8 {
+		t.Errorf("parallel: ${ENV}=8 must decode as the int 8, got %d", c.Opts.Parallel)
+	}
+	if !c.Opts.Snapshot {
+		t.Errorf("snapshot: ${ENV}=true must decode as true")
+	}
+	if c.Opts.Tolerance != 0.001 {
+		t.Errorf("tolerance: ${ENV}=0.001 must decode as 0.001, got %v", c.Opts.Tolerance)
+	}
+	if !c.Opts.AllowStructureTruncate {
+		t.Errorf("allow_structure_truncate: ${ENV}=true must decode as true")
+	}
+	if c.Opts.AllowRowRewrite {
+		t.Errorf("allow_row_rewrite: ${ENV}=false must decode as false (not the default)")
+	}
+}
+
+// A substituted value that does not parse for the field's type is a
+// configuration error naming the variable and the value (fail closed).
+func TestEnvExpansionTypedInvalid(t *testing.T) {
+	cases := []struct {
+		name, field, env, value string
+	}{
+		{"int", "parallel", "MTDIFF_TEST_BAD_INT", "not-a-number"},
+		{"float", "tolerance", "MTDIFF_TEST_BAD_FLOAT", "1e"},
+		{"bool", "snapshot", "MTDIFF_TEST_BAD_BOOL", "maybe"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(tc.env, tc.value)
+			_, err := Parse([]byte("src:\n  host: h\noptions:\n  " + tc.field + ": ${" + tc.env + "}\n"))
+			if err == nil {
+				t.Fatalf("a value that does not parse for %s must fail closed", tc.field)
+			}
+			if !strings.Contains(err.Error(), tc.env) || !strings.Contains(err.Error(), tc.value) {
+				t.Errorf("the error must name the variable and its value, got %q", err)
+			}
+		})
+	}
+}
+
+// A value that LOOKS like a mapping must not create the second key:
+// on a bool field the isolated scalar simply fails to parse (the
+// structural-injection value of R5-2, re-tested against the typed
+// path), and on an untyped field it is still just a value.
+func TestEnvExpansionTypedInjectionRefused(t *testing.T) {
+	t.Setenv("MTDIFF_TEST_ALLOWX", "true\nother_key: x")
+	if _, err := Parse([]byte("src:\n  host: h\noptions:\n  allow_row_rewrite: ${MTDIFF_TEST_ALLOWX}\n")); err == nil {
+		t.Fatal("a value containing a new mapping line for a bool field must fail closed (no new field may appear)")
+	} else if !strings.Contains(err.Error(), "MTDIFF_TEST_ALLOWX") {
+		t.Errorf("the error must name the variable, got %q", err)
+	}
+	c, err := Parse([]byte("src:\n  host: h\n  password: ${MTDIFF_TEST_ALLOWX}\n"))
+	if err != nil {
+		t.Fatalf("on an untyped field the value is still a value: %v", err)
+	}
+	if c.Src.Password != "true\nother_key: x" {
+		t.Errorf("byte-exact value required, got %q", c.Src.Password)
+	}
+}
+
+// UNTYPED (string) fields keep the substituted value a string, byte
+// for byte — even when it looks like a number.
+func TestEnvExpansionUntypedKeysStayString(t *testing.T) {
+	t.Setenv("MTDIFF_TEST_H8", "8")
+	c, err := Parse([]byte("src:\n  host: ${MTDIFF_TEST_H8}\n"))
+	if err != nil {
+		t.Fatalf("a string field taking a numeric env value must stay a string: %v", err)
+	}
+	if c.Src.Host != "8" {
+		t.Errorf("host must be the string \"8\", got %q", c.Src.Host)
+	}
+}
+
+// Sequence items have no typed field: the same value is a plain string
+// there (and decodes as one).
+func TestEnvExpansionSequenceItemsStayString(t *testing.T) {
+	t.Setenv("MTDIFF_TEST_SEQ", "8")
+	c, err := Parse([]byte("src:\n  host: h\ndst:\n  host: d\noptions:\n  tables:\n    - ${MTDIFF_TEST_SEQ}\n"))
+	if err != nil {
+		t.Fatalf("sequence items have no typed field and must stay strings: %v", err)
+	}
+	if len(c.Opts.Tables) != 1 || c.Opts.Tables[0] != "8" {
+		t.Errorf("got %v", c.Opts.Tables)
+	}
+}
+
+// An explicit quote is a deliberate STRING: `parallel: "${P}"` is not
+// coerced (the strict decode refuses the string for an int field —
+// fail closed), while a quoted placeholder on a string field is legal.
+func TestEnvExpansionQuotedPlaceholderStaysString(t *testing.T) {
+	t.Setenv("MTDIFF_TEST_QP", "8")
+	if _, err := Parse([]byte("src:\n  host: h\noptions:\n  parallel: \"${MTDIFF_TEST_QP}\"\n")); err == nil {
+		t.Fatal(`a quoted placeholder on a typed field must not be coerced (it stays the string "8", refused by the strict decoder)`)
+	}
+	c, err := Parse([]byte("src:\n  host: h\n  user: \"${MTDIFF_TEST_QP}\"\n"))
+	if err != nil {
+		t.Fatalf("a quoted placeholder on a string field must parse: %v", err)
+	}
+	if c.Src.User != "8" {
+		t.Errorf("got %q", c.Src.User)
+	}
+}
+
+// A placeholder that is PART of a larger value is a string: no typed
+// coercion (the strict decode refuses it on a typed field), and on a
+// string field it is just concatenation.
+func TestEnvExpansionPartialSubstitutionStaysString(t *testing.T) {
+	t.Setenv("MTDIFF_TEST_PS", "8")
+	if _, err := Parse([]byte("src:\n  host: h\noptions:\n  parallel: x${MTDIFF_TEST_PS}\n")); err == nil {
+		t.Fatal("a partial substitution on a typed field must stay a string and be refused, not coerced")
+	}
+	c, err := Parse([]byte("src:\n  host: h\n  user: x${MTDIFF_TEST_PS}\n"))
+	if err != nil {
+		t.Fatalf("partial substitution on a string field: %v", err)
+	}
+	if c.Src.User != "x8" {
+		t.Errorf("got %q", c.Src.User)
+	}
+}
+
 func TestValidateAndDefaults(t *testing.T) {
 	c := &Config{Src: Endpoint{Host: "a"}, Dst: Endpoint{Host: "b"}}
 	if err := c.Validate(); err != nil {

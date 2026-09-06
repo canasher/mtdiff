@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -132,6 +133,18 @@ func LoadFile(path string) (*Config, error) {
 // the variable (fail closed): substituting a silent empty string would
 // turn a typo into an incomprehensible server-side auth failure.
 //
+// A LONE placeholder on a typed field — the whole value is exactly one
+// ${ENV} reference, and the field's Go type is int/bool/float (port,
+// parallel, chunk_size, tolerance, snapshot, allow_structure_truncate,
+// …; see typedEnvFields) — has the substituted text parsed as that
+// type, so `parallel: ${P}` with P=8 decodes as the int 8. The
+// coercion is per isolated scalar only: it can never read or create
+// structure (a value of "true\nother_key: x" for a bool field is an
+// error, not a new key), a placeholder that is part of a larger value
+// stays a string, and a QUOTED placeholder stays a string (an explicit
+// quote is a deliberate string). A substituted value that does not
+// parse for the field's type is a configuration error (fail closed).
+//
 // Unknown fields at any level are an error, and a second document is
 // refused: this config is a single document, and reading only the first
 // would hide a second half the operator believes is in effect.
@@ -147,7 +160,7 @@ func Parse(data []byte) (*Config, error) {
 	if err := dec.Decode(&second); err != io.EOF {
 		return nil, fmt.Errorf("multiple YAML documents: this configuration is a single document (the first document parsed, the rest ignored — refused rather than silently half-applied)")
 	}
-	if err := expandEnvValue(&root); err != nil {
+	if err := expandEnvValue(&root, ""); err != nil {
 		return nil, err
 	}
 	expanded, err := yaml.Marshal(&root)
@@ -163,6 +176,24 @@ func Parse(data []byte) (*Config, error) {
 	return &c, nil
 }
 
+// typedEnvFields names the config fields whose LONE-placeholder value
+// is parsed as the field's Go type after substitution (see Parse): a
+// placeholder that is the whole value of `parallel` decodes as the int
+// it replaces, one for `snapshot` as a bool, one for `tolerance` as a
+// float. Untyped fields (host, user, password, …) keep their value as
+// a string, byte for byte.
+var typedEnvFields = map[string]string{
+	"port": "int", "parallel": "int", "chunk_size": "int",
+	"drill_limit": "int", "max_allowed_packet": "int", "batch_size": "int",
+	"sample_limit": "int",
+	"tolerance":    "float",
+	"snapshot":     "bool", "drill": "bool", "no_trim": "bool",
+	"fold_case": "bool", "normalize_json": "bool", "allow_tz_swap": "bool",
+	"strict_types": "bool", "secure": "bool",
+	"allow_unenforced_readonly": "bool", "no_sync_schema": "bool",
+	"allow_structure_truncate": "bool", "allow_row_rewrite": "bool",
+}
+
 // expandEnvValue walks an already-parsed YAML tree and replaces ${NAME}
 // references in VALUE scalars only — never in mapping keys (a key is
 // structure: an environment value must be able to rename no field).
@@ -170,29 +201,33 @@ func Parse(data []byte) (*Config, error) {
 // quoted stays a string, and the re-encoding quotes substituted content
 // whenever the new content would otherwise be ambiguous (a value
 // containing a colon or a newline cannot become a new mapping).
-func expandEnvValue(n *yaml.Node) error {
+// parentKey carries the enclosing mapping's key into the value scalar,
+// so a lone placeholder can be parsed as the field's Go type (see
+// typedEnvFields); sequence items have no field key.
+func expandEnvValue(n *yaml.Node, parentKey string) error {
 	switch n.Kind {
 	case yaml.DocumentNode:
 		for _, item := range n.Content {
-			if err := expandEnvValue(item); err != nil {
+			if err := expandEnvValue(item, ""); err != nil {
 				return err
 			}
 		}
 	case yaml.MappingNode:
-		// pairs (key, value): the value sits at the ODD index
-		for i := 1; i < len(n.Content); i += 2 {
-			if err := expandEnvValue(n.Content[i]); err != nil {
+		// pairs (key, value): the value sits at the ODD index; the
+		// key is structure, never an expansion target
+		for i := 0; i+1 < len(n.Content); i += 2 {
+			if err := expandEnvValue(n.Content[i+1], n.Content[i].Value); err != nil {
 				return err
 			}
 		}
 	case yaml.SequenceNode:
 		for _, item := range n.Content {
-			if err := expandEnvValue(item); err != nil {
+			if err := expandEnvValue(item, ""); err != nil {
 				return err
 			}
 		}
 	case yaml.ScalarNode:
-		return expandEnvScalar(n)
+		return expandEnvScalar(n, parentKey)
 	}
 	return nil
 }
@@ -202,11 +237,23 @@ func expandEnvValue(n *yaml.Node) error {
 // naming the variable (fail closed). The substituted text is final —
 // it is not re-scanned, so a value containing a literal "${OTHER}" is
 // not expanded a second time.
-func expandEnvScalar(n *yaml.Node) error {
+//
+// When the WHOLE value is exactly one placeholder (no other text
+// around it) and the scalar is plain (not quoted — a quote is a
+// deliberate string) and the field is typed (typedEnvFields), the
+// substituted text is parsed as the field's Go type and the node's tag
+// is set to match: `parallel: ${P}` with P=8 becomes the int 8, not
+// the string "8" (which the strict decode would refuse). The parsing
+// is of the ISOLATED scalar only — it cannot see or create structure
+// (a multi-line value for a bool field simply fails to parse), and a
+// value that does not parse is a configuration error naming the
+// variable and the field.
+func expandEnvScalar(n *yaml.Node, key string) error {
 	matches := envRe.FindAllStringIndex(n.Value, -1)
 	if len(matches) == 0 {
 		return nil
 	}
+	original := n.Value
 	var b strings.Builder
 	last := 0
 	for _, m := range matches {
@@ -221,6 +268,28 @@ func expandEnvScalar(n *yaml.Node) error {
 	}
 	b.WriteString(n.Value[last:])
 	n.Value = b.String()
+
+	lone := len(matches) == 1 && matches[0][0] == 0 && matches[0][1] == len(original)
+	if typ, typed := typedEnvFields[key]; typed && lone && n.Style == 0 && (n.Tag == "" || n.Tag == "!!str") {
+		name := original[2 : len(original)-1]
+		switch typ {
+		case "int":
+			if _, err := strconv.ParseInt(n.Value, 10, 64); err != nil {
+				return fmt.Errorf("environment variable %s (value %q) is not a valid integer for field %q", name, n.Value, key)
+			}
+			n.Tag = "!!int"
+		case "float":
+			if _, err := strconv.ParseFloat(n.Value, 64); err != nil {
+				return fmt.Errorf("environment variable %s (value %q) is not a valid number for field %q", name, n.Value, key)
+			}
+			n.Tag = "!!float"
+		case "bool":
+			if _, err := strconv.ParseBool(n.Value); err != nil {
+				return fmt.Errorf("environment variable %s (value %q) is not a valid boolean for field %q", name, n.Value, key)
+			}
+			n.Tag = "!!bool"
+		}
+	}
 	return nil
 }
 

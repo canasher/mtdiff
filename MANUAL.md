@@ -94,6 +94,7 @@ options:
 
 命令行参数会覆盖 YAML 里的值；YAML 里可以用 `${环境变量名}` 引用环境变量。
 替换发生在**结构解析之后**（只对取值标量生效，映射的键名永不替换）：变量值里含引号、换行、冒号、`#` 等都会**原样字节级**落在同一个值里，不可能借一个变量值注入新的键或翻动安全开关（例如密码值里带 `options:\n  allow_structure_truncate: true` 不会被当成新的配置段）。引用了一个**未设置**的变量会直接报错（指名变量名），而不是静默替换成空串。
+当一个变量**构成某个类型化字段（int/bool/float）的整个取值**时，替换结果按该字段的类型解析：`parallel: ${P}`（`P=8`）得整数 8，`snapshot: ${S}`（`S=true`）得 true，`tolerance: ${T}`（`T=0.001`）得 0.001，`allow_structure_truncate: ${ALLOW}` 同理。类型化字段包括 `port`/`parallel`/`chunk_size`/`drill_limit`/`max_allowed_packet`/`batch_size`/`sample_limit`（int）、`tolerance`（float）、`snapshot`/`drill`/`no_trim`/`fold_case`/`normalize_json`/`allow_tz_swap`/`strict_types`/`secure`/`allow_unenforced_readonly`/`no_sync_schema`/`allow_structure_truncate`/`allow_row_rewrite`（bool）。替换结果解析不出目标类型会报配置错误（指名变量、值、字段，fail closed）；非类型化字段（host、user、password 等）与部分替换（值里只含一个占位符之外的文字）保持字符串；加了引号的占位符是显式字符串，不做类型转换。
 配置解析是**严格模式**：任何一级出现未知字段（如把 `exclude_tables` 误写成 `exclude_table`、`allow_structure_truncate` 少一个字母）会直接报错，而不是像旧版那样静默忽略、让该表悄悄进入同步/删除集合；一个配置文件必须是**单个文档**，第二个 `---` 文档会被拒绝（而不是只解析第一个）。
 
 **密码的优先级**：环境变量（`password_env`）> 写在文件/命令行里的密码 > 交互式询问。
@@ -271,7 +272,7 @@ mtdiff sync --src ... --dst ... --tables orders,users --apply --yes
 
 ## 敢不敢上生产
 
-- **只读，硬保证（diff / tables）**：每条连接用之前先强制只读会话（MySQL 本体没有会话级 read_only 时回退到只读事务），做不到就拒绝运行，绝不向被比的库发写语句。唯一例外是**无法强制只读的后端**（TiDB：`read_only` 只有 GLOBAL 级，只读事务是禁用的空操作）：默认同样拒绝；确要在这种后端上跑，用 `--allow-unenforced-readonly` 显式豁免，每条读连接会打告警，mtdiff 对它们只发 SELECT。
+- **只读，硬保证（diff / tables）**：每条连接（控制 + 扫描）**每次取出使用前**都强制只读会话（MySQL 本体没有会话级 read_only 时回退到只读事务），做不到就拒绝运行，绝不向被比的库发写语句。策略**逐次重放**：连接被 `KILL`、断网或服务端重启后被池替换、或会话被带外重置，新物理会话在交出前都会重新拿到完整策略（先策略后查询，不存在无防护会话被使用）；sync 的写连接同理，每条新物理写会话都会重放会话护栏（锁等待超时 / 执行超时 / `NO_ZERO_DATE` 等）。唯一例外是**无法强制只读的后端**（TiDB：`read_only` 只有 GLOBAL 级，只读事务是禁用的空操作）：默认同样拒绝；确要在这种后端上跑，用 `--allow-unenforced-readonly` 显式豁免，每条读连接会打告警，mtdiff 对它们只发 SELECT。
 - **sync 的写入是文档化例外**：默认零写入（dry-run）；只有 `--apply` 且确认后才会写，且**只写 dst**——src 和两侧所有扫描 / 控制连接在 sync 里也一律强制只读。写后自动复验，退出码以复验为准（详见"怎么同步数据"）。
 - **影响小**：不持锁；锁等待超时 5 秒、单条语句限时 5 分钟（尽力而为，兼容层不支持就跳过）。
 - **准不准**：块一致靠指纹，64 位指纹理论上有 2⁻⁶⁴ 的碰撞概率，不能接受就加 `--secure` 升到 128 位；指纹不一致的块会自动下钻到行，所以"有差异"永远带着具体证据，不是空口。
@@ -330,7 +331,7 @@ dst 的定位是 src 的**一次性副本**，同步方向固定单向 src → d
 ```sh
 make build      # 构建
 make test       # 单元测试
-make e2e        # 端到端：docker 起两个 MySQL 8.0 容器跑全部场景（295 项断言）
+make e2e        # 端到端：docker 起两个 MySQL 8.0 容器跑全部场景（301 项断言）
 make compat-57  # 跨后端兼容：双 MySQL 5.7（89 项断言）
 make compat-tidb # 跨后端兼容：MySQL 8.0 源 + 单节点 TiDB 目标（86 项断言，表状态按能力门控，TiDB 侧自动带 --allow-unenforced-readonly）
 ```

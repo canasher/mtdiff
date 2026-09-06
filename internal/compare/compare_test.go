@@ -395,3 +395,44 @@ func TestFoldDigests(t *testing.T) {
 		t.Errorf("unmatched digest sets must be DIFFERENT with nil lookup: %+v", res)
 	}
 }
+
+// The differing-chunk list must come out in CHUNK-ID ORDER no matter how
+// the digest maps happen to iterate: the sync plan derives its APPLY
+// ORDER from this list, and the cross-chunk unique-holder verdict is only
+// sound when chunks apply sequentially in KEY order. A random order would
+// apply the writer of a small-chunk unique value move before the chunk
+// that frees its slot, and the unique index rejects the write (the flake
+// behind TestUniqueHolderParallelOneDoesNotDeadlock). The digests live in
+// maps, whose iteration order is randomized per run — so the fold is
+// repeated many times against the same maps.
+func TestFoldDigestsDiffChunksSorted(t *testing.T) {
+	const n = 8
+	chunks := make([]chunk.Chunk, n)
+	src := make(map[int]mhash.ChunkDigest, n)
+	dst := make(map[int]mhash.ChunkDigest, n)
+	for i := 0; i < n; i++ {
+		chunks[i] = chunk.Chunk{ID: i}
+		src[i] = chunkDigest(true, i, 5)
+		dst[i] = chunkDigest(true, i, 6) // every chunk differs
+	}
+	for i := 0; i < 200; i++ {
+		res := TableResult{Name: "t", Status: "OK"}
+		foldDigests(&res, chunks, src, dst, 5*n, 6*n, true, false)
+		if res.Status != "DIFFERENT" || len(res.DiffChunks) != n {
+			t.Fatalf("iteration %d: want DIFFERENT with %d diffs, got %s / %d", i, n, res.Status, len(res.DiffChunks))
+		}
+		for j := 1; j < len(res.DiffChunks); j++ {
+			if res.DiffChunks[j-1].ID >= res.DiffChunks[j].ID {
+				t.Fatalf("iteration %d: the diff list must be in ascending chunk order, got %v", i, idsOf(res.DiffChunks))
+			}
+		}
+	}
+}
+
+func idsOf(ds []ChunkDiff) []int {
+	out := make([]int, len(ds))
+	for i, d := range ds {
+		out[i] = d.ID
+	}
+	return out
+}

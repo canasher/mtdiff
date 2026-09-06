@@ -239,12 +239,21 @@ func resolveTables(ctx context.Context, cfg *config.Config, src, dst *conn.Side)
 	if len(cfg.Opts.Tables) > 0 {
 		return cfg.Opts.Tables, nil
 	}
-	srcTables, err := conn.ListTables(ctx, src.Ctl())
-	if err != nil {
+	// one control session per side (policy-applied, dead-connection
+	// recovering), released before the next acquisition
+	var srcTables, dstTables []string
+	if err := src.WithControl(ctx, func(q conn.Queryer) error {
+		var err error
+		srcTables, err = conn.ListTables(ctx, q)
+		return err
+	}); err != nil {
 		return nil, failf(ExitRuntimeErr, "src: %v", err)
 	}
-	dstTables, err := conn.ListTables(ctx, dst.Ctl())
-	if err != nil {
+	if err := dst.WithControl(ctx, func(q conn.Queryer) error {
+		var err error
+		dstTables, err = conn.ListTables(ctx, q)
+		return err
+	}); err != nil {
 		return nil, failf(ExitRuntimeErr, "dst: %v", err)
 	}
 	excl := make(map[string]bool, len(cfg.Opts.ExcludeTables))

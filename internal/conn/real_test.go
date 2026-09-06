@@ -192,3 +192,250 @@ func TestRealScanReplacementReinitialized(t *testing.T) {
 		t.Fatalf("the replacement connection lacks the sql_mode guardrail: %q", mode)
 	}
 }
+
+// TestRealControlReplacementReinitialized is the control-side counterpart
+// of TestRealScanReplacementReinitialized (R6-1): the control pool's
+// physical connection is KILLed and the replacement — a fresh physical
+// session at the SERVER DEFAULTS — must come back policy-initialized
+// (read-only tier plus guardrails) before it may serve a metadata
+// query. The pre-R6-1 code applied the policy ONCE at OpenSide time;
+// a replaced control connection served metadata queries UNGUARDED.
+func TestRealControlReplacementReinitialized(t *testing.T) {
+	dsn := os.Getenv("MTDIFF_E2E_DSN_SRC")
+	if dsn == "" {
+		t.Skip("MTDIFF_E2E_DSN_SRC not set (run via e2e/run_e2e.sh)")
+	}
+	ctx := context.Background()
+	ep := e2eEndpoint(t, dsn)
+
+	raw, err := sql.Open("mysql", BuildDSN(ep, 0))
+	if err != nil {
+		t.Fatalf("open raw: %v", err)
+	}
+	if err := raw.Ping(); err != nil {
+		raw.Close()
+		t.Fatalf("ping raw: %v", err)
+	}
+	defer raw.Close()
+
+	side, err := OpenSide(ctx, "src", ep, 0, 1, false)
+	if err != nil {
+		t.Fatalf("open side: %v", err)
+	}
+	defer side.Close()
+
+	// first control checkout: the policy is in effect, and we learn the
+	// control connection's physical id
+	c1, err := side.AcquireControl(ctx)
+	if err != nil {
+		t.Fatalf("first control checkout: %v", err)
+	}
+	var ctlID int64
+	if err := c1.QueryRowContext(ctx, "SELECT CONNECTION_ID()").Scan(&ctlID); err != nil {
+		t.Fatalf("control connection id: %v", err)
+	}
+	var wait int
+	if err := c1.QueryRowContext(ctx, "SELECT @@SESSION.innodb_lock_wait_timeout").Scan(&wait); err != nil {
+		t.Fatalf("lock wait: %v", err)
+	}
+	if wait != 5 {
+		t.Fatalf("the first checkout must be policy-initialized, innodb_lock_wait_timeout=%d", wait)
+	}
+	c1.Close() // idle in the control pool
+
+	// KILL the control connection (from the unguarded raw connection)
+	if _, err := raw.ExecContext(ctx, "KILL "+strconv.FormatInt(ctlID, 10)); err != nil {
+		t.Fatalf("kill %d: %v", ctlID, err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var one int
+		err := raw.QueryRowContext(ctx, "SELECT 1 FROM information_schema.PROCESSLIST WHERE ID = ?", ctlID).Scan(&one)
+		if err != nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("killed control connection still visible in PROCESSLIST after 10s")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// the next control checkout may surface the dead connection (the
+	// policy's SETs fail; AcquireControl swaps in a fresh one and
+	// re-applies the policy) or may be replaced transparently by the
+	// driver. Either way the handed-out connection is a NEW physical
+	// session, policy-initialized.
+	var c2 *sql.Conn
+	for i := 0; ; i++ {
+		cn, err := side.AcquireControl(ctx)
+		if err == nil {
+			c2 = cn
+			break
+		}
+		if !DeadConn(err) || i >= 5 {
+			t.Fatalf("control checkout after the kill: %v", err)
+		}
+	}
+	defer c2.Close()
+	var newID int64
+	if err := c2.QueryRowContext(ctx, "SELECT CONNECTION_ID()").Scan(&newID); err != nil {
+		t.Fatalf("replacement connection id: %v", err)
+	}
+	if newID == ctlID {
+		t.Fatalf("the checkout returned the KILLED connection (id %d) as if it were fresh", newID)
+	}
+	// the fresh session starts at the SERVER DEFAULTS; only the
+	// per-checkout re-apply produces these values
+	if err := c2.QueryRowContext(ctx, "SELECT @@SESSION.innodb_lock_wait_timeout").Scan(&wait); err != nil {
+		t.Fatalf("replacement lock wait: %v", err)
+	}
+	if wait != 5 {
+		t.Fatalf("the REPLACEMENT control connection was not policy-initialized: innodb_lock_wait_timeout=%d (server default is 50)", wait)
+	}
+	var mode string
+	if err := c2.QueryRowContext(ctx, "SELECT @@SESSION.sql_mode").Scan(&mode); err != nil {
+		t.Fatalf("replacement sql_mode: %v", err)
+	}
+	if !strings.Contains(mode, "NO_ZERO_DATE") {
+		t.Fatalf("the replacement control connection lacks the sql_mode guardrail: %q", mode)
+	}
+	// read-only state, when the backend exposes it as a session
+	// variable (MySQL proper has no such variable; MariaDB does)
+	var ro int
+	if err := c2.QueryRowContext(ctx, "SELECT @@SESSION.transaction_read_only").Scan(&ro); err == nil {
+		if ro != 1 {
+			t.Fatalf("the replacement control connection is not read-only: transaction_read_only=%d", ro)
+		}
+	}
+	// and it actually works: a metadata query runs on the replacement
+	if _, err := TableExists(ctx, c2, "information_schema"); err != nil {
+		t.Fatalf("metadata query on the replacement control connection: %v", err)
+	}
+}
+
+// TestRealWriterReplacementReinitialized is the writer-side counterpart
+// (R6-3): the single write connection is KILLed and the replacement —
+// a fresh physical session at the SERVER DEFAULTS — must come back
+// guardrailed (Conn() re-applies the best-effort guardrails on every
+// checkout), and the re-connected writer must still be able to run a
+// normal destination transaction.
+func TestRealWriterReplacementReinitialized(t *testing.T) {
+	dsn := os.Getenv("MTDIFF_E2E_DSN_DST")
+	if dsn == "" {
+		t.Skip("MTDIFF_E2E_DSN_DST not set (run via e2e/run_e2e.sh)")
+	}
+	ctx := context.Background()
+	ep := e2eEndpoint(t, dsn)
+
+	raw, err := sql.Open("mysql", BuildWriterDSN(ep, 0))
+	if err != nil {
+		t.Fatalf("open raw: %v", err)
+	}
+	if err := raw.Ping(); err != nil {
+		raw.Close()
+		t.Fatalf("ping raw: %v", err)
+	}
+	defer raw.Close()
+
+	w, err := OpenWriter(ctx, "dst", ep, 0)
+	if err != nil {
+		t.Fatalf("open writer: %v", err)
+	}
+	defer w.Close()
+
+	c1, err := w.Conn(ctx)
+	if err != nil {
+		t.Fatalf("first checkout: %v", err)
+	}
+	var writerID int64
+	if err := c1.QueryRowContext(ctx, "SELECT CONNECTION_ID()").Scan(&writerID); err != nil {
+		t.Fatalf("writer connection id: %v", err)
+	}
+	var wait int
+	if err := c1.QueryRowContext(ctx, "SELECT @@SESSION.innodb_lock_wait_timeout").Scan(&wait); err != nil {
+		t.Fatalf("lock wait: %v", err)
+	}
+	if wait != 5 {
+		t.Fatalf("the first checkout must be guardrailed, innodb_lock_wait_timeout=%d", wait)
+	}
+	c1.Close() // idle in the writer pool
+
+	if _, err := raw.ExecContext(ctx, "KILL "+strconv.FormatInt(writerID, 10)); err != nil {
+		t.Fatalf("kill %d: %v", writerID, err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var one int
+		err := raw.QueryRowContext(ctx, "SELECT 1 FROM information_schema.PROCESSLIST WHERE ID = ?", writerID).Scan(&one)
+		if err != nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("killed writer connection still visible in PROCESSLIST after 10s")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// the first checkout after the kill may hand out the dead
+	// connection (the best-effort guardrails cannot detect a dead
+	// socket before the first use); the caller re-acquires, exactly
+	// like the apply path does
+	var c2 *sql.Conn
+	for i := 0; ; i++ {
+		cn, err := w.Conn(ctx)
+		if err == nil {
+			var one int
+			if err := cn.QueryRowContext(ctx, "SELECT 1").Scan(&one); err == nil {
+				c2 = cn
+				break
+			}
+			if !DeadConn(err) || i >= 5 {
+				t.Fatalf("checkout after the kill: %v", err)
+			}
+			cn.Close()
+			continue
+		}
+		if !DeadConn(err) || i >= 5 {
+			t.Fatalf("checkout after the kill: %v", err)
+		}
+	}
+	defer c2.Close()
+	var newID int64
+	if err := c2.QueryRowContext(ctx, "SELECT CONNECTION_ID()").Scan(&newID); err != nil {
+		t.Fatalf("replacement connection id: %v", err)
+	}
+	if newID == writerID {
+		t.Fatalf("the checkout returned the KILLED connection (id %d) as if it were fresh", newID)
+	}
+	if err := c2.QueryRowContext(ctx, "SELECT @@SESSION.innodb_lock_wait_timeout").Scan(&wait); err != nil {
+		t.Fatalf("replacement lock wait: %v", err)
+	}
+	if wait != 5 {
+		t.Fatalf("the REPLACEMENT writer connection was not guardrailed: innodb_lock_wait_timeout=%d (server default is 50)", wait)
+	}
+	var mode string
+	if err := c2.QueryRowContext(ctx, "SELECT @@SESSION.sql_mode").Scan(&mode); err != nil {
+		t.Fatalf("replacement sql_mode: %v", err)
+	}
+	if !strings.Contains(mode, "NO_ZERO_DATE") {
+		t.Fatalf("the replacement writer connection lacks the sql_mode guardrail: %q", mode)
+	}
+	// the re-connected writer must still work end to end: a normal
+	// destination transaction
+	if _, err := c2.ExecContext(ctx, "CREATE TABLE t_wkill (id INT PRIMARY KEY, v VARCHAR(8) NOT NULL)"); err != nil {
+		t.Fatalf("writer DDL after the replacement: %v", err)
+	}
+	defer func() {
+		c2.ExecContext(ctx, "DROP TABLE IF EXISTS t_wkill")
+	}()
+	if _, err := c2.ExecContext(ctx, "INSERT INTO t_wkill VALUES (1, 'x')"); err != nil {
+		t.Fatalf("writer INSERT after the replacement: %v", err)
+	}
+	var n int
+	if err := c2.QueryRowContext(ctx, "SELECT COUNT(*) FROM t_wkill").Scan(&n); err != nil {
+		t.Fatalf("writer SELECT after the replacement: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("writer transaction after the replacement saw %d rows, want 1", n)
+	}
+}

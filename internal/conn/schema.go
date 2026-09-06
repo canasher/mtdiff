@@ -202,7 +202,7 @@ func parseTimeScale(spec string) int {
 }
 
 // IntrospectTable reads column metadata and the usable key of a table.
-func IntrospectTable(ctx context.Context, db *sql.DB, table string) (*Schema, error) {
+func IntrospectTable(ctx context.Context, db Queryer, table string) (*Schema, error) {
 	rows, err := db.QueryContext(ctx, `
 		SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLLATION_NAME, EXTRA
 		FROM information_schema.COLUMNS
@@ -267,7 +267,7 @@ func generatedColumn(extra string) (generated bool, storage string) {
 // columns on the other side. Uses the MySQL 8.0 information_schema column
 // names (COLUMN_DEFAULT, EXTRA); 5.7 naming differs and is not supported
 // here.
-func IntrospectStructure(ctx context.Context, db *sql.DB, table string) (*Struct, error) {
+func IntrospectStructure(ctx context.Context, db Queryer, table string) (*Struct, error) {
 	rows, err := db.QueryContext(ctx, `
 		SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLLATION_NAME,
 		       CHARACTER_SET_NAME, COLUMN_DEFAULT, EXTRA, COLUMN_COMMENT
@@ -330,7 +330,7 @@ func IntrospectStructure(ctx context.Context, db *sql.DB, table string) (*Struct
 // column of the table (column name -> expression). A backend without the
 // information_schema column errors (the caller degrades to EXTRA-only
 // detection); an empty result (no generated columns) is not an error.
-func generatedExpressions(ctx context.Context, db *sql.DB, table string) (map[string]string, error) {
+func generatedExpressions(ctx context.Context, db Queryer, table string) (map[string]string, error) {
 	rows, err := db.QueryContext(ctx, `
 		SELECT COLUMN_NAME, GENERATION_EXPRESSION
 		FROM information_schema.COLUMNS
@@ -355,7 +355,7 @@ func generatedExpressions(ctx context.Context, db *sql.DB, table string) (map[st
 // table, each with its columns in index order. Functional index parts (no
 // physical column) are skipped, and non-unique indexes are dropped: the
 // structure sync only needs the keys that address or constrain rows.
-func structureIndexes(ctx context.Context, db *sql.DB, table string) ([]Index, error) {
+func structureIndexes(ctx context.Context, db Queryer, table string) ([]Index, error) {
 	rows, err := db.QueryContext(ctx, `
 		SELECT INDEX_NAME, NON_UNIQUE, SEQ_IN_INDEX, COLUMN_NAME
 		FROM information_schema.STATISTICS
@@ -410,7 +410,7 @@ func structureIndexes(ctx context.Context, db *sql.DB, table string) ([]Index, e
 // Uses information_schema.STATISTICS rather than SHOW INDEX: the latter's
 // column count varies across MySQL versions (15 columns on 8.0.46), and
 // database/sql requires the Scan destinations to match exactly.
-func SelectKey(ctx context.Context, db *sql.DB, table string) ([]string, string, error) {
+func SelectKey(ctx context.Context, db Queryer, table string) ([]string, string, error) {
 	nullable, err := nullableColumns(ctx, db, table)
 	if err != nil {
 		return nil, "", err
@@ -487,7 +487,7 @@ func SelectKey(ctx context.Context, db *sql.DB, table string) ([]string, string,
 // The result drives the sync's KeyIsUnique (UPDATE vs group-replacement)
 // and the --where safety rejection (a filtered row-level sync must be able
 // to address exactly one row per key value on BOTH sides).
-func ExplicitKeyIsUnique(ctx context.Context, db *sql.DB, table string, key []string) (bool, error) {
+func ExplicitKeyIsUnique(ctx context.Context, db Queryer, table string, key []string) (bool, error) {
 	pk, uniques, err := uniqueKeySequences(ctx, db, table)
 	if err != nil {
 		return false, err
@@ -503,7 +503,7 @@ func ExplicitKeyIsUnique(ctx context.Context, db *sql.DB, table string, key []st
 // its unique indexes (each a column sequence in index order), derived from
 // UniqueConstraints (information_schema.STATISTICS, same source as
 // SelectKey).
-func uniqueKeySequences(ctx context.Context, db *sql.DB, table string) (pk []string, uniques [][]string, err error) {
+func uniqueKeySequences(ctx context.Context, db Queryer, table string) (pk []string, uniques [][]string, err error) {
 	cons, err := UniqueConstraints(ctx, db, table)
 	if err != nil {
 		return nil, nil, err
@@ -522,7 +522,7 @@ func uniqueKeySequences(ctx context.Context, db *sql.DB, table string) (pk []str
 // information_schema.STATISTICS: the primary key (Name "PRIMARY") first,
 // then every unique index with its columns in index order. Functional
 // index parts (no physical column) are skipped.
-func UniqueConstraints(ctx context.Context, db *sql.DB, table string) ([]UniqueConstraint, error) {
+func UniqueConstraints(ctx context.Context, db Queryer, table string) ([]UniqueConstraint, error) {
 	rows, err := db.QueryContext(ctx, `
 		SELECT INDEX_NAME, NON_UNIQUE, SEQ_IN_INDEX, COLUMN_NAME
 		FROM information_schema.STATISTICS
@@ -645,7 +645,7 @@ func keySequenceUnique(pk []string, uniques [][]string, nullable map[string]bool
 
 // nullableColumns returns the set of columns of the table that accept NULL
 // (information_schema.COLUMNS.IS_NULLABLE = 'YES').
-func nullableColumns(ctx context.Context, db *sql.DB, table string) (map[string]bool, error) {
+func nullableColumns(ctx context.Context, db Queryer, table string) (map[string]bool, error) {
 	rows, err := db.QueryContext(ctx, `
 		SELECT COLUMN_NAME, IS_NULLABLE
 		FROM information_schema.COLUMNS
@@ -680,13 +680,13 @@ func nullableColumns(ctx context.Context, db *sql.DB, table string) (map[string]
 // from "left to the backend's default": backends disagree on what that
 // default is (MySQL 8.0: utf8mb4_0900_ai_ci, TiDB: utf8mb4_bin), so two
 // sides that both left it to the default are not in drift.
-func DefaultCollation(ctx context.Context, db *sql.DB) (string, error) {
+func DefaultCollation(ctx context.Context, db Queryer) (string, error) {
 	var c string
-	err := db.QueryRowContext(ctx,
+	err := OneRow(ctx, db,
 		"SELECT COALESCE(s.DEFAULT_COLLATION_NAME, @@collation_server) "+
-			"FROM information_schema.SCHEMATA s WHERE s.SCHEMA_NAME = DATABASE()").Scan(&c)
+			"FROM information_schema.SCHEMATA s WHERE s.SCHEMA_NAME = DATABASE()", []any{&c})
 	if err == sql.ErrNoRows {
-		err = db.QueryRowContext(ctx, "SELECT @@collation_server").Scan(&c)
+		err = OneRow(ctx, db, "SELECT @@collation_server", []any{&c})
 	}
 	if err != nil {
 		return "", err
@@ -695,7 +695,7 @@ func DefaultCollation(ctx context.Context, db *sql.DB) (string, error) {
 }
 
 // ListTables returns the table names of the current database.
-func ListTables(ctx context.Context, db *sql.DB) ([]string, error) {
+func ListTables(ctx context.Context, db Queryer) ([]string, error) {
 	rows, err := db.QueryContext(ctx, "SHOW TABLES")
 	if err != nil {
 		return nil, err
@@ -715,7 +715,7 @@ func ListTables(ctx context.Context, db *sql.DB) ([]string, error) {
 // ListBaseTables returns the BASE TABLE names of the current database (views
 // and other object types are excluded: the sync reconciles regular tables
 // only). Sorted for deterministic ordering.
-func ListBaseTables(ctx context.Context, db *sql.DB) ([]string, error) {
+func ListBaseTables(ctx context.Context, db Queryer) ([]string, error) {
 	rows, err := db.QueryContext(ctx, `
 		SELECT TABLE_NAME FROM information_schema.TABLES
 		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_TYPE = 'BASE TABLE'
@@ -736,11 +736,11 @@ func ListBaseTables(ctx context.Context, db *sql.DB) ([]string, error) {
 }
 
 // TableExists reports whether the table exists in the current database.
-func TableExists(ctx context.Context, db *sql.DB, table string) (bool, error) {
+func TableExists(ctx context.Context, db Queryer, table string) (bool, error) {
 	var n int
-	err := db.QueryRowContext(ctx, `
+	err := OneRow(ctx, db, `
 		SELECT COUNT(*) FROM information_schema.TABLES
-		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?`, table).Scan(&n)
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?`, []any{&n}, table)
 	if err != nil {
 		return false, err
 	}
@@ -752,11 +752,11 @@ func TableExists(ctx context.Context, db *sql.DB, table string) (bool, error) {
 // NULL (the table has no auto-increment column); err when the query
 // itself is not supported (the caller degrades to skipping the table-
 // state reconciliation; see the sync package).
-func informationSchemaAutoInc(ctx context.Context, db *sql.DB, table string) (value int64, present bool, err error) {
+func informationSchemaAutoInc(ctx context.Context, db Queryer, table string) (value int64, present bool, err error) {
 	var v sql.NullInt64
-	if err := db.QueryRowContext(ctx, `
+	if err := OneRow(ctx, db, `
 		SELECT AUTO_INCREMENT FROM information_schema.TABLES
-		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?`, table).Scan(&v); err != nil {
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?`, []any{&v}, table); err != nil {
 		if err == sql.ErrNoRows {
 			return 0, false, nil
 		}
@@ -789,7 +789,7 @@ var showCreateAutoIncValueRe = regexp.MustCompile(`AUTO_INCREMENT=(\d+)`)
 // pre-allocates ID ranges (TiDB's batch allocator) reports an estimate,
 // and an explicit counter below the allocated range's end is silently
 // ignored there.
-func TableAutoIncrementFacts(ctx context.Context, db *sql.DB, table string) (value, maxPlusOne int64, present bool, err error) {
+func TableAutoIncrementFacts(ctx context.Context, db Queryer, table string) (value, maxPlusOne int64, present bool, err error) {
 	est, present, err := informationSchemaAutoInc(ctx, db, table)
 	if err != nil || !present {
 		return 0, 0, present, err
@@ -797,8 +797,8 @@ func TableAutoIncrementFacts(ctx context.Context, db *sql.DB, table string) (val
 	col, explicit, hasExplicit, ok := showCreateAutoInc(ctx, db, table)
 	if ok && col != "" {
 		var m sql.NullInt64
-		if err := db.QueryRowContext(ctx,
-			"SELECT MAX("+QuoteIdent(col)+") FROM "+QuoteIdent(table)).Scan(&m); err == nil {
+		if err := OneRow(ctx, db,
+			"SELECT MAX("+QuoteIdent(col)+") FROM "+QuoteIdent(table), []any{&m}); err == nil {
 			next := int64(1)
 			if m.Valid {
 				next = m.Int64 + 1
@@ -820,7 +820,7 @@ func TableAutoIncrementFacts(ctx context.Context, db *sql.DB, table string) (val
 
 // TableAutoIncrement is the value half of TableAutoIncrementFacts (kept
 // for callers that do not care about the exactness inputs).
-func TableAutoIncrement(ctx context.Context, db *sql.DB, table string) (value int64, present bool, err error) {
+func TableAutoIncrement(ctx context.Context, db Queryer, table string) (value int64, present bool, err error) {
 	v, _, present, err := TableAutoIncrementFacts(ctx, db, table)
 	return v, present, err
 }
@@ -836,9 +836,9 @@ var showCreateAutoIncColRe = regexp.MustCompile("`([^`]*)`[^`\n]*?\\bAUTO_INCREM
 // TABLE: the auto-increment column name (from the column definition)
 // and the explicit counter (the table-level AUTO_INCREMENT= clause).
 // ok is false when the query fails or the output is unparseable.
-func showCreateAutoInc(ctx context.Context, db *sql.DB, table string) (col string, explicit int64, hasExplicit, ok bool) {
+func showCreateAutoInc(ctx context.Context, db Queryer, table string) (col string, explicit int64, hasExplicit, ok bool) {
 	var name, create string
-	if err := db.QueryRowContext(ctx, "SHOW CREATE TABLE "+QuoteIdent(table)).Scan(&name, &create); err != nil {
+	if err := OneRow(ctx, db, "SHOW CREATE TABLE "+QuoteIdent(table), []any{&name, &create}); err != nil {
 		return "", 0, false, false
 	}
 	col, explicit, hasExplicit = parseShowCreateAutoInc(create)
@@ -891,11 +891,11 @@ func firstIdent(line string) string {
 
 // TableEngine returns the table's storage engine from information_schema
 // (empty when the backend reports none).
-func TableEngine(ctx context.Context, db *sql.DB, table string) (string, error) {
+func TableEngine(ctx context.Context, db Queryer, table string) (string, error) {
 	var e string
-	err := db.QueryRowContext(ctx, `
+	err := OneRow(ctx, db, `
 		SELECT ENGINE FROM information_schema.TABLES
-		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?`, table).Scan(&e)
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?`, []any{&e}, table)
 	if err == sql.ErrNoRows {
 		return "", nil
 	}

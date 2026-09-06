@@ -22,6 +22,8 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/go-sql-driver/mysql"
+
 	"mtdiff/internal/config"
 )
 
@@ -183,13 +185,16 @@ func (r *fakeRows) Next(dest []driver.Value) error {
 	return nil
 }
 
-// useFakeDB routes OpenSide's pools through the fake server.
+// useFakeDB routes the pool constructors through the fake server.
 func useFakeDB(t *testing.T, srv *fakeServer) {
 	t.Helper()
-	old := openDB
-	openDB = func(name, dsn string) (*sql.DB, error) { return sql.Open("fake-mtdiff", dsn) }
+	old := openPool
+	openPool = func(cfg *mysql.Config) (*sql.DB, error) {
+		// the fake driver ignores its DSN (activeFake selects the server)
+		return sql.Open("fake-mtdiff", "")
+	}
 	activeFake = srv
-	t.Cleanup(func() { openDB = old; activeFake = nil })
+	t.Cleanup(func() { openPool = old; activeFake = nil })
 }
 
 func fakeEndpoint() config.Endpoint {

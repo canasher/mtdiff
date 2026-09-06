@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync/atomic"
 
@@ -191,9 +192,20 @@ func (c *Comparer) compareTable(ctx context.Context, src, dst *conn.Side, name s
 			p.KeyCols = nil
 			p.KeyFamilies = nil
 		}
-		var planQ chunk.Querier = src.Ctl()
+		// the plan's extremes run on a policy-applied control session
+		// (dead-connection recovery included); snapshot mode keeps the
+		// snapshot connection — a dead snapshot transaction is a hard
+		// failure, not a re-plan
+		var planQ chunk.Querier
 		if srcSnap != nil {
 			planQ = srcSnap // the extremes must come from the snapshot read
+		} else {
+			q, err := src.Control(ctx)
+			if err != nil {
+				return fail("control: %v", err)
+			}
+			defer q.Close()
+			planQ = q
 		}
 		chunks, err = p.Plan(ctx, planQ, srcTotal)
 		if err != nil {
@@ -385,7 +397,12 @@ func pickScanError(srcErr, dstErr error) error {
 }
 
 func (c *Comparer) count(ctx context.Context, side *conn.Side, table string) (int64, error) {
-	return c.countQ(ctx, side.Ctl(), side.Name, table)
+	q, err := side.Control(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer q.Close()
+	return c.countQ(ctx, q, side.Name, table)
 }
 
 // countQ is the COUNT on an arbitrary read seam (snapshot mode runs it on
@@ -396,7 +413,18 @@ func (c *Comparer) countQ(ctx context.Context, q chunk.Querier, sideName, table 
 		qry += " WHERE (" + c.opts.Where + ")"
 	}
 	var n int64
-	if err := q.QueryRowContext(ctx, qry).Scan(&n); err != nil {
+	rows, err := q.QueryContext(ctx, qry)
+	if err != nil {
+		return 0, fmt.Errorf("%s %s: %w", sideName, table, err)
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return 0, fmt.Errorf("%s %s: %w", sideName, table, err)
+		}
+		return 0, fmt.Errorf("%s %s: %w", sideName, table, sql.ErrNoRows)
+	}
+	if err := rows.Scan(&n); err != nil {
 		return 0, fmt.Errorf("%s %s: %w", sideName, table, err)
 	}
 	return n, nil
@@ -513,6 +541,14 @@ func digestList(m map[int]mhash.ChunkDigest) []mhash.ChunkDigest {
 // so the count-mismatch branch is unit-testable without a database. It
 // returns the chunk lookup table used by drill-down (nil when the digest
 // sets do not line up, in which case there are no chunks to drill).
+//
+// The differing-chunk list is emitted in CHUNK-ID ORDER (the digests live
+// in a map, whose iteration order is random): the sync plan derives its
+// APPLY ORDER from this list, and the cross-chunk unique-holder verdict
+// is only sound when chunks apply sequentially in key order (a safe
+// cross-chunk value move relies on the earlier chunk freeing the slot
+// first). A random order would apply the writer before the releaser and
+// the unique index would reject it.
 func foldDigests(res *TableResult, chunks []chunk.Chunk, srcDigests, dstDigests map[int]mhash.ChunkDigest, srcTotal, dstTotal int64, ordered, secure bool) map[int]chunk.Chunk {
 	res.SrcFP = mhash.Hex(mhash.TableFingerprint(digestList(srcDigests), ordered, secure))
 	res.DstFP = mhash.Hex(mhash.TableFingerprint(digestList(dstDigests), ordered, secure))
@@ -524,11 +560,18 @@ func foldDigests(res *TableResult, chunks []chunk.Chunk, srcDigests, dstDigests 
 	for _, ch := range chunks {
 		byID[ch.ID] = ch
 	}
+	diffIDs := make([]int, 0, len(srcDigests))
 	for id, sd := range srcDigests {
 		dd, ok := dstDigests[id]
 		if ok && digestsEqual(sd, dd) {
 			continue
 		}
+		diffIDs = append(diffIDs, id)
+	}
+	sort.Ints(diffIDs)
+	for _, id := range diffIDs {
+		sd := srcDigests[id]
+		dd, ok := dstDigests[id]
 		ch := byID[id]
 		d := ChunkDiff{ID: id, Lo: ch.RenderBound(true), Hi: ch.RenderBound(false), Src: mhash.HexDigest(sd)}
 		if ok {

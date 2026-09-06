@@ -15,6 +15,7 @@ package sync
 
 import (
 	"fmt"
+	"sort"
 
 	"mtdiff/internal/compare"
 )
@@ -129,6 +130,15 @@ func DecidePlan(res compare.TableResult, srcKeyed, dstKeyed, srcUnique, dstUniqu
 		for _, cd := range res.DiffChunks {
 			p.Chunks = append(p.Chunks, cd.ID)
 		}
+		// The plan's chunk order IS the apply order (the executor runs
+		// the groups in slice order). The cross-chunk unique-holder
+		// verdict is only sound when chunks apply sequentially in KEY
+		// ORDER — a safe value move relies on the earlier chunk freeing
+		// the unique slot before the later chunk's write lands. Pin the
+		// order here regardless of how the chunk list was assembled
+		// (the pre-pass already emits it sorted; this is the safety
+		// backstop).
+		sort.Ints(p.Chunks)
 	}
 	return p
 }

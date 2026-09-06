@@ -35,12 +35,19 @@ var tablesCmd = &cobra.Command{
 		}
 		defer dst.Close()
 
-		srcTables, err := conn.ListTables(ctx, src.Ctl())
-		if err != nil {
+		var srcTables, dstTables []string
+		if err := src.WithControl(ctx, func(q conn.Queryer) error {
+			var err error
+			srcTables, err = conn.ListTables(ctx, q)
+			return err
+		}); err != nil {
 			return failf(ExitRuntimeErr, "src: %v", err)
 		}
-		dstTables, err := conn.ListTables(ctx, dst.Ctl())
-		if err != nil {
+		if err := dst.WithControl(ctx, func(q conn.Queryer) error {
+			var err error
+			dstTables, err = conn.ListTables(ctx, q)
+			return err
+		}); err != nil {
 			return failf(ExitRuntimeErr, "dst: %v", err)
 		}
 		sort.Strings(srcTables)

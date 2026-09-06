@@ -319,12 +319,19 @@ func resolveSyncTables(ctx context.Context, cfg *config.Config, src, dst *conn.S
 	if len(cfg.Opts.Tables) > 0 {
 		return cfg.Opts.Tables, nil, nil
 	}
-	srcTables, err := conn.ListBaseTables(ctx, src.Ctl())
-	if err != nil {
+	var srcTables, dstTables []string
+	if err := src.WithControl(ctx, func(q conn.Queryer) error {
+		var err error
+		srcTables, err = conn.ListBaseTables(ctx, q)
+		return err
+	}); err != nil {
 		return nil, nil, failf(ExitRuntimeErr, "src: %v", err)
 	}
-	dstTables, err := conn.ListBaseTables(ctx, dst.Ctl())
-	if err != nil {
+	if err := dst.WithControl(ctx, func(q conn.Queryer) error {
+		var err error
+		dstTables, err = conn.ListBaseTables(ctx, q)
+		return err
+	}); err != nil {
 		return nil, nil, failf(ExitRuntimeErr, "dst: %v", err)
 	}
 	tables, extra = syncTableSets(srcTables, dstTables, cfg.Opts.ExcludeTables, cfg.Opts.Where == "")

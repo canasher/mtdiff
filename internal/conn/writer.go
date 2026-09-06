@@ -31,8 +31,7 @@ type Writer struct {
 // wait timeout, statement timeout, zero-date sql_mode flags) but no
 // read-only enforcement.
 func OpenWriter(ctx context.Context, name string, ep config.Endpoint, maxAllowedPacket int) (*Writer, error) {
-	dsn := BuildWriterDSN(ep, maxAllowedPacket)
-	db, err := sql.Open("mysql", dsn)
+	db, err := openPool(poolConfig(ep, maxAllowedPacket, 600))
 	if err != nil {
 		return nil, err
 	}
@@ -66,11 +65,22 @@ func OpenWriter(ctx context.Context, name string, ep config.Endpoint, maxAllowed
 
 // Conn returns the dedicated write connection. The caller must Close it
 // when done (it returns to the pool).
+//
+// The guardrails are re-applied on EVERY checkout, not just at
+// OpenWriter time: if the physical connection dies (network failure, a
+// KILL, a server restart) database/sql replaces it with a fresh session
+// that starts at the SERVER DEFAULTS (lock wait 50, no zero-date
+// sql_mode flags) — only the per-checkout re-apply puts the guardrails
+// back. applyGuardrails is best-effort by design (the writer is allowed
+// to write; the guardrails cap damage, they are not a correctness
+// gate), so a guardrail that cannot be applied is reported, not an
+// error: the checkout still succeeds.
 func (w *Writer) Conn(ctx context.Context) (*sql.Conn, error) {
 	c, err := w.db.Conn(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("%s: acquire write connection: %w", w.Name, err)
 	}
+	applyGuardrails(ctx, c)
 	return c, nil
 }
 

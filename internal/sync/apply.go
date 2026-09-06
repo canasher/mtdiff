@@ -79,9 +79,11 @@ func (a *Applier) resync(ctx context.Context, st *Stats, b *Builder, schema *con
 			KeyFamilies: keyFams,
 			ChunkSize:   a.Batch,
 		}
-		var err error
-		chunks, err = p.Plan(ctx, a.Src.Ctl(), srcTotal)
-		if err != nil {
+		if err := a.Src.WithControl(ctx, func(q conn.Queryer) error {
+			var err error
+			chunks, err = p.Plan(ctx, q, srcTotal)
+			return err
+		}); err != nil {
 			st.Error = fmt.Sprintf("plan: %v", err)
 			return
 		}

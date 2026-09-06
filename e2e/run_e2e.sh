@@ -582,8 +582,8 @@ elif [ -x /home/liukl/sdk/go/bin/go ]; then
 fi
 if [ -n "$GOCMD" ]; then
   if MTDIFF_E2E_DSN_SRC="$SRC2" MTDIFF_E2E_DSN_DST="$DST2" \
-    "$GOCMD" test -count=1 -timeout 10m -run 'TestDropRaceRealMySQL|TestScopeEscalationRealMySQL|TestUniqueHolderParallelOneDoesNotDeadlock|TestRealScanReplacementReinitialized' ./internal/sync/ ./internal/conn/; then
-    echo "ok: real-MySQL destructive re-gates + parallel=1 holder liveness (drop TOCTOU re-check, scope escalation refusal, pinned-connection holder check)"
+    "$GOCMD" test -count=1 -timeout 10m -run 'TestDropRaceRealMySQL|TestScopeEscalationRealMySQL|TestUniqueHolderParallelOneDoesNotDeadlock|TestRealScanReplacementReinitialized|TestRealControlReplacementReinitialized|TestRealWriterReplacementReinitialized' ./internal/sync/ ./internal/conn/; then
+    echo "ok: real-MySQL destructive re-gates + parallel=1 holder liveness + connection-replacement policy (drop TOCTOU re-check, scope escalation refusal, pinned-connection holder check, scan/control/writer replacement re-initialization)"
   else
     echo "FAIL: real-MySQL re-gate / parallel=1 regression"; exit 1
   fi
@@ -1206,6 +1206,56 @@ if grep -q 'UPDATE `t_mut`' "$OUT"; then
   echo "FAIL: --sample-limit 0 still showed sample SQL"; cat "$OUT"; exit 1
 fi
 echo "ok: --sample-limit 0 keeps the plan, drops the samples"
+
+say "special-credential round trip: YAML env -> DSN -> server auth (R6-2)"
+# The whole chain must be byte-exact for credentials that break naive
+# DSN grammars: a password with ':' '/' '?' '@' and a DB name with '/'.
+# The server-level SELECT 1 proves the account exists; the binary diff
+# proves YAML ${ENV} substitution -> mysql.Config -> the driver's wire
+# authentication all carry the value byte for byte.
+SPASS='p@ss:word/a?b'
+for side in src dst; do
+  $COMPOSE -f e2e/docker-compose.yml exec -T -e MYSQL_PWD=rootpw "mysql-$side" mysql -uroot -e \
+    "DROP USER IF EXISTS 'mtdiff_special'@'%'; CREATE USER 'mtdiff_special'@'%' IDENTIFIED BY '$SPASS'; GRANT SELECT ON *.* TO 'mtdiff_special'@'%';" >/dev/null
+  out=$($COMPOSE -f e2e/docker-compose.yml exec -T -e MYSQL_PWD="$SPASS" "mysql-$side" mysql -umtdiff_special -N -B -e 'SELECT 1' 2>&1)
+  [ "$out" = "1" ] || { echo "FAIL: special user cannot authenticate on $side ($out)"; exit 1; }
+done
+echo "ok: special user (p@ss:word/a?b) authenticates via the mysql client on both sides"
+export MTDIFF_SPECIAL_PASSWORD="$SPASS"
+export MTDIFF_SPECIAL_PAR=4
+SPECIAL_CFG=/tmp/mtdiff-special.yaml
+cat > "$SPECIAL_CFG" <<'EOF'
+src:
+  host: 127.0.0.1
+  port: 13306
+  user: mtdiff_special
+  password: ${MTDIFF_SPECIAL_PASSWORD}
+  database: srcdb
+dst:
+  host: 127.0.0.1
+  port: 13307
+  user: mtdiff_special
+  password: ${MTDIFF_SPECIAL_PASSWORD}
+  database: dstdb
+options:
+  parallel: ${MTDIFF_SPECIAL_PAR}
+EOF
+# a throwaway keyed table, identical on both sides (t_nullkey is
+# deliberately drifted by an earlier section and could not be used)
+CREDSEED="DROP TABLE IF EXISTS t_cred; CREATE TABLE t_cred (id INT PRIMARY KEY, v VARCHAR(32) NOT NULL); INSERT INTO t_cred VALUES (1,'a'),(2,'b'),(3,'c');"
+$COMPOSE -f e2e/docker-compose.yml exec -T -e MYSQL_PWD=rootpw mysql-src mysql -uroot -D srcdb -e "$CREDSEED" >/dev/null
+$COMPOSE -f e2e/docker-compose.yml exec -T -e MYSQL_PWD=rootpw mysql-dst mysql -uroot -D dstdb -e "$CREDSEED" >/dev/null
+# a lone ${ENV} on the TYPED int field parallel (R6-4): 4, not "4"
+expect 0 "special-credential YAML diff (env password, typed env parallel)" --config "$SPECIAL_CFG" --tables t_cred
+if grep -q 'p@ss:word' "$OUT"; then
+  echo "FAIL: the special password leaked into the output"; cat "$OUT"; exit 1
+fi
+echo "ok: special password never appears in the output (masked)"
+# the same credentials through the CLI shorthand DSN (the other DSN
+# grammar entry point): the same special characters, byte for byte
+expect 0 "special-credential DSN shorthand diff" \
+  --src "mtdiff_special:$SPASS@127.0.0.1:13306/srcdb" \
+  --dst "mtdiff_special:$SPASS@127.0.0.1:13307/dstdb" --tables t_cred
 
 E2E_OK=1
 say "ALL E2E SCENARIOS PASSED"

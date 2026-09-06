@@ -268,8 +268,18 @@ func NewRunner(src, dst *conn.Side, o Options) *Runner {
 // difference is always reported), never to a failed run.
 func (r *Runner) sideDefaultCollations(ctx context.Context) (src, dst string) {
 	r.sdOnce.Do(func() {
-		r.sdSrc, _ = conn.DefaultCollation(ctx, r.Src.Ctl())
-		r.sdDst, _ = conn.DefaultCollation(ctx, r.Dst.Ctl())
+		// best-effort: a backend that refuses the query degrades to the
+		// strict comparison, never to a failed run
+		_ = r.Src.WithControl(ctx, func(q conn.Queryer) error {
+			var err error
+			r.sdSrc, err = conn.DefaultCollation(ctx, q)
+			return err
+		})
+		_ = r.Dst.WithControl(ctx, func(q conn.Queryer) error {
+			var err error
+			r.sdDst, err = conn.DefaultCollation(ctx, q)
+			return err
+		})
 		if r.sdSrc == "" || r.sdDst == "" {
 			fmt.Fprintf(os.Stderr, "warn: could not resolve the database default collation (src=%q dst=%q); collation differences are treated as drift\n", r.sdSrc, r.sdDst)
 		}
@@ -316,14 +326,30 @@ func (r *Runner) stateExactness(ctx context.Context, side *conn.Side) (exact, kn
 	}
 	// TiDB exposes allocator variables; a plain MySQL server does not
 	// (an unknown system variable is an error, not a value).
-	var chunk int
-	if err := side.Ctl().QueryRowContext(ctx, "SELECT @@tidb_alloc_chunk_size").Scan(&chunk); err == nil {
+	found := false
+	_ = side.WithControl(ctx, func(q conn.Queryer) error {
+		var err error
+		found, err = allocatorVariablePresent(ctx, q)
+		return err
+	})
+	if found {
 		return false, true
 	}
 	if mysqlVersionRE.MatchString(side.Version) || strings.Contains(v, "mariadb") {
 		return true, true
 	}
 	return false, false
+}
+
+// allocatorVariablePresent reports whether the backend exposes TiDB's
+// allocator variables: a plain MySQL server answers an unknown system
+// variable with an error, not a value.
+func allocatorVariablePresent(ctx context.Context, q conn.Queryer) (bool, error) {
+	var chunk int
+	if err := conn.OneRow(ctx, q, "SELECT @@tidb_alloc_chunk_size", []any{&chunk}); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // sideStateExact decides whether this side's reported value for THIS
@@ -385,14 +411,22 @@ type aiFacts struct {
 // tableAutoIncFacts reads one side's next AUTO_INCREMENT value plus the
 // data maximum, best-effort.
 func (r *Runner) tableAutoIncFacts(ctx context.Context, side *conn.Side, table string) aiFacts {
-	v, mp, present, err := conn.TableAutoIncrementFacts(ctx, side.Ctl(), table)
+	var facts aiFacts
+	err := side.WithControl(ctx, func(q conn.Queryer) error {
+		var err error
+		var v, mp int64
+		var present bool
+		v, mp, present, err = conn.TableAutoIncrementFacts(ctx, q, table)
+		facts = aiFacts{table: table, value: v, maxPlus: mp, present: present, readable: true}
+		return err
+	})
 	if err != nil {
 		r.aiWarned.Do(func() {
 			fmt.Fprintf(os.Stderr, "warn: cannot read the AUTO_INCREMENT state on %s (%v); table-state reconciliation is skipped\n", side.Name, err)
 		})
 		return aiFacts{table: table}
 	}
-	return aiFacts{table: table, value: v, maxPlus: mp, present: present, readable: true}
+	return facts
 }
 
 // tableAutoInc reads one side's next AUTO_INCREMENT value (the thin
@@ -489,12 +523,23 @@ func (r *Runner) VerifyState(ctx context.Context, table string) string {
 // the destination: the pre-pass erred because the destination copy is
 // absent, not because of a schema mismatch or a runtime problem.
 func (r *Runner) missingOnDst(ctx context.Context, table string) bool {
-	dstOK, err := conn.TableExists(ctx, r.Dst.Ctl(), table)
-	if err != nil || dstOK {
+	var dstOK bool
+	if err := r.Dst.WithControl(ctx, func(q conn.Queryer) error {
+		var err error
+		dstOK, err = conn.TableExists(ctx, q, table)
+		return err
+	}); err != nil || dstOK {
 		return false
 	}
-	srcOK, err := conn.TableExists(ctx, r.Src.Ctl(), table)
-	return err == nil && srcOK
+	var srcOK bool
+	if err := r.Src.WithControl(ctx, func(q conn.Queryer) error {
+		var err error
+		srcOK, err = conn.TableExists(ctx, q, table)
+		return err
+	}); err != nil {
+		return false
+	}
+	return srcOK
 }
 
 // createPlanFor builds the plan for a table the destination is missing:
@@ -505,8 +550,12 @@ func (r *Runner) missingOnDst(ctx context.Context, table string) bool {
 // destination: every source row is an INSERT — row-level when the source
 // offers a usable key, a plain full load otherwise).
 func (r *Runner) createPlanFor(ctx context.Context, table string) (*StructPlan, bool, error) {
-	srcS, err := conn.IntrospectStructure(ctx, r.Src.Ctl(), table)
-	if err != nil {
+	var srcS *conn.Struct
+	if err := r.Src.WithControl(ctx, func(q conn.Queryer) error {
+		var err error
+		srcS, err = conn.IntrospectStructure(ctx, q, table)
+		return err
+	}); err != nil {
 		return nil, false, err
 	}
 	srcS = filterStruct(srcS, r.o.Cmp.Normalize.IgnoreCols)
@@ -519,8 +568,12 @@ func (r *Runner) createPlanFor(ctx context.Context, table string) (*StructPlan, 
 			table, strings.Join(g, ", "))
 	}
 	autoInc, hasAuto := r.tableAutoInc(ctx, r.Src, table)
-	engine, err := conn.TableEngine(ctx, r.Src.Ctl(), table)
-	if err != nil {
+	var engine string
+	if err := r.Src.WithControl(ctx, func(q conn.Queryer) error {
+		var err error
+		engine, err = conn.TableEngine(ctx, q, table)
+		return err
+	}); err != nil {
 		return nil, false, err
 	}
 	keyed := len(r.o.Cmp.Key) > 0 || UsableKeyOf(srcS) != nil
@@ -567,8 +620,23 @@ func (r *Runner) Count(ctx context.Context, side *conn.Side, table string) (int6
 		q += " WHERE (" + r.o.Cmp.Where + ")"
 	}
 	var n int64
-	if err := side.Ctl().QueryRowContext(ctx, q).Scan(&n); err != nil {
+	err := side.WithControl(ctx, func(qq conn.Queryer) error {
+		var err error
+		n, err = countOnQuery(ctx, qq, q)
+		return err
+	})
+	if err != nil {
 		return 0, fmt.Errorf("%s %s: %w", side.Name, table, err)
+	}
+	return n, nil
+}
+
+// countOnQuery runs a COUNT(*) on a Queryer (the control session in the
+// production path; the snapshot connection in snapshot mode).
+func countOnQuery(ctx context.Context, q conn.Queryer, query string, args ...any) (int64, error) {
+	var n int64
+	if err := conn.OneRow(ctx, q, query, []any{&n}, args...); err != nil {
+		return 0, err
 	}
 	return n, nil
 }
@@ -735,8 +803,12 @@ func (r *Runner) PlanRowWork(ctx context.Context, p *prep, res compare.TableResu
 		ChunkSize:   r.o.Cmp.ChunkSize,
 		Where:       r.o.Cmp.Where,
 	}
-	chunks, err := planner.Plan(ctx, r.Src.Ctl(), freshSrc)
-	if err != nil {
+	var chunks []chunk.Chunk
+	if err := r.Src.WithControl(ctx, func(q conn.Queryer) error {
+		var err error
+		chunks, err = planner.Plan(ctx, q, freshSrc)
+		return err
+	}); err != nil {
 		return rowWork{}, fmt.Errorf("re-plan: %w", err)
 	}
 	if len(chunks) == 0 {
@@ -791,8 +863,12 @@ func (r *Runner) PlanRowWork(ctx context.Context, p *prep, res compare.TableResu
 	var loV, hiV []driver.Value
 	oorPass := freshSrc > 0 && len(p.srcS.Key) > 0 && len(p.dstS.Key) > 0 && keyAgree(p.srcS, p.dstS)
 	if len(p.e.uc) > 0 || oorPass {
-		minV, maxV, err := planner.Extremes(ctx, r.Src.Ctl())
-		if err != nil {
+		var minV, maxV []driver.Value
+		if err := r.Src.WithControl(ctx, func(q conn.Queryer) error {
+			var err error
+			minV, maxV, err = planner.Extremes(ctx, q)
+			return err
+		}); err != nil {
 			return rowWork{}, fmt.Errorf("key extremes: %w", err)
 		}
 		loV, hiV = minV, maxV
@@ -806,6 +882,7 @@ func (r *Runner) PlanRowWork(ctx context.Context, p *prep, res compare.TableResu
 	// makes the sequence collision-free.
 	var oorDel int64
 	if oorPass && loV != nil && hiV != nil {
+		var err error
 		oorDel, err = r.countOOR(ctx, p, loV, hiV)
 		if err != nil {
 			return rowWork{}, fmt.Errorf("out-of-range count: %w", err)
@@ -951,8 +1028,12 @@ func (r *Runner) streamKeyDeletes(ctx context.Context, p *prep, side *conn.Side,
 		ChunkSize:   r.o.Cmp.ChunkSize,
 		Where:       r.o.Cmp.Where,
 	}
-	chunks, err := planner.Plan(ctx, side.Ctl(), total)
-	if err != nil {
+	var chunks []chunk.Chunk
+	if err := side.WithControl(ctx, func(q conn.Queryer) error {
+		var err error
+		chunks, err = planner.Plan(ctx, q, total)
+		return err
+	}); err != nil {
 		return fmt.Errorf("re-plan %s: %w", side.Name, err)
 	}
 	b, cap := r.deleteBatch(p)
@@ -1130,7 +1211,11 @@ func (r *Runner) countOOR(ctx context.Context, p *prep, minV, maxV []driver.Valu
 		q += " AND (" + r.o.Cmp.Where + ")"
 	}
 	var n int64
-	if err := r.Dst.Ctl().QueryRowContext(ctx, q, pred.Args...).Scan(&n); err != nil {
+	if err := r.Dst.WithControl(ctx, func(qq conn.Queryer) error {
+		var err error
+		n, err = countOnQuery(ctx, qq, q, pred.Args...)
+		return err
+	}); err != nil {
 		return 0, fmt.Errorf("dst %s: %w", p.dstS.Table, err)
 	}
 	return n, nil
@@ -1159,31 +1244,37 @@ func (r *Runner) keySamples(ctx context.Context, side *conn.Side, s *conn.Schema
 		q += " WHERE (" + r.o.Cmp.Where + ")"
 	}
 	q += " ORDER BY " + strings.Join(idents, ", ") + fmt.Sprintf(" LIMIT %d", limit)
-	rows, err := side.Ctl().QueryContext(ctx, q)
+	var out []string
+	err := side.WithControl(ctx, func(qq conn.Queryer) error {
+		rows, err := qq.QueryContext(ctx, q)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		vals := make([]driver.Value, len(s.Key))
+		ptrs := make([]any, len(s.Key))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		for rows.Next() {
+			for i := range vals {
+				vals[i] = nil
+			}
+			if err := rows.Scan(ptrs...); err != nil {
+				return err
+			}
+			parts := make([]string, len(vals))
+			for i, v := range vals {
+				parts[i] = literalFor(fams[i], v)
+			}
+			out = append(out, "("+strings.Join(parts, ", ")+")")
+		}
+		return rows.Err()
+	})
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	vals := make([]driver.Value, len(s.Key))
-	ptrs := make([]any, len(s.Key))
-	for i := range vals {
-		ptrs[i] = &vals[i]
-	}
-	var out []string
-	for rows.Next() {
-		for i := range vals {
-			vals[i] = nil
-		}
-		if err := rows.Scan(ptrs...); err != nil {
-			return nil, err
-		}
-		parts := make([]string, len(vals))
-		for i, v := range vals {
-			parts[i] = literalFor(fams[i], v)
-		}
-		out = append(out, "("+strings.Join(parts, ", ")+")")
-	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // keysetCursor renders the strict "key > cursor" predicate with BINDABLE
@@ -1402,8 +1493,12 @@ func (r *Runner) ApplyRowWork(ctx context.Context, p *prep, w rowWork, ap *Appli
 				KeyFamilies: compare.KeyFamilies(p.srcS),
 				Where:       r.o.Cmp.Where,
 			}
-			minV, maxV, err := sp.Extremes(ctx, r.Src.Ctl())
-			if err != nil {
+			var minV, maxV []driver.Value
+			if err := r.Src.WithControl(ctx, func(q conn.Queryer) error {
+				var err error
+				minV, maxV, err = sp.Extremes(ctx, q)
+				return err
+			}); err != nil {
 				st.Error = fmt.Sprintf("key extremes: %v", err)
 				return
 			}
@@ -1461,12 +1556,19 @@ const errWhereDrift = "structure drift on a --where-filtered table cannot be syn
 // any DDL failure the old plan is stale and must be recomputed, never
 // replayed.
 func (r *Runner) structurePlan(ctx context.Context, table string) (*StructPlan, *conn.Struct, error) {
-	srcS, err := conn.IntrospectStructure(ctx, r.Src.Ctl(), table)
-	if err != nil {
+	var srcS, dstS *conn.Struct
+	if err := r.Src.WithControl(ctx, func(q conn.Queryer) error {
+		var err error
+		srcS, err = conn.IntrospectStructure(ctx, q, table)
+		return err
+	}); err != nil {
 		return nil, nil, err
 	}
-	dstS, err := conn.IntrospectStructure(ctx, r.Dst.Ctl(), table)
-	if err != nil {
+	if err := r.Dst.WithControl(ctx, func(q conn.Queryer) error {
+		var err error
+		dstS, err = conn.IntrospectStructure(ctx, q, table)
+		return err
+	}); err != nil {
 		return nil, nil, err
 	}
 	srcS = filterStruct(srcS, r.o.Cmp.Normalize.IgnoreCols)
@@ -2010,9 +2112,15 @@ func (r *Runner) PlanTable(ctx context.Context, res compare.TableResult) TableSy
 					ChunkSize:   r.o.Cmp.ChunkSize,
 					Where:       r.o.Cmp.Where,
 				}
-				if chunks, err := dpl.Plan(ctx, r.Dst.Ctl(), w.dstDel); err == nil {
-					ts.Chunks = len(chunks)
-				}
+				_ = r.Dst.WithControl(ctx, func(q conn.Queryer) error {
+					var err error
+					var chunks []chunk.Chunk
+					chunks, err = dpl.Plan(ctx, q, w.dstDel)
+					if err == nil {
+						ts.Chunks = len(chunks)
+					}
+					return err
+				})
 				ts.Deletes = int(w.dstDel)
 				ts.SampleSQL = []string{fmt.Sprintf("STREAM DELETE ~%d destination rows by key (chunk-sized transactions)", w.dstDel)}
 				if ks, err := r.keySamples(ctx, r.Dst, d.p.dstS, r.o.SampleLimit); err == nil {
@@ -2266,5 +2374,13 @@ func (r *Runner) dropProbe(ctx context.Context, side *conn.Side, table string, h
 	if hook != nil {
 		return hook(ctx, table)
 	}
-	return conn.TableExists(ctx, side.Ctl(), table)
+	var exists bool
+	if err := side.WithControl(ctx, func(q conn.Queryer) error {
+		var err error
+		exists, err = conn.TableExists(ctx, q, table)
+		return err
+	}); err != nil {
+		return false, err
+	}
+	return exists, nil
 }

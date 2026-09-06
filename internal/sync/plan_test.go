@@ -100,4 +100,11 @@ func TestDecidePlanChunkList(t *testing.T) {
 	if len(p.Chunks) != 0 {
 		t.Errorf("count-mismatch chunks = %v, want none", p.Chunks)
 	}
+	// the plan's chunk list is the APPLY ORDER: whatever order the chunk
+	// list arrives in, the plan must execute the chunks in KEY ORDER
+	// (the cross-chunk unique-holder verdict is only sound then)
+	p = DecidePlan(result("DIFFERENT", 10, 10, 7, 2, 0, 5), true, true, true, true, "id", "", true)
+	if len(p.Chunks) != 4 || p.Chunks[0] != 0 || p.Chunks[1] != 2 || p.Chunks[2] != 5 || p.Chunks[3] != 7 {
+		t.Errorf("shuffled chunk list must come out in key order, got %v, want [0 2 5 7]", p.Chunks)
+	}
 }

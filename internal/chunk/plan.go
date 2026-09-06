@@ -14,12 +14,16 @@ import (
 	"mtdiff/internal/normalize"
 )
 
-// Querier is the read seam the planner runs on: a *sql.DB (the pool's
-// control connection) or a dedicated *sql.Conn (snapshot mode, where the
-// extremes must be read on the same connection — and transaction — as
-// the chunk scans).
+// Querier is the read seam the planner runs on: a control-pool session
+// (conn.ControlQueryer, policy-applied with dead-connection recovery)
+// or a dedicated *sql.Conn (snapshot mode, where the extremes must be
+// read on the same connection — and transaction — as the chunk scans).
+// QueryContext, not QueryRow: a dead connection must surface as a
+// recoverable QUERY error (the control session swaps in a fresh,
+// policy-applied connection and retries once); a Row's dead-connection
+// error only surfaces at Scan time, unrecoverable.
 type Querier interface {
-	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 }
 
 // Planner splits a table into key ranges.
@@ -135,14 +139,35 @@ func (p *Planner) keyRow(ctx context.Context, db Querier, dir, where string) ([]
 	for i := range dest {
 		ptrs[i] = &dest[i]
 	}
-	err := db.QueryRowContext(ctx,
+	if err := keyRowOne(ctx, db,
 		fmt.Sprintf("SELECT %s FROM %s%s ORDER BY %s LIMIT 1",
-			strings.Join(idents, ", "), ident(p.Table), where, keyOrder(idents, dir))).
-		Scan(ptrs...)
-	if err != nil {
+			strings.Join(idents, ", "), ident(p.Table), where, keyOrder(idents, dir)), ptrs); err != nil {
 		return nil, err
 	}
 	return toDriverValues(dest), nil
+}
+
+// keyRowOne scans the single row a key query must return, via
+// QueryContext so a dead connection is a recoverable query error (see
+// Querier) rather than a Row error that only surfaces at Scan time.
+// ptrs holds one pointer per selected column; a missing row is
+// sql.ErrNoRows.
+func keyRowOne(ctx context.Context, db Querier, query string, ptrs []any, args ...any) error {
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		return sql.ErrNoRows
+	}
+	if err := rows.Scan(ptrs...); err != nil {
+		return err
+	}
+	return rows.Err()
 }
 
 // toDriverValues converts a []any scan result to []driver.Value: the
@@ -328,11 +353,10 @@ func (p *Planner) sample(ctx context.Context, db Querier, lo, hi []driver.Value,
 	for i := range dest {
 		ptrs[i] = &dest[i]
 	}
-	err := db.QueryRowContext(ctx,
+	err := keyRowOne(ctx, db,
 		fmt.Sprintf("SELECT %s FROM %s%s ORDER BY %s LIMIT 1 OFFSET %d",
-			strings.Join(p.keyIdents(), ", "), ident(p.Table), where, strings.Join(p.keyIdents(), ", "), off),
-		pred.Args...).
-		Scan(ptrs...)
+			strings.Join(p.keyIdents(), ", "), ident(p.Table), where, strings.Join(p.keyIdents(), ", "), off), ptrs,
+		pred.Args...)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
