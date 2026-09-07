@@ -190,7 +190,9 @@ DATETIME 是纯墙钟，两者语义不同，默认直接报错，显式开了�
 
 - 默认：裁掉尾部空格（贴近 CHAR 语义）、大小写敏感、逐字节比。
 - `--fold-case` 忽略大小写；`--no-trim` 不裁空格。
-- JSON 列默认按原始字节比；`--normalize-json` 先做规范化（键排序、数字归一）再比。
+- JSON 列默认按原始字节比；`--normalize-json` 先做规范化（键排序、数字归一、类型保留：number 归一后仍是 JSON number 而非 string——`{"n":1}` 与 `{"n":"1"}` 判不同）再比。
+- 数值列（INT/UINT/DECIMAL/FLOAT/DOUBLE）跨家族比较走同一套 canonical 十进制文法（`--strict-types` 仍拒收）：同值判等（`BIGINT 1000000` == `DOUBLE 1e6`、`DECIMAL 0.00001` == `DOUBLE 0.00001`），不同值必判不同。
+- ENUM/SET **主键/唯一键**：排序按成员**定义序**（ENUM 按成员下标、SET 按位位置），两侧成员定义不同（如 `ENUM('b','a')` vs `ENUM('a','b')`，排序相反）时 diff 回退无键整表多集合 + 告警，sync 拒绝行级寻址（fail closed）；默认结构同步按源定义重放键列类型后恢复行级。
 
 **表里有超大 BLOB**
 

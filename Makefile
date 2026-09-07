@@ -1,13 +1,16 @@
 GO  ?= go
 BIN := bin/mtdiff
 
-.PHONY: build test e2e compat-57 compat-tidb lint clean push
+.PHONY: build test race e2e compat-57 compat-tidb lint clean push
 
 build:
 	$(GO) build -o $(BIN) .
 
 test:
 	$(GO) test ./...
+
+race:
+	$(GO) test -race ./...
 
 e2e: build
 	bash e2e/run_e2e.sh

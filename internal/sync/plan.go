@@ -99,10 +99,23 @@ type Plan struct {
 // gate fires only for a pair the structure sync did not (and will not)
 // repair.
 //
+// keyChunkable (conn.KeyRangeChunkable) subsumes keyOrderOK and adds the
+// per-side property a cross-side check cannot see: the key must be RANGE
+// ADDRESSABLE. An ENUM/SET key column is not: MySQL orders the column by
+// DEFINITION order in ORDER BY but compares it against a string by the
+// member NAME's collation order in WHERE (for enum('b','a') the chunk
+// range ['b'..'a'] selects ZERO rows in WHERE while covering the whole
+// table in ORDER BY). The row-level engine's chunked scans and the
+// out-of-range key-range deletes are all range predicates, so a table
+// whose key is not range-addressable goes through the same decision as a
+// keyless one: a full resync (order-independent, safe), or an argument
+// error when --where is set (a whole-table resync cannot honor a
+// filter).
+//
 // FULL mode is only produced without a --where filter: TRUNCATE is a
 // whole-table operation and cannot honor a filter (a keyless side +
 // --where is an error instead).
-func DecidePlan(res compare.TableResult, srcKeyed, dstKeyed, srcUnique, dstUnique bool, key, where string, keysAgree, keyOrderOK bool) Plan {
+func DecidePlan(res compare.TableResult, srcKeyed, dstKeyed, srcUnique, dstUnique bool, key, where string, keysAgree, keyOrderOK, keyChunkable bool) Plan {
 	p := Plan{Table: res.Name, SrcRows: res.SrcRows, DstRows: res.DstRows}
 	switch res.Status {
 	case "OK":
@@ -136,6 +149,15 @@ func DecidePlan(res compare.TableResult, srcKeyed, dstKeyed, srcUnique, dstUniqu
 			"--where requires compatible key ordering on both sides (the same key family and, for string keys, the same effective collation); the destination key orders rows differently — refusing a filtered row-level sync", true
 		return p
 	}
+	if where != "" && srcKeyed && dstKeyed && keysAgree && !keyChunkable {
+		// The key is not range-addressable (an ENUM/SET column: ORDER BY
+		// orders by definition, WHERE compares by member name), and a
+		// --where sync cannot fall back to a whole-table resync (a
+		// TRUNCATE cannot honor the filter)
+		p.Mode, p.Error, p.ArgErr = ModeError,
+			fmt.Sprintf("--where requires a range-addressable key; key (%s) contains an ENUM/SET column, whose rows cannot be addressed by key ranges — drop --where to converge the table by full resync", key), true
+		return p
+	}
 	switch {
 	case !srcKeyed || !dstKeyed:
 		p.Mode, p.Reason = ModeFull, "no usable key on both sides: truncate + full resync"
@@ -161,6 +183,17 @@ func DecidePlan(res compare.TableResult, srcKeyed, dstKeyed, srcUnique, dstUniqu
 		p.Mode, p.Error = ModeError,
 			"row-level sync requires identical key ordering semantics on both sides (the same key family and, for string keys, the same effective collation); the destination key orders rows differently and the source's key bounds cannot be used against it — align the key family/collation, or run without --no-sync-schema so the structure sync aligns it"
 		return p
+	case srcKeyed && dstKeyed && !keyChunkable:
+		// The key's names and ordering agree, but the key is not RANGE
+		// ADDRESSABLE: it contains an ENUM/SET column, whose ORDER BY
+		// order (definition) and WHERE comparison order (member-name
+		// collation) disagree. The row-level engine addresses rows by
+		// key ranges (chunked scans, out-of-range deletes), so it would
+		// scan the wrong rows. The full resync is order-independent and
+		// touches no keys on the destination — safe, and the only
+		// convergence left for this key.
+		p.Mode, p.Reason = ModeFull,
+			fmt.Sprintf("key (%s) contains an ENUM/SET column: key ranges are not addressable (ORDER BY orders the members by definition, WHERE compares them by the member name's collation) — truncate + full resync", key)
 	default:
 		p.Mode, p.Reason = ModeRowLevel, "row-level sync"
 		for _, cd := range res.DiffChunks {

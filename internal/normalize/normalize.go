@@ -32,15 +32,19 @@ import (
 // type tags.
 //
 // All numeric families (INT, UINT, DECIMAL, FLOAT, DOUBLE) share ONE tag
-// (tagNUMERIC): the schema-compatibility layer already allows these
-// families to be compared across each other ("compared after
-// normalization"), so a cross-family equal value (INT 1 vs DECIMAL 1.00 vs
-// DOUBLE 1.0) must render under the SAME tag — five distinct tags would
-// make them compare unequal forever and the declared numeric compatibility
-// would be fiction. The payload still carries the family's exact
-// semantics (INT/UINT the exact decimal, DECIMAL the exact normalized
-// decimal, FLOAT/DOUBLE the tolerance-aware decimal), so different VALUES
-// across families (INT 2 vs DOUBLE 1.0) stay different; --strict-types
+// (tagNUMERIC) AND one payload grammar (canonicalNumber, see canonical.go):
+// the schema-compatibility layer already allows these families to be
+// compared across each other ("compared after normalization"), so a
+// cross-family equal value (INT 1000000 vs DECIMAL 1000000.000 vs
+// DOUBLE 1e+06) must render under the SAME tag AND the SAME payload —
+// five distinct tags would make them compare unequal forever, and one
+// tag over disagreeing payload grammars ("1e+06" vs "1000000") just as
+// badly. The payload carries the family's exact semantics through the
+// shared grammar: INT/UINT/DECIMAL the EXACT decimal (no float64),
+// FLOAT/DOUBLE the tolerance-quantized value's shortest round-trip
+// decimal — all rendered in the one plain-or-scientific grammar, so
+// different VALUES across families (INT 2 vs DOUBLE 1.0, INT 9007199254740993
+// vs DOUBLE 9007199254740992) stay different; --strict-types
 // rejects the cross-family schema itself before any normalization.
 const (
 	tagNULL      = 0x00

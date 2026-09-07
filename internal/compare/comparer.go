@@ -178,17 +178,25 @@ func (c *Comparer) compareTable(ctx context.Context, src, dst *conn.Side, name s
 			fmt.Sprintf("usable keys differ between the sides (src %s vs dst %s): comparing as keyless whole-table multisets",
 				strings.Join(srcSchema.Key, ","), strings.Join(dstSchema.Key, ",")))
 	} else if len(srcSchema.Key) > 0 {
-		// Same key NAMES on both sides, but the ORDERING SEMANTICS may
-		// still differ (P0-3): a string key orders by its collation
-		// ("Z" < "a" in utf8mb4_bin, the reverse in
+		// Same key NAMES on both sides, but the key may still not be
+		// RANGE-ADDRESSABLE (conn.KeyRangeChunkable): a string key orders
+		// by its collation ("Z" < "a" in utf8mb4_bin, the reverse in
 		// utf8mb4_general_ci), and under --no-sync-schema the families
-		// can drift too. Source min/max and chunk bounds rendered
-		// against the destination would address the wrong rows. Same
-		// fallback: order-independent whole-table multisets.
-		if ok, why := conn.KeyOrderCompatible(srcSchema, dstSchema); !ok {
+		// can drift too; and an ENUM/SET key is unsound even when both
+		// sides agree — MySQL orders the column by DEFINITION order in
+		// ORDER BY but compares it against a string by the member NAME's
+		// collation order in WHERE (for enum('b','a') the range
+		// [min..max] = ['b'..'a'] is EMPTY in WHERE while covering the
+		// whole table in ORDER BY: both sides scan zero rows and a
+		// diverged table compares identical — a silent false identical).
+		// Source min/max and chunk bounds rendered against the
+		// destination would address the wrong rows. Same fallback:
+		// order-independent whole-table multisets (a single unbounded
+		// chunk per side, no key bounds anywhere).
+		if ok, why := conn.KeyRangeChunkable(srcSchema, dstSchema); !ok {
 			keyMismatch = true
 			res.Warnings = append(res.Warnings,
-				fmt.Sprintf("key ordering differs between the endpoints (%s): comparing as keyless whole-table multiset", why))
+				fmt.Sprintf("key is not range-addressable (%s): comparing as keyless whole-table multiset", why))
 		}
 	}
 

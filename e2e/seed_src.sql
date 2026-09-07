@@ -122,3 +122,33 @@ DROP TABLE IF EXISTS t_timestamp_tz;
 CREATE TABLE t_timestamp_tz (id INT PRIMARY KEY, ts TIMESTAMP);
 SET time_zone = '+00:00';
 INSERT INTO t_timestamp_tz VALUES (1, '2024-01-01 08:00:00');
+
+-- round-9: a JSON number (P0-1): the dst variant holds the JSON STRING
+-- of the same digits — the type must survive --normalize-json.
+DROP TABLE IF EXISTS t_json_type;
+CREATE TABLE t_json_type (id INT PRIMARY KEY, j JSON);
+INSERT INTO t_json_type VALUES (1, '{"n":1}');
+-- number 1 where the dst variant holds number 1.0: equal only after
+-- normalization
+DROP TABLE IF EXISTS t_json_type_ok;
+CREATE TABLE t_json_type_ok (id INT PRIMARY KEY, j JSON);
+INSERT INTO t_json_type_ok VALUES (1, '{"n":1}');
+
+-- round-9: ENUM primary key (P0-2): the member DEFINITION ORDER is
+-- reversed on the dst side. Identical data, reversed ordering semantics.
+DROP TABLE IF EXISTS t_enumkey;
+CREATE TABLE t_enumkey (k ENUM('b','a') PRIMARY KEY, v INT);
+INSERT INTO t_enumkey VALUES ('a', 1), ('b', 2);
+-- the same drift WITH a data difference: the sync would want row-level
+-- addressing, which the incompatible key ordering must refuse
+DROP TABLE IF EXISTS t_enumkey_drift;
+CREATE TABLE t_enumkey_drift (k ENUM('b','a') PRIMARY KEY, v INT);
+INSERT INTO t_enumkey_drift VALUES ('a', 1), ('b', 2);
+
+-- round-9: cross-family numerics over the SHARED canonical payload (P1-3)
+DROP TABLE IF EXISTS t_numfam_large;
+CREATE TABLE t_numfam_large (id INT PRIMARY KEY, v BIGINT);
+INSERT INTO t_numfam_large VALUES (1, 1000000);
+DROP TABLE IF EXISTS t_numfam_dec;
+CREATE TABLE t_numfam_dec (id INT PRIMARY KEY, v DECIMAL(20,10));
+INSERT INTO t_numfam_dec VALUES (1, 0.0000100000);

@@ -20,6 +20,11 @@ jobs:
         run: make lint
       - name: Test
         run: make test
+      - name: Race
+        # the unit suite under the race detector, as a SEPARATE step
+        # from Test: a race failure must be locatable without
+        # re-running the plain suite (and vice versa)
+        run: go test -race ./...
       - name: make push regression
         # temporary repo + bare origin: staged-only commit, final push,
         # metacharacter messages land literally, untracked files stay local

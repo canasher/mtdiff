@@ -234,7 +234,7 @@ expect 1 "JSON: 1 vs 1.0 differ raw (no --normalize-json)" --src "$SRC" --dst "$
 # Identical data still compares equal — via the announced keyless
 # whole-table multiset fallback, never via shared key bounds.
 expect 0 "cross-collation key: identical data via keyless fallback" --src "$SRC" --dst "$DST" --tables t_keycoll
-if ! grep -q "key ordering differs" "$OUT"; then
+if ! grep -q "not range-addressable" "$OUT"; then
   echo "FAIL: the key-ordering fallback must be announced"; cat "$OUT"; exit 1
 fi
 echo "ok: key-ordering fallback announced"
@@ -269,6 +269,61 @@ col=$(qdst "SELECT COLLATION_NAME FROM information_schema.COLUMNS WHERE TABLE_SC
 [ "$col" = "utf8mb4_bin" ] || { echo "FAIL: dst key collation after sync: $col, want utf8mb4_bin"; exit 1; }
 echo "ok: dst key collation aligned"
 expect 0 "cross-collation key: diff identical after the alignment" --src "$SRC" --dst "$DST" --tables t_keycoll
+
+say "round-9 value regressions"
+# P0-1: a JSON number is not a JSON string — the type must SURVIVE
+# --normalize-json (the old canonicalizer rendered a number as a quoted
+# string: {"n":1} and {"n":"1"} both normalized to {"n":"1"}).
+expect 1 "JSON: number 1 vs string '1' (raw)" --src "$SRC" --dst "$DST" --tables t_json_type
+expect 1 "JSON: number 1 vs string '1' under --normalize-json" --src "$SRC" --dst "$DST" --tables t_json_type --normalize-json
+expect 0 "JSON: number 1 vs number 1.0 under --normalize-json" --src "$SRC" --dst "$DST" --tables t_json_type_ok --normalize-json
+expect 1 "JSON: number 1 vs number 1.0 differ raw" --src "$SRC" --dst "$DST" --tables t_json_type_ok
+# P0-2: an ENUM key whose members are DEFINED in the opposite order:
+# identical data, REVERSED ordering semantics — the diff must not share
+# the key bounds (announced keyless fallback), and a --no-sync-schema
+# sync over a divergent table must fail closed with zero writes.
+expect 0 "ENUM key (reversed members): identical data via keyless fallback" --src "$SRC" --dst "$DST" --tables t_enumkey
+if ! grep -q "not range-addressable" "$OUT"; then
+  echo "FAIL: the ENUM key-ordering fallback must be announced"; cat "$OUT"; exit 1
+fi
+echo "ok: ENUM key-ordering fallback announced"
+expect 2 "ENUM key (reversed members): --no-sync-schema refuses row-level (dry-run)" sync --src "$SRC" --dst "$DST" --tables t_enumkey_drift --no-sync-schema
+if ! grep -q "key ordering" "$OUT"; then
+  echo "FAIL: the refusal must name the key-ordering cause"; cat "$OUT"; exit 1
+fi
+echo "ok: the refusal names the key-ordering cause"
+expect 2 "ENUM key (reversed members): --no-sync-schema --apply writes nothing" sync --src "$SRC" --dst "$DST" --tables t_enumkey_drift --no-sync-schema --apply --yes
+n=$(qdst "SELECT COUNT(*) FROM t_enumkey_drift")
+[ "$n" = "2" ] || { echo "FAIL: the refused apply wrote to the table (count=$n, want 2)"; exit 1; }
+v=$(qdst "SELECT v FROM t_enumkey_drift WHERE k = 'b'")
+[ "$v" = "99" ] || { echo "FAIL: the refused apply must leave the data untouched (v=$v, want the drifted 99)"; exit 1; }
+# the DEFAULT sync repairs instead: the structure DDL re-emits the
+# source's ENUM definition verbatim, after which the (now order-
+# compatible) pair is row-level safe and converges the data.
+expect 1 "ENUM key: default sync plans the ENUM definition DDL" sync --src "$SRC" --dst "$DST" --tables t_enumkey_drift
+if ! grep -qi "ENUM" "$OUT"; then
+  echo "FAIL: the structure plan must align the ENUM definition"; cat "$OUT"; exit 1
+fi
+echo "ok: the structure plan aligns the ENUM definition"
+expect 0 "ENUM key: default sync --apply" sync --src "$SRC" --dst "$DST" --tables t_enumkey_drift --apply --yes
+kcol=$(qdst "SELECT COLUMN_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='dstdb' AND TABLE_NAME='t_enumkey_drift' AND COLUMN_NAME='k'")
+[ "$kcol" = "enum('b','a')" ] || { echo "FAIL: dst key type after sync: $kcol, want enum('b','a')"; exit 1; }
+echo "ok: dst ENUM definition aligned"
+v=$(qdst "SELECT v FROM t_enumkey_drift WHERE k = 'b'")
+[ "$v" = "2" ] || { echo "FAIL: the converged value (v=$v, want 2)"; exit 1; }
+echo "ok: the data converged after the alignment"
+expect 0 "ENUM key: diff identical after the alignment" --src "$SRC" --dst "$DST" --tables t_enumkey_drift
+# P1-3: the shared canonical numeric payload — the same value across
+# numeric families (BIGINT vs DOUBLE, DECIMAL vs DOUBLE) compares equal
+# non-strict (announced), and --strict-types still rejects the pair.
+expect 0 "cross-family numeric: BIGINT vs DOUBLE 1000000 (non-strict)" --src "$SRC" --dst "$DST" --tables t_numfam_large
+if ! grep -q "numeric types differ" "$OUT"; then
+  echo "FAIL: the cross-family comparison must announce the normalization"; cat "$OUT"; exit 1
+fi
+echo "ok: cross-family normalization announced"
+expect 2 "cross-family numeric: BIGINT vs DOUBLE rejected by --strict-types" --src "$SRC" --dst "$DST" --tables t_numfam_large --strict-types
+expect 0 "cross-family numeric: DECIMAL(20,10) 0.0000100000 vs DOUBLE 0.00001 (non-strict)" --src "$SRC" --dst "$DST" --tables t_numfam_dec
+expect 2 "cross-family numeric: DECIMAL vs DOUBLE rejected by --strict-types" --src "$SRC" --dst "$DST" --tables t_numfam_dec --strict-types
 
 say "where / mutations on t_mut"
 sql dst dstdb m_where.sql

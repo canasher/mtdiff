@@ -3,6 +3,7 @@ package normalize
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"math"
 	"strconv"
 	"testing"
@@ -425,6 +426,136 @@ func TestNumericTagEquality(t *testing.T) {
 	}
 }
 
+// TestNumericCrossFamilyCanonicalForm pins the P1-3 fix: the shared
+// tagNUMERIC only means something if the payload GRAMMAR is shared too.
+// The old payloads disagreed on notation (INT 1000000 = "1000000" but
+// DOUBLE 1000000 = "1e+06" from the 'g' round-trip; DECIMAL 0.00001 =
+// "0.00001" but DOUBLE 0.00001 = "1e-05"), so the declared cross-family
+// compatibility was still a fiction for every value whose shortest
+// float rendering is not plain. Every numeric family now passes its
+// exact value through the one canonical decimal grammar (INT/UINT/DECIMAL
+// exact, never via float64; FLOAT/DOUBLE after tolerance quantization):
+// the same value renders identically in any family, distinct values
+// always render differently.
+func TestNumericCrossFamilyCanonicalForm(t *testing.T) {
+	n := NewNormalizer([]conn.Column{col("v", conn.FamINT)}, DefaultOptions())
+	enc := func(fam string, v any) []byte {
+		p, err := n.encodeValue(col("v", fam), v)
+		if err != nil {
+			t.Fatalf("encode %s %v: %v", fam, v, err)
+		}
+		return p
+	}
+	same := func(want string, fam string, val any) {
+		got := enc(fam, val)
+		if string(got) != want {
+			t.Errorf("%s %v: canonical payload %q, want %q", fam, val, got, want)
+		}
+	}
+	// INT 1000000 == UINT 1000000 == DECIMAL 1000000.000 == DOUBLE 1000000.0
+	same("1000000", conn.FamINT, int64(1000000))
+	same("1000000", conn.FamUINT, uint64(1000000))
+	same("1000000", conn.FamDECIMAL, []byte("1000000.000"))
+	same("1000000", conn.FamDOUBLE, float64(1000000))
+	same("1000000", conn.FamFLOAT, float32(1000000))
+	if a, b := enc(conn.FamINT, int64(1000000)), enc(conn.FamDOUBLE, float64(1000000)); !bytes.Equal(a, b) {
+		t.Errorf("INT 1000000 vs DOUBLE 1000000: % x vs % x", a, b)
+	}
+	// DECIMAL 0.00001 == DOUBLE 0.00001 (the 'g' rendering 1e-05 used to
+	// collide with nothing but the decimal's plain form)
+	same("0.00001", conn.FamDECIMAL, []byte("0.00001"))
+	same("0.00001", conn.FamDECIMAL, []byte("0.0000100"))
+	same("0.00001", conn.FamDOUBLE, 0.00001)
+	if a, b := enc(conn.FamDECIMAL, []byte("0.0000100")), enc(conn.FamDOUBLE, 0.00001); !bytes.Equal(a, b) {
+		t.Errorf("DECIMAL 0.00001 vs DOUBLE 0.00001: % x vs % x", a, b)
+	}
+	// INT 1 == DOUBLE 1.0
+	if a, b := enc(conn.FamINT, int64(1)), enc(conn.FamDOUBLE, 1.0); !bytes.Equal(a, b) {
+		t.Errorf("INT 1 vs DOUBLE 1.0: % x vs % x", a, b)
+	}
+	// negatives across families
+	same("-1000000", conn.FamINT, int64(-1000000))
+	same("-1000000", conn.FamDECIMAL, []byte("-1000000.00"))
+	same("-1000000", conn.FamDOUBLE, float64(-1000000))
+	// different VALUES stay different across the shared grammar
+	if a, b := enc(conn.FamINT, int64(1000000)), enc(conn.FamDOUBLE, float64(1000001)); bytes.Equal(a, b) {
+		t.Errorf("INT 1000000 vs DOUBLE 1000001 must differ, both % x", a)
+	}
+	// precision boundary: DOUBLE cannot represent 9007199254740993 — the
+	// exact INT and the DOUBLE that rounds to ...92 must stay different
+	// (the INT stays EXACT: it never passes through float64)
+	if a, b := enc(conn.FamINT, int64(9007199254740993)), enc(conn.FamDOUBLE, float64(9007199254740992)); bytes.Equal(a, b) {
+		t.Errorf("INT 9007199254740993 vs DOUBLE 9007199254740992 must differ, both % x", a)
+	}
+	// the maximum UINT (20 digits — right at the plain-render limit)
+	// must not overflow the canonicalizer and must agree across shapes
+	maxU := enc(conn.FamUINT, uint64(18446744073709551615))
+	if string(maxU) != "18446744073709551615" {
+		t.Errorf("max UINT canonical = %q, want the exact 20-digit value", maxU)
+	}
+	if !bytes.Equal(maxU, enc(conn.FamUINT, "18446744073709551615")) {
+		t.Errorf("max UINT: uint64 shape vs decimal-string shape disagree: % x", maxU)
+	}
+}
+
+// TestCanonicalNumberGrammar pins the shared decimal grammar itself: the
+// plain/scientific switch, the exactness invariants, the sentinel
+// pass-through, and the refusal of anything that is not a decimal.
+func TestCanonicalNumberGrammar(t *testing.T) {
+	eq := func(tok, want string) {
+		got, err := canonicalNumber(tok)
+		if err != nil {
+			t.Fatalf("canonicalNumber(%q): %v", tok, err)
+		}
+		if got != want {
+			t.Errorf("canonicalNumber(%q) = %q, want %q", tok, got, want)
+		}
+	}
+	// equal values, any notation, one rendering
+	eq("1", "1")
+	eq("1.0", "1")
+	eq("1.00", "1")
+	eq("1e0", "1")
+	eq("1000000", "1000000")
+	eq("1e6", "1000000")
+	eq("1.0e6", "1000000")
+	eq("0.00001", "0.00001")
+	eq("1e-5", "0.00001")
+	eq("0.0000100", "0.00001")
+	eq("-1e6", "-1000000")
+	eq("-0", "0")
+	// beyond the plain limit the rendering is scientific but compact
+	eq("1e100000000", "1e+100000000")
+	if got, _ := canonicalNumber("123456789012345678901234567890"); len(got) > 40 {
+		t.Errorf("27-digit integer expanded to %d bytes: %q", len(got), got)
+	}
+	// distinct values stay distinct at any magnitude
+	differ := func(a, b string) {
+		x, errA := canonicalNumber(a)
+		y, errB := canonicalNumber(b)
+		if errA != nil || errB != nil {
+			t.Fatalf("canonicalNumber(%q/%q): %v %v", a, b, errA, errB)
+		}
+		if x == y {
+			t.Errorf("distinct values must differ: %q and %q both %q", a, b, x)
+		}
+	}
+	differ("9007199254740992", "9007199254740993")
+	differ("123456789012345678901234567890", "123456789012345678901234567891")
+	differ("1e100000000", "2e100000000")
+	// the float sentinels pass through unchanged (MySQL 8.0 DOUBLE can
+	// store them; no canonical decimal exists for them)
+	eq("NaN", "NaN")
+	eq("+Inf", "+Inf")
+	eq("-Inf", "-Inf")
+	// anything else is not a decimal: an error, never a guess
+	for _, bad := range []string{"", "abc", "1x", "1.2.3", "e5", "1e", "0x10", "--1", "1..2"} {
+		if _, err := canonicalNumber(bad); err == nil {
+			t.Errorf("canonicalNumber(%q) must error", bad)
+		}
+	}
+}
+
 // TestUINTDriverShapes pins the three driver shapes a 64-bit UNSIGNED value
 // can arrive in (P1-6, found by the e2e): the TEXT protocol yields uint64,
 // the BINARY protocol yields int64 while the value fits the signed range
@@ -517,6 +648,75 @@ func TestNormalizeJSONExact(t *testing.T) {
 	if !bytes.Equal(x, y) {
 		t.Errorf("key-sorted/nested JSON must still match: %s vs %s", x, y)
 	}
+}
+
+// TestNormalizeJSONPreservesNumberType pins the P0-1 fix: --normalize-json
+// must preserve the JSON TYPE of every value. A JSON number is not a JSON
+// string: the old code canonicalized a number into a plain Go string, and
+// json.Marshal then rendered it WITH quotes, so {"n":1} and {"n":"1"} both
+// normalized to {"n":"1"} — a deterministic silent false identical between
+// a number and a string (the same trap, one level up, as the float64
+// collapse the exact-number work fixed).
+func TestNormalizeJSONPreservesNumberType(t *testing.T) {
+	// normEq(a, b): the normalized documents are byte-equal
+	normEq := func(a, b string) (bool, string, string) {
+		x, err := normalizeJSON([]byte(a))
+		if err != nil {
+			t.Fatalf("normalize %s: %v", a, err)
+		}
+		y, err := normalizeJSON([]byte(b))
+		if err != nil {
+			t.Fatalf("normalize %s: %v", b, err)
+		}
+		return bytes.Equal(x, y), string(x), string(y)
+	}
+	// TYPE SEPARATION: a number never equals the string of its digits
+	mustDiffer := [][2]string{
+		{`{"n":1}`, `{"n":"1"}`},
+		{`{"n":1.0}`, `{"n":"1"}`},
+		{`{"n":-5}`, `{"n":"-5"}`},
+		{`{"n":0.25}`, `{"n":"0.25"}`},
+		{`{"a":{"n":1}}`, `{"a":{"n":"1"}}`},
+		{`[1]`, `["1"]`},
+		{`{"a":[1,2]}`, `{"a":["1","2"]}`},
+		// the other JSON types are already distinct, but pin them as
+		// type invariants too: booleans and null are not their names
+		{`{"n":true}`, `{"n":"true"}`},
+		{`{"n":false}`, `{"n":"false"}`},
+		{`{"n":null}`, `{"n":"null"}`},
+		{`[null]`, `["null"]`},
+	}
+	for i, pair := range mustDiffer {
+		eq, x, y := normEq(pair[0], pair[1])
+		if eq {
+			t.Errorf("case %d: distinct JSON types must differ: %s vs %s", i, x, y)
+		}
+	}
+	// the normalized document must re-parse as JSON with the ORIGINAL
+	// types: a number comes back a json.Number, a string a string
+	roundTripTypes := func(doc string, wantNumber bool) {
+		out, err := normalizeJSON([]byte(doc))
+		if err != nil {
+			t.Fatalf("normalize %s: %v", doc, err)
+		}
+		dec := json.NewDecoder(bytes.NewReader(out))
+		dec.UseNumber()
+		var v any
+		if err := dec.Decode(&v); err != nil {
+			t.Fatalf("normalized output %s is not valid JSON: %v", out, err)
+		}
+		_, ok := v.(map[string]any)["n"].(json.Number)
+		s, isStr := v.(map[string]any)["n"].(string)
+		if wantNumber && !ok {
+			t.Errorf("normalized %s: the number lost its type: %s", doc, out)
+		}
+		if !wantNumber && !isStr {
+			t.Errorf("normalized %s: the string lost its type: %s (got %v)", doc, out, s)
+		}
+	}
+	roundTripTypes(`{"n":1}`, true)
+	roundTripTypes(`{"n":"1"}`, false)
+	roundTripTypes(`{"n":1e100000000}`, true)
 }
 
 func TestFractionalSecondCollisions(t *testing.T) {

@@ -23,25 +23,48 @@ func (n *Normalizer) encodeValue(c conn.Column, v driver.Value) ([]byte, error) 
 		if !ok {
 			return nil, fmt.Errorf("expected int64, got %T", v)
 		}
-		return strconv.AppendInt(nil, i, 10), nil
+		// exact decimal through the shared canonical grammar: an int64
+		// renders in <= 19 digits without trailing zeros, so the
+		// canonicalizer is an identity here — but the SAME grammar the
+		// other numeric families use, so INT 1000000 and DOUBLE 1e+06
+		// both end up "1000000" (see canonicalNumber)
+		out, err := canonicalNumber(strconv.FormatInt(i, 10))
+		if err != nil {
+			return nil, err
+		}
+		return []byte(out), nil
 	case conn.FamUINT:
 		// The driver delivers a 64-bit UNSIGNED value in THREE shapes
 		// depending on the protocol path: the text protocol yields
 		// uint64; the binary protocol yields int64 while the value still
 		// fits the signed range (<= math.MaxInt64) and a decimal STRING
 		// beyond it (the driver renders those instead of fitting them).
-		// All three are the same value; rendering is decimal text either
-		// way, so cross-family numeric equality (tagNUMERIC) holds.
+		// All three are the same value; rendering is the exact decimal
+		// text through the shared canonical grammar either way (a uint64
+		// renders in <= 20 digits: the canonicalizer never widens it),
+		// so cross-family numeric equality (tagNUMERIC) holds.
 		switch u := v.(type) {
 		case int64:
-			return strconv.AppendInt(nil, u, 10), nil
+			out, err := canonicalNumber(strconv.FormatInt(u, 10))
+			if err != nil {
+				return nil, err
+			}
+			return []byte(out), nil
 		case uint64:
-			return strconv.AppendUint(nil, u, 10), nil
+			out, err := canonicalNumber(strconv.FormatUint(u, 10))
+			if err != nil {
+				return nil, err
+			}
+			return []byte(out), nil
 		case string:
 			if !isDecimalUint(u) {
 				return nil, fmt.Errorf("expected uint64, got %T", v)
 			}
-			return []byte(u), nil
+			out, err := canonicalNumber(u)
+			if err != nil {
+				return nil, err
+			}
+			return []byte(out), nil
 		default:
 			return nil, fmt.Errorf("expected uint64, got %T", v)
 		}
@@ -50,7 +73,14 @@ func (n *Normalizer) encodeValue(c conn.Column, v driver.Value) ([]byte, error) 
 		if !ok {
 			return nil, fmt.Errorf("expected decimal bytes, got %T", v)
 		}
-		return []byte(normalizeDecimal(s)), nil
+		// exact decimal through the shared canonical grammar — NEVER via
+		// float64: DECIMAL 0.00001 and DOUBLE 0.00001 both end up
+		// "0.00001", and a DECIMAL beyond ~17 digits stays exact
+		out, err := canonicalNumber(s)
+		if err != nil {
+			return nil, err
+		}
+		return []byte(out), nil
 	case conn.FamFLOAT:
 		if !usableTolerance(n.opts.Tolerance) {
 			return nil, toleranceRefused(n.opts.Tolerance)
@@ -66,7 +96,17 @@ func (n *Normalizer) encodeValue(c conn.Column, v driver.Value) ([]byte, error) 
 		default:
 			return nil, fmt.Errorf("expected float, got %T", v)
 		}
-		return []byte(formatFloat(f64, n.opts.Tolerance, 32)), nil
+		// tolerance quantization (unchanged — see formatFloat) →
+		// shortest round-trip decimal → the SHARED canonical grammar:
+		// DOUBLE 1e+06 and INT 1000000 both end up "1000000". The
+		// quantization stays exact-or-keep (no saturation); only the
+		// final rendering is unified across the numeric families.
+		q := formatFloat(f64, n.opts.Tolerance, 32)
+		out, err := canonicalNumber(q)
+		if err != nil {
+			return nil, err
+		}
+		return []byte(out), nil
 	case conn.FamDOUBLE:
 		if !usableTolerance(n.opts.Tolerance) {
 			return nil, toleranceRefused(n.opts.Tolerance)
@@ -75,7 +115,12 @@ func (n *Normalizer) encodeValue(c conn.Column, v driver.Value) ([]byte, error) 
 		if !ok {
 			return nil, fmt.Errorf("expected float64, got %T", v)
 		}
-		return []byte(formatFloat(f, n.opts.Tolerance, 64)), nil
+		q := formatFloat(f, n.opts.Tolerance, 64)
+		out, err := canonicalNumber(q)
+		if err != nil {
+			return nil, err
+		}
+		return []byte(out), nil
 	case conn.FamDATE:
 		t, ok := v.(time.Time)
 		if !ok {

@@ -132,3 +132,30 @@ CREATE TABLE t_timestamp_tz (id INT PRIMARY KEY, ts TIMESTAMP);
 SET time_zone = '+08:00';
 INSERT INTO t_timestamp_tz VALUES (1, '2024-01-01 08:00:00');
 SET time_zone = '+00:00';
+
+-- round-9: the JSON STRING where the src holds the JSON number (P0-1):
+-- {"n":1} and {"n":"1"} must stay DIFFERENT under --normalize-json
+DROP TABLE IF EXISTS t_json_type;
+CREATE TABLE t_json_type (id INT PRIMARY KEY, j JSON);
+INSERT INTO t_json_type VALUES (1, '{"n":"1"}');
+-- number 1.0 where the src holds number 1
+DROP TABLE IF EXISTS t_json_type_ok;
+CREATE TABLE t_json_type_ok (id INT PRIMARY KEY, j JSON);
+INSERT INTO t_json_type_ok VALUES (1, '{"n":1.0}');
+
+-- round-9: the ENUM members DEFINED in the opposite order (P0-2)
+DROP TABLE IF EXISTS t_enumkey;
+CREATE TABLE t_enumkey (k ENUM('a','b') PRIMARY KEY, v INT);
+INSERT INTO t_enumkey VALUES ('a', 1), ('b', 2);
+-- identical schema drift, and the 'b' row's value DIFFERS
+DROP TABLE IF EXISTS t_enumkey_drift;
+CREATE TABLE t_enumkey_drift (k ENUM('a','b') PRIMARY KEY, v INT);
+INSERT INTO t_enumkey_drift VALUES ('a', 1), ('b', 99);
+
+-- round-9: DOUBLE where the src holds exact BIGINT / DECIMAL (P1-3)
+DROP TABLE IF EXISTS t_numfam_large;
+CREATE TABLE t_numfam_large (id INT PRIMARY KEY, v DOUBLE);
+INSERT INTO t_numfam_large VALUES (1, 1000000);
+DROP TABLE IF EXISTS t_numfam_dec;
+CREATE TABLE t_numfam_dec (id INT PRIMARY KEY, v DOUBLE);
+INSERT INTO t_numfam_dec VALUES (1, 0.00001);

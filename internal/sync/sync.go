@@ -708,7 +708,7 @@ func (r *Runner) prepare(ctx context.Context, res compare.TableResult) (*prep, e
 		srcS: srcS,
 		dstS: dstS,
 		plan: DecidePlan(res, len(srcS.Key) > 0, len(dstS.Key) > 0, srcS.KeyIsUnique, dstS.KeyIsUnique,
-			strings.Join(srcS.Key, ","), r.o.Cmp.Where, keyAgree(srcS, dstS), keyOrderCompatible(srcS, dstS)),
+			strings.Join(srcS.Key, ","), r.o.Cmp.Where, keyAgree(srcS, dstS), keyOrderCompatible(srcS, dstS), keyRangeChunkable(srcS, dstS)),
 		b: NewBuilder(res.Name, srcS),
 	}
 	p.e = NewEngine(
@@ -1129,6 +1129,40 @@ func keyAgree(a, b *conn.Schema) bool {
 func keyOrderCompatible(a, b *conn.Schema) bool {
 	ok, _ := conn.KeyOrderCompatible(a, b)
 	return keyAgree(a, b) && ok
+}
+
+// keyRangeChunkable is keyAgree plus the RANGE-ADDRESSABILITY check
+// (conn.KeyRangeChunkable): subsumes keyOrderCompatible and refuses a
+// key that contains an ENUM/SET column, whose ORDER BY order (member
+// definition) and WHERE comparison order (member-name collation)
+// disagree — the row-level engine's key-range addressing is unsound for
+// such a key (see conn.KeyRangeChunkable).
+func keyRangeChunkable(a, b *conn.Schema) bool {
+	ok, _ := conn.KeyRangeChunkable(a, b)
+	return keyAgree(a, b) && ok
+}
+
+// structKeyRangeAddressable reports whether a key (column names from a
+// conn.Struct) is range-addressable: none of its columns is an ENUM/SET
+// (whose ORDER BY definition order and WHERE member-name comparison
+// order disagree, so key ranges cannot be addressed — see
+// conn.KeyRangeChunkable). It is the structure-side mirror of
+// keyRangeChunkable, used to PREDICT the post-repair mode before the
+// destination has the source's key yet: a structure repair makes the
+// destination take the source's key, so the source's usable key decides
+// whether the repaired table can go row-level or must end on the full
+// load.
+func structKeyRangeAddressable(s *conn.Struct, key []string) bool {
+	fam := make(map[string]string, len(s.Cols))
+	for _, c := range s.Cols {
+		fam[c.Name] = c.Family
+	}
+	for _, k := range key {
+		if fam[k] == conn.FamENUM || fam[k] == conn.FamSET {
+			return false
+		}
+	}
+	return true
 }
 
 // oorPredicate renders the "key strictly outside [min, max]" predicate for
@@ -1788,6 +1822,17 @@ func (r *Runner) convergeAfterDDL(ctx context.Context, table, label string, ap *
 		}
 	}
 	st := &Stats{Table: table, Mode: "FULL"}
+	if !preTruncated && !scope.FullResync {
+		// Scope backstop (defense in depth): the in-place structure ALTER
+		// kept the destination's data, so a full load needs a TRUNCATE —
+		// but the confirmed plan the user saw did not show one (it
+		// predicted ROWLEVEL while the post-repair re-decision came back
+		// FULL). A prediction/decision mismatch must stop the table with
+		// the data untouched, never TRUNCATE out of scope: the operator
+		// re-runs so the new (full) plan is reviewed and confirmed.
+		return fail("%s: table %s — the re-plan after the %s requires the full resync (TRUNCATE), which the confirmed plan did not show; the table was stopped and no TRUNCATE was executed. Re-run so the new plan can be reviewed and confirmed",
+			ErrReplanRequired, table, label)
+	}
 	if !preTruncated {
 		// the in-place structure ALTER kept the destination's data; a
 		// full load re-writes every source row, so the table is wiped
@@ -1970,9 +2015,25 @@ func (r *Runner) planDecision(ctx context.Context, res compare.TableResult) deci
 		// instead of a blind full resync. The apply path re-reads the
 		// metadata after the repair and re-decides from the actual key
 		// state (convergeAfterDDL).
+		//
+		// The key the repaired table will have is the SOURCE's key, so the
+		// prediction must use it — and it must account for RANGE
+		// ADDRESSABILITY: a usable key that is an ENUM/SET column cannot go
+		// row-level (its ORDER BY order and WHERE comparison order
+		// disagree, so key ranges are not addressable; see
+		// conn.KeyRangeChunkable) and ends on the full load instead. The
+		// prediction must match what the apply re-decides, because the
+		// confirmed scope carries the TRUNCATE only when this shows FULL
+		// (a ROWLEVEL prediction carries no full resync in scope).
 		mode := "FULL"
-		if len(r.o.Cmp.Key) > 0 || (srcS != nil && UsableKeyOf(srcS) != nil) {
-			mode = "ROWLEVEL"
+		if srcS != nil {
+			key := UsableKeyOf(srcS)
+			if len(r.o.Cmp.Key) > 0 {
+				key = r.o.Cmp.Key
+			}
+			if key != nil && structKeyRangeAddressable(srcS, key) {
+				mode = "ROWLEVEL"
+			}
 		}
 		d.sp = sp
 		d.ts.Mode, d.ts.Status = mode, "PLANNED"

@@ -79,6 +79,17 @@ func (a *Applier) resync(ctx context.Context, st *Stats, b *Builder, schema *con
 			KeyFamilies: keyFams,
 			ChunkSize:   a.Batch,
 		}
+		// A key whose column is an ENUM/SET is NOT range-addressable (its
+		// ORDER BY order and WHERE comparison order disagree), so a
+		// key-range chunk [min..max] over the source is EMPTY in the WHERE
+		// and would stream zero rows: the full resync would truncate the
+		// destination and reload NOTHING. Stream it as a whole-table
+		// (keyless) chunk instead — order-independent, so no key bounds
+		// are rendered (see conn.KeyRangeAddressable).
+		if ok, _ := conn.KeyRangeAddressable(schema); !ok {
+			p.KeyCols = nil
+			p.KeyFamilies = nil
+		}
 		if err := a.Src.WithControl(ctx, func(q conn.Queryer) error {
 			var err error
 			chunks, err = p.Plan(ctx, q, srcTotal)
