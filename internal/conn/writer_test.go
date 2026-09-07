@@ -10,7 +10,6 @@ package conn
 
 import (
 	"context"
-	"database/sql"
 	"strings"
 	"testing"
 
@@ -29,8 +28,10 @@ func openFakeWriter(t *testing.T, srv *fakeServer) *Writer {
 }
 
 // The replacement scenario: the physical writer connection is killed;
-// the next checkout that actually works must be a NEW physical session
-// that received the guardrails from an empty start.
+// ONE Conn() call must recover (the bounded checkout replaces the dead
+// session internally) and the handed-out session — a NEW physical
+// connection — must have received the time-zone pin plus guardrails
+// from an empty start.
 func TestWriterReappliesGuardrailsOnReplacement(t *testing.T) {
 	srv := &fakeServer{}
 	w := openFakeWriter(t, srv)
@@ -45,39 +46,27 @@ func TestWriterReappliesGuardrailsOnReplacement(t *testing.T) {
 	if first.state["innodb_lock_wait_timeout"] != "5" {
 		t.Fatalf("the first checkout must have set the guardrail, state=%v", first.state)
 	}
+	if first.state["time_zone"] != "+00:00" {
+		t.Fatalf("the first checkout must have pinned the time zone, state=%v", first.state)
+	}
 
 	// the network failure: the physical connection is killed
 	first.kill()
 
-	// the first checkout after the kill may still hand out the dead
-	// connection (the best-effort guardrails cannot detect a dead
-	// socket before the first use); the caller re-acquires, exactly
-	// like the apply path does on a dead writer connection
-	var c2 *sql.Conn
-	for i := 0; ; i++ {
-		cn, err := w.Conn(ctx)
-		if err != nil {
-			t.Fatalf("checkout %d: %v", i, err)
-		}
-		var one int
-		err = cn.QueryRowContext(ctx, "SELECT 1").Scan(&one)
-		if err == nil {
-			c2 = cn
-			break
-		}
-		if !DeadConn(err) || i >= 5 {
-			t.Fatalf("checkout %d: not a dead-connection error: %v", i, err)
-		}
-		cn.Close()
+	// P2-8: one Conn() call is the entire recovery — no caller-side
+	// retry loop (the production apply path relies on exactly this)
+	c2, err := w.Conn(ctx)
+	if err != nil {
+		t.Fatalf("single Conn() call after the KILL must recover on a bounded internal replacement: %v", err)
 	}
 	defer c2.Close()
 	if len(srv.conns) != 2 {
 		t.Fatalf("the pool must have opened a NEW physical writer connection, got %d conns", len(srv.conns))
 	}
 	second := srv.conns[1]
-	if second.state["innodb_lock_wait_timeout"] != "5" || second.state["max_execution_time"] != "300000" ||
-		!strings.Contains(second.state["sql_mode"], "NO_ZERO_DATE") {
-		t.Fatalf("the replacement writer connection was handed out WITHOUT the guardrails: state=%v", second.state)
+	if second.state["time_zone"] != "+00:00" || second.state["innodb_lock_wait_timeout"] != "5" ||
+		second.state["max_execution_time"] != "300000" || !strings.Contains(second.state["sql_mode"], "NO_ZERO_DATE") {
+		t.Fatalf("the replacement writer connection was handed out WITHOUT the policy: state=%v", second.state)
 	}
 }
 
@@ -99,10 +88,11 @@ func TestWriterReappliesGuardrailsOnSamePhysicalCheckout(t *testing.T) {
 		t.Fatalf("the first checkout must have set the guardrail, state=%v", first.state)
 	}
 
-	// an out-of-band reset: the guardrails go back to the server
-	// defaults on the same physical session
+	// an out-of-band reset: the guardrails and the time zone go back
+	// to the server defaults on the same physical session
 	first.state["innodb_lock_wait_timeout"] = "50"
 	first.state["max_execution_time"] = ""
+	first.state["time_zone"] = "+08:00"
 
 	c2, err := w.Conn(ctx) // single-connection pool: the same physical connection
 	if err != nil {
@@ -117,6 +107,9 @@ func TestWriterReappliesGuardrailsOnSamePhysicalCheckout(t *testing.T) {
 	}
 	if first.state["max_execution_time"] != "300000" {
 		t.Fatalf("the second checkout must re-apply the statement timeout, state=%v", first.state)
+	}
+	if first.state["time_zone"] != "+00:00" {
+		t.Fatalf("the second checkout must RE-PIN the time zone (the session-reset defense), state=%v", first.state)
 	}
 }
 
@@ -149,9 +142,9 @@ func TestWriterConnDeadDuringGuardrailReacquires(t *testing.T) {
 		t.Fatalf("the recovery must open a SECOND physical connection, got %d conns", len(srv.conns))
 	}
 	second := srv.conns[1]
-	if second.state["innodb_lock_wait_timeout"] != "5" || second.state["max_execution_time"] != "300000" ||
-		!strings.Contains(second.state["sql_mode"], "NO_ZERO_DATE") {
-		t.Fatalf("the second connection must be handed out WITH the guardrails re-applied: state=%v", second.state)
+	if second.state["time_zone"] != "+00:00" || second.state["innodb_lock_wait_timeout"] != "5" ||
+		second.state["max_execution_time"] != "300000" || !strings.Contains(second.state["sql_mode"], "NO_ZERO_DATE") {
+		t.Fatalf("the second connection must be handed out WITH the policy re-applied: state=%v", second.state)
 	}
 	// and the handed-out connection actually works, on the second
 	// physical session

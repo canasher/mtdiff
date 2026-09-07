@@ -26,15 +26,18 @@ import (
 // dedicated connections are pinned to workers so the session safety policy
 // stays in effect for the whole scan.
 //
-// The policy (applySession) is re-applied on EVERY scan checkout, not
+// The policy (applySession: the +00:00 time-zone pin, the read-only
+// tiers, the guardrails) is re-applied on EVERY scan checkout, not
 // remembered per physical connection. A CONNECTION_ID memo cannot be
 // the identity of a physical session: the server's counter resets
 // across a restart, and a recycled ID on a NEW physical connection
 // must not inherit the old one's "initialized" mark (the new session
 // has no policy in it). applySession is idempotent, so the re-apply
 // costs a handful of cheap SETs per checkout — safety over saved round
-// trips. A connection the policy cannot be applied to is closed and
-// never handed out.
+// trips. A connection the policy cannot be applied to (or that is
+// dead) is closed and never handed out — checkoutChecked bounds the
+// replacements so one AcquireScan/AcquireControl call is the whole
+// recovery.
 type Side struct {
 	Name          string
 	Version       string
@@ -58,6 +61,20 @@ type Side struct {
 // parseTime=true&loc=UTC is mandatory: both sides must interpret
 // timestamps in UTC or TIMESTAMP columns spanning time zones produce
 // false positives.
+//
+// time_zone is pinned to +00:00 for EVERY physical connection, twice:
+// (1) at connect time — the driver's Params map makes it execute
+// "SET time_zone = '+00:00'" before the connection is usable (a failure
+// there fails the connect); (2) on every checkout, by the session
+// policy (applySession / the writer's checkout), which re-verifies and
+// re-applies it. parseTime+loc=UTC alone is NOT a session-timezone pin:
+// a TIMESTAMP column is TEXT-formatted by the server in the SESSION
+// time_zone before the driver ever sees it, so a session left at the
+// server's default zone (which may differ between the two endpoints)
+// shifts every TIMESTAMP by that zone's offset — two rows displaying
+// the same string can be different instants, and equal instants can
+// compare different (P0-2). cfg.Loc=UTC and @@session.time_zone=+00:00
+// are independent; both are required.
 func poolConfig(ep config.Endpoint, maxAllowedPacket, writeTimeoutSec int) *mysql.Config {
 	cfg := mysql.NewConfig()
 	cfg.User = ep.User
@@ -76,6 +93,11 @@ func poolConfig(ep config.Endpoint, maxAllowedPacket, writeTimeoutSec int) *mysq
 	// only way string values with backslashes/quotes stay intact under
 	// NO_BACKSLASH_ESCAPES (P0-3).
 	cfg.InterpolateParams = false
+	// Pin the session time zone on every physical connection at connect
+	// time (the driver's Params map; see the poolConfig doc for why
+	// parseTime+loc=UTC alone is not a pin, and why the checkout policy
+	// re-verifies and re-applies it on top).
+	cfg.Params = map[string]string{"time_zone": "'+00:00'"}
 	if maxAllowedPacket > 0 {
 		cfg.MaxAllowedPacket = maxAllowedPacket
 	}
@@ -210,25 +232,47 @@ func OpenSide(ctx context.Context, name string, ep config.Endpoint, maxAllowedPa
 	}, nil
 }
 
-// applySession enforces the read-only safety net and best-effort guardrails
-// that may not exist on compatible layers. It is idempotent: every statement
-// it runs may be re-executed on the same session without observable effect
-// (the sql_mode flags in particular are appended at most once, see
-// addSQLModeFlags).
+// applySession enforces the session safety policy. It is idempotent:
+// every statement it runs may be re-executed on the same session without
+// observable effect (the sql_mode flags in particular are appended at
+// most once, see addSQLModeFlags).
 //
-// Read-only is enforced two-tier: MySQL proper only has a GLOBAL read_only,
-// so a session SET fails with ER_VARIABLE_IS_READONLY (1229); the fallback is
-// a session default transaction character (READ ONLY), which also covers
-// implicit autocommit statements. TiDB inverts the problem: read_only is
-// GLOBAL-only there as well (1229), and SET SESSION TRANSACTION READ ONLY is
-// a disabled no-op (1235, unless tidb_enable_noop_functions is set), so both
-// tiers fail. By default mtdiff then refuses to continue: a read pool the
-// server cannot keep read-only is not acceptable silently. With
-// allowUnenforcedReadOnly (--allow-unenforced-readonly) it proceeds instead,
-// printing a per-connection warning: mtdiff still only issues SELECTs on
-// these connections, the accepted risk is that the server could not stop
-// other statements from a shared account.
+// The policy is three tiers, in order:
+//
+//  1. the time zone pin (REQUIRED, no fallback): the session time_zone
+//     must be +00:00, or TIMESTAMP values are server-local text and a
+//     pair of endpoints with different default zones compares instants
+//     wrong (P0-2). This is a CORRECTNESS requirement, not a
+//     best-effort one: a session that refuses the pin (or is dead) is
+//     NOT handed out — not even under allowUnenforcedReadOnly, which
+//     relaxes ONLY the read-only tiers below.
+//  2. read-only, enforced two-tier: MySQL proper only has a GLOBAL
+//     read_only, so a session SET fails with ER_VARIABLE_IS_READONLY
+//     (1229); the fallback is a session default transaction character
+//     (READ ONLY), which also covers implicit autocommit statements.
+//     TiDB inverts the problem: read_only is GLOBAL-only there as well
+//     (1229), and SET SESSION TRANSACTION READ ONLY is a disabled no-op
+//     (1235, unless tidb_enable_noop_functions is set), so both tiers
+//     fail. By default mtdiff then refuses to continue: a read pool the
+//     server cannot keep read-only is not acceptable silently. With
+//     allowUnenforcedReadOnly (--allow-unenforced-readonly) it proceeds
+//     instead, printing a per-connection warning: mtdiff still only
+//     issues SELECTs on these connections, the accepted risk is that
+//     the server could not stop other statements from a shared account.
+//  3. the guardrails (see applyGuardrails). Their failure is NOT
+//     ignored (P2-8): applyGuardrails returns an error only when the
+//     session is DEAD (an unsupported variable is a warning inside
+//     guardrail, not an error), and a dead session handed out would
+//     serve its first real query as a bad-connection error. Propagated
+//     so the bounded checkout helper can replace it.
 func applySession(ctx context.Context, c *sql.Conn, allowUnenforced bool) error {
+	if _, err := c.ExecContext(ctx, "SET SESSION time_zone = '+00:00'"); err != nil {
+		// a DEAD session fails this first: the error (sentinel or
+		// "invalid connection" message) is wrapped with %w so the
+		// bounded checkout helper can tell a dead session apart from a
+		// genuine refusal and replace it
+		return fmt.Errorf("cannot pin session time_zone to +00:00 (TIMESTAMP values would be compared in the server's default zone): %w", err)
+	}
 	if _, err := c.ExecContext(ctx, "SET SESSION read_only = ON"); err != nil {
 		if _, err2 := c.ExecContext(ctx, "SET SESSION TRANSACTION READ ONLY"); err2 != nil {
 			if !allowUnenforced {
@@ -242,12 +286,9 @@ func applySession(ctx context.Context, c *sql.Conn, allowUnenforced bool) error 
 			fmt.Fprintf(os.Stderr, "warn: cannot enforce a read-only session on this backend (read_only: %v; transaction read only: %v); continuing per --allow-unenforced-readonly, read connections issue SELECTs only\n", err, err2)
 		}
 	}
-	// and the guardrails on top. The guardrail failure is ignored HERE
-	// (best-effort, see applyGuardrails): a read connection whose
-	// guardrails cannot be applied because the session is DEAD has
-	// already failed the read-only tiers above (a dead socket fails
-	// both SETs), and its checkout is refused there.
-	applyGuardrails(ctx, c)
+	if err := applyGuardrails(ctx, c); err != nil {
+		return fmt.Errorf("apply session guardrails: %w", err)
+	}
 	return nil
 }
 
@@ -259,10 +300,10 @@ func applySession(ctx context.Context, c *sql.Conn, allowUnenforced bool) error 
 // is the best-effort part. A statement that fails because the SESSION
 // is dead (a KILLed socket, a dropped network) is returned so the
 // caller can REPLACE the connection instead of handing out a dead one
-// (see Writer.Conn / connChecked). It is shared by the read-only pools
-// (via applySession, which ignores the result) and the destination
-// write pool (which is intentionally not read-only and acts on the
-// result).
+// (see Writer.Conn / checkoutChecked). It is shared by the read-only
+// pools (via applySession, which PROPAGATES the result — a dead session
+// must be replaced, not handed out) and the destination write pool (the
+// writer's checkout).
 func applyGuardrails(ctx context.Context, c *sql.Conn) error {
 	if err := guardrail(ctx, c, "SET SESSION innodb_lock_wait_timeout = 5"); err != nil {
 		return err
@@ -318,25 +359,75 @@ func addSQLModeFlags(ctx context.Context, c *sql.Conn) error {
 	return guardrail(ctx, c, "SET SESSION sql_mode = '"+strings.ReplaceAll(newMode, "'", "''")+"'")
 }
 
+// checkoutChecked is the ONE bounded checkout/replacement rule for a
+// dedicated pool, shared by the scan pool (AcquireScan), the control
+// pool (AcquireControl) and the destination write pool (Writer's
+// checkout) so the three paths cannot drift:
+//
+//   - the session policy (init) is re-applied on EVERY checkout, not
+//     remembered per physical connection: a CONNECTION_ID memo cannot
+//     be a session's identity (the server's counter resets across a
+//     restart, and a recycled ID on a NEW physical connection must not
+//     inherit the old one's "initialized" mark), and the policy is
+//     idempotent, so the cost is a handful of cheap SETs per checkout;
+//   - a checkout the policy cannot be applied to is closed and NEVER
+//     handed out. If the failure says the SESSION IS DEAD (a KILLed
+//     idle socket, a dropped network), a FRESH checkout is tried
+//     instead, bounded to THREE attempts total (never a loop): the
+//     dead connection is closed, the next checkout re-applies the
+//     full policy from scratch, and only a live, policy-initialized
+//     session is returned. A NON-dead policy failure (a genuine
+//     refusal: the backend will not take the read-only tiers, will
+//     not pin the time zone) is an immediate error — no replacement,
+//     no handout, no warning-and-continue.
+//
+// ONE call to AcquireScan/AcquireControl/Writer.Conn is therefore the
+// ENTIRE dead-connection recovery: callers must not (and cannot usefully)
+// wrap them in "for DeadConn(err) { re-acquire }" retry loops — a failed
+// call has already exhausted its bounded replacements.
+//
+// Why three attempts, not two (the "one replacement" minimum): the real
+// driver reports a KILLed IDLE socket in two phases. The FIRST
+// operation on it (the policy's first SET) returns its plain
+// ErrInvalidConn — the client's write went out, the read got EOF/RST —
+// and database/sql only releases a pinned connection on
+// driver.ErrBadConn, so when the dead connection is closed it goes BACK
+// to the single-slot pool, and the next checkout is the SAME physical
+// connection. Only the driver's NEXT operation on it hits its closed
+// check (driver.ErrBadConn), which is what finally discards it — the
+// third checkout is the first one that is a genuinely NEW physical
+// session. A single replacement would fail exactly in the case this
+// exists for: the pool's only slot was just KILLed.
+func checkoutChecked(ctx context.Context, name string, pool *sql.DB, kind string, init func(context.Context, *sql.Conn) error) (*sql.Conn, error) {
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		c, err := pool.Conn(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("%s: acquire %s connection: %w", name, kind, err)
+		}
+		if err := init(ctx, c); err != nil {
+			// a non-dead failure (a policy REFUSAL) must never
+			// trigger a replacement: close and report
+			if !DeadConn(err) {
+				c.Close()
+				return nil, fmt.Errorf("%s: init %s connection: %w", name, kind, err)
+			}
+			lastErr = err
+			_ = c.Close()
+			continue
+		}
+		return c, nil
+	}
+	return nil, fmt.Errorf("%s: replace dead %s connection (3 dead sessions in a row): %v", name, kind, lastErr)
+}
+
 // AcquireScan returns a dedicated scan connection whose session safety
-// policy (read-only enforcement and guardrails) is in effect. The
-// policy is re-applied on EVERY checkout, not remembered per physical
-// connection: a CONNECTION_ID memo cannot be a session's identity (the
-// server's counter resets across a restart, and a recycled ID on a NEW
-// physical connection must not inherit the old one's initialization),
-// and applySession is idempotent, so the cost is a handful of SETs per
-// checkout. A connection the policy cannot be applied to is closed and
-// NOT handed out. Callers must Close it when done.
+// policy (time-zone pin, read-only enforcement, guardrails) is in
+// effect — see checkoutChecked for the single-call bounded replacement
+// contract. Callers must Close it when done.
 func (s *Side) AcquireScan(ctx context.Context) (*sql.Conn, error) {
-	c, err := s.scan.Conn(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("%s: acquire scan connection: %w", s.Name, err)
-	}
-	if err := applySession(ctx, c, s.allowUnforced); err != nil {
-		c.Close()
-		return nil, fmt.Errorf("%s: init scan connection: %w", s.Name, err)
-	}
-	return c, nil
+	return checkoutChecked(ctx, s.Name, s.scan, "scan",
+		func(ctx context.Context, c *sql.Conn) error { return applySession(ctx, c, s.allowUnforced) })
 }
 
 // DeadConn reports a dead-connection error: the driver's bad-connection
@@ -375,40 +466,19 @@ type Queryer interface {
 }
 
 // AcquireControl returns the control connection with the full session
-// safety policy in effect. Same contract as AcquireScan: the policy is
-// re-applied on EVERY checkout, not remembered per physical connection
-// (a CONNECTION_ID memo cannot be a session's identity — see the Side
-// doc), and a connection the policy cannot be applied to is closed and
-// NOT handed out. Callers must Close it when done.
-//
-// A checkout that comes back DEAD (killed by the server, network loss,
-// a restart — the policy's SETs fail with a bad-connection error) is
-// not a policy refusal: the dead connection is closed, a FRESH one is
-// checked out and the FULL policy re-applied to it before the checkout
-// may be used (fresh connection → policy → query, never the reverse),
-// once. A second dead connection, or a genuine policy refusal on the
-// fresh one, is an error: nothing unguarded is ever handed out.
+// safety policy in effect — the same single-call bounded replacement
+// contract as AcquireScan (see checkoutChecked): a checkout that comes
+// back DEAD (killed by the server, network loss, a restart — the
+// policy's SETs fail with a bad-connection error) is not a policy
+// refusal: the dead connection is closed, a FRESH one is checked out
+// and the FULL policy re-applied to it before the checkout may be used
+// (fresh connection → policy → query, never the reverse), bounded to
+// three attempts; a genuine policy refusal, or three dead sessions in a
+// row, is an error: nothing unguarded is ever handed out. Callers must
+// Close it when done.
 func (s *Side) AcquireControl(ctx context.Context) (*sql.Conn, error) {
-	c, err := s.ctl.Conn(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("%s: acquire control connection: %w", s.Name, err)
-	}
-	if err := applySession(ctx, c, s.allowUnforced); err != nil {
-		if !DeadConn(err) {
-			c.Close()
-			return nil, fmt.Errorf("%s: init control connection: %w", s.Name, err)
-		}
-		_ = c.Close()
-		c, err = s.ctl.Conn(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("%s: replace dead control connection: %w", s.Name, err)
-		}
-		if err := applySession(ctx, c, s.allowUnforced); err != nil {
-			c.Close()
-			return nil, fmt.Errorf("%s: init control connection: %w", s.Name, err)
-		}
-	}
-	return c, nil
+	return checkoutChecked(ctx, s.Name, s.ctl, "control",
+		func(ctx context.Context, c *sql.Conn) error { return applySession(ctx, c, s.allowUnforced) })
 }
 
 // ControlQueryer is a Queryer bound to the control pool: one

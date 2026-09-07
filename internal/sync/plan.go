@@ -86,10 +86,23 @@ type Plan struct {
 // engine replaces whole key groups (delete + insert) instead of updating
 // single rows.
 //
+// keyOrderOK (conn.KeyOrderCompatible) is the ORDERING-semantics half of
+// keysAgree: same key names is not enough, a string key orders by its
+// collation and the families can drift under --no-sync-schema. With the
+// names agreeing but the ordering incompatible, row-level addressing
+// (and the --where filter on top of it) is refused: without --where the
+// table FAILS CLOSED (the message says how to fix it — align the key
+// family/collation, or let the structure sync align it), with --where it
+// is an argument error. The structure-sync pre-step repairs the case it
+// can (it aligns the destination's key type and collation with the
+// source's) and the post-repair prepare sees compatible keys, so this
+// gate fires only for a pair the structure sync did not (and will not)
+// repair.
+//
 // FULL mode is only produced without a --where filter: TRUNCATE is a
 // whole-table operation and cannot honor a filter (a keyless side +
 // --where is an error instead).
-func DecidePlan(res compare.TableResult, srcKeyed, dstKeyed, srcUnique, dstUnique bool, key, where string, keysAgree bool) Plan {
+func DecidePlan(res compare.TableResult, srcKeyed, dstKeyed, srcUnique, dstUnique bool, key, where string, keysAgree, keyOrderOK bool) Plan {
 	p := Plan{Table: res.Name, SrcRows: res.SrcRows, DstRows: res.DstRows}
 	switch res.Status {
 	case "OK":
@@ -115,6 +128,14 @@ func DecidePlan(res compare.TableResult, srcKeyed, dstKeyed, srcUnique, dstUniqu
 			fmt.Sprintf("--where requires the SAME usable key on both sides; the destination's key differs from the source's (%s) — filtered row addressing is impossible", key), true
 		return p
 	}
+	if where != "" && srcKeyed && dstKeyed && keysAgree && !keyOrderOK {
+		// P0-3: the names agree but the ordering semantics do not
+		// (collation/family drift): a filtered row-level sync would
+		// delete destination rows the filter cannot be applied to
+		p.Mode, p.Error, p.ArgErr = ModeError,
+			"--where requires compatible key ordering on both sides (the same key family and, for string keys, the same effective collation); the destination key orders rows differently — refusing a filtered row-level sync", true
+		return p
+	}
 	switch {
 	case !srcKeyed || !dstKeyed:
 		p.Mode, p.Reason = ModeFull, "no usable key on both sides: truncate + full resync"
@@ -125,6 +146,21 @@ func DecidePlan(res compare.TableResult, srcKeyed, dstKeyed, srcUnique, dstUniqu
 		// columns, so row-level addressing is not possible. A full
 		// resync touches no keys on the destination and is safe.
 		p.Mode, p.Reason = ModeFull, fmt.Sprintf("usable keys differ between the sides (source %s): truncate + full resync", key)
+	case srcKeyed && dstKeyed && !keyOrderOK:
+		// P0-3: the key NAMES agree but the ordering semantics do not
+		// (a string key's collation differs — "Z" < "a" on one side,
+		// the reverse on the other — or the families drifted): the
+		// source's min/max and chunk bounds would address the WRONG
+		// destination rows (a wrong out-of-range delete on a parent
+		// cascades to its FK children). Row-level addressing is
+		// forbidden, and the table fails closed instead of silently
+		// choosing a destructive fallback: the message says how to fix
+		// it. (A full resync would be order-independent, but it is a
+		// destructive operation the operator did not ask for on a pair
+		// whose key semantics the tool cannot prove.)
+		p.Mode, p.Error = ModeError,
+			"row-level sync requires identical key ordering semantics on both sides (the same key family and, for string keys, the same effective collation); the destination key orders rows differently and the source's key bounds cannot be used against it — align the key family/collation, or run without --no-sync-schema so the structure sync aligns it"
+		return p
 	default:
 		p.Mode, p.Reason = ModeRowLevel, "row-level sync"
 		for _, cd := range res.DiffChunks {

@@ -80,7 +80,7 @@ func TestRealScanReplacementReinitialized(t *testing.T) {
 	defer side.Close()
 
 	// first checkout: the policy is in effect (guardrail 5, not the
-	// server default 50)
+	// server default 50, and the time zone pinned to +00:00)
 	c1, err := side.AcquireScan(ctx)
 	if err != nil {
 		t.Fatalf("first checkout: %v", err)
@@ -91,6 +91,13 @@ func TestRealScanReplacementReinitialized(t *testing.T) {
 	}
 	if wait != 5 {
 		t.Fatalf("the first checkout must be policy-initialized, innodb_lock_wait_timeout=%d", wait)
+	}
+	var tz string
+	if err := c1.QueryRowContext(ctx, "SELECT @@SESSION.time_zone").Scan(&tz); err != nil {
+		t.Fatalf("time zone: %v", err)
+	}
+	if tz != "+00:00" {
+		t.Fatalf("the first checkout must pin the session time zone, time_zone=%q", tz)
 	}
 	c1.Close()
 
@@ -144,22 +151,16 @@ func TestRealScanReplacementReinitialized(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	// the first checkout may surface the dead connection (its policy
-	// SETs fail; the caller re-acquires, as the plan's dead-connection
-	// path does) or may transparently replace it (the driver's session
-	// reset discards the dead idle connection and database/sql opens a
-	// fresh one). Either way, the handed-out connection must be a NEW
-	// physical session, policy-initialized.
-	var c2 *sql.Conn
-	for i := 0; ; i++ {
-		cn, err := side.AcquireScan(ctx)
-		if err == nil {
-			c2 = cn
-			break
-		}
-		if !DeadConn(err) || i >= 5 {
-			t.Fatalf("checkout after the kill: %v", err)
-		}
+	// P2-8: ONE AcquireScan call is the entire recovery. The checkout
+	// may surface the dead connection (its policy's first SET fails on
+	// it — the driver's two-phase dead report takes up to two
+	// operations on the KILLed socket) and replaces it internally,
+	// bounded to three attempts; no caller-side retry loop. The
+	// handed-out connection must be a NEW physical session,
+	// policy-initialized.
+	c2, err := side.AcquireScan(ctx)
+	if err != nil {
+		t.Fatalf("single AcquireScan call after the KILL must recover (bounded internal replacement): %v", err)
 	}
 	defer c2.Close()
 	// the handed-out connection must NOT be one of the killed ones
@@ -190,6 +191,15 @@ func TestRealScanReplacementReinitialized(t *testing.T) {
 	}
 	if !strings.Contains(mode, "NO_ZERO_DATE") {
 		t.Fatalf("the replacement connection lacks the sql_mode guardrail: %q", mode)
+	}
+	// the replacement's session time zone must be pinned too (P0-2):
+	// a TIMESTAMP value scanned through a session in the server's
+	// default zone would be server-local text
+	if err := c2.QueryRowContext(ctx, "SELECT @@SESSION.time_zone").Scan(&tz); err != nil {
+		t.Fatalf("replacement time zone: %v", err)
+	}
+	if tz != "+00:00" {
+		t.Fatalf("the REPLACEMENT connection must pin the session time zone, time_zone=%q (server default may differ)", tz)
 	}
 }
 
@@ -260,21 +270,14 @@ func TestRealControlReplacementReinitialized(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	// the next control checkout may surface the dead connection (the
-	// policy's SETs fail; AcquireControl swaps in a fresh one and
-	// re-applies the policy) or may be replaced transparently by the
-	// driver. Either way the handed-out connection is a NEW physical
-	// session, policy-initialized.
-	var c2 *sql.Conn
-	for i := 0; ; i++ {
-		cn, err := side.AcquireControl(ctx)
-		if err == nil {
-			c2 = cn
-			break
-		}
-		if !DeadConn(err) || i >= 5 {
-			t.Fatalf("control checkout after the kill: %v", err)
-		}
+	// P2-8: ONE AcquireControl call is the entire recovery — the
+	// bounded checkout replaces the dead session internally (the
+	// driver's two-phase dead report may consume up to two attempts on
+	// the KILLed socket) and hands out a NEW physical session,
+	// policy-initialized. No caller-side retry loop.
+	c2, err := side.AcquireControl(ctx)
+	if err != nil {
+		t.Fatalf("single AcquireControl call after the KILL must recover (bounded internal replacement): %v", err)
 	}
 	defer c2.Close()
 	var newID int64
@@ -298,6 +301,14 @@ func TestRealControlReplacementReinitialized(t *testing.T) {
 	}
 	if !strings.Contains(mode, "NO_ZERO_DATE") {
 		t.Fatalf("the replacement control connection lacks the sql_mode guardrail: %q", mode)
+	}
+	// the replacement's session time zone must be pinned too (P0-2)
+	var tz string
+	if err := c2.QueryRowContext(ctx, "SELECT @@SESSION.time_zone").Scan(&tz); err != nil {
+		t.Fatalf("replacement time zone: %v", err)
+	}
+	if tz != "+00:00" {
+		t.Fatalf("the REPLACEMENT control connection must pin the session time zone, time_zone=%q (server default may differ)", tz)
 	}
 	// read-only state, when the backend exposes it as a session
 	// variable (MySQL proper has no such variable; MariaDB does)
@@ -412,6 +423,14 @@ func TestRealActiveControlKillRecovers(t *testing.T) {
 	if !strings.Contains(mode, "NO_ZERO_DATE") {
 		t.Fatalf("the replacement control session lacks the sql_mode guardrail: %q", mode)
 	}
+	// the recovered session's time zone must be pinned (P0-2)
+	var tz string
+	if err := OneRow(wctx, q, "SELECT @@SESSION.time_zone", []any{&tz}); err != nil {
+		t.Fatalf("time zone after the KILL: %v", err)
+	}
+	if tz != "+00:00" {
+		t.Fatalf("the recovered control session must pin the time zone, time_zone=%q (server default may differ)", tz)
+	}
 	// and a real metadata query runs on the recovered active session
 	if _, err := TableExists(wctx, q, "information_schema"); err != nil {
 		t.Fatalf("metadata query on the recovered active session: %v", err)
@@ -463,6 +482,13 @@ func TestRealWriterReplacementReinitialized(t *testing.T) {
 	if wait != 5 {
 		t.Fatalf("the first checkout must be guardrailed, innodb_lock_wait_timeout=%d", wait)
 	}
+	var tz string
+	if err := c1.QueryRowContext(ctx, "SELECT @@SESSION.time_zone").Scan(&tz); err != nil {
+		t.Fatalf("time zone: %v", err)
+	}
+	if tz != "+00:00" {
+		t.Fatalf("the first checkout must pin the session time zone, time_zone=%q", tz)
+	}
 	c1.Close() // idle in the writer pool
 
 	if _, err := raw.ExecContext(ctx, "KILL "+strconv.FormatInt(writerID, 10)); err != nil {
@@ -481,28 +507,13 @@ func TestRealWriterReplacementReinitialized(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	// the first checkout after the kill may hand out the dead
-	// connection (the best-effort guardrails cannot detect a dead
-	// socket before the first use); the caller re-acquires, exactly
-	// like the apply path does
-	var c2 *sql.Conn
-	for i := 0; ; i++ {
-		cn, err := w.Conn(ctx)
-		if err == nil {
-			var one int
-			if err := cn.QueryRowContext(ctx, "SELECT 1").Scan(&one); err == nil {
-				c2 = cn
-				break
-			}
-			if !DeadConn(err) || i >= 5 {
-				t.Fatalf("checkout after the kill: %v", err)
-			}
-			cn.Close()
-			continue
-		}
-		if !DeadConn(err) || i >= 5 {
-			t.Fatalf("checkout after the kill: %v", err)
-		}
+	// P2-8: ONE Conn() call is the entire recovery — the bounded
+	// checkout (the same rule the apply path uses) replaces the dead
+	// session internally and hands out a live, policy-initialized one.
+	// No caller-side retry loop.
+	c2, err := w.Conn(ctx)
+	if err != nil {
+		t.Fatalf("single Conn() call after the KILL must recover (bounded internal replacement): %v", err)
 	}
 	defer c2.Close()
 	var newID int64
@@ -525,6 +536,15 @@ func TestRealWriterReplacementReinitialized(t *testing.T) {
 	if !strings.Contains(mode, "NO_ZERO_DATE") {
 		t.Fatalf("the replacement writer connection lacks the sql_mode guardrail: %q", mode)
 	}
+	// the replacement's session time zone must be pinned (P0-2): a
+	// TIMESTAMP written through a session in the server's default zone
+	// would be interpreted in that zone
+	if err := c2.QueryRowContext(ctx, "SELECT @@SESSION.time_zone").Scan(&tz); err != nil {
+		t.Fatalf("replacement time zone: %v", err)
+	}
+	if tz != "+00:00" {
+		t.Fatalf("the REPLACEMENT writer connection must pin the session time zone, time_zone=%q (server default may differ)", tz)
+	}
 	// the re-connected writer must still work end to end: a normal
 	// destination transaction
 	if _, err := c2.ExecContext(ctx, "CREATE TABLE t_wkill (id INT PRIMARY KEY, v VARCHAR(8) NOT NULL)"); err != nil {
@@ -543,4 +563,61 @@ func TestRealWriterReplacementReinitialized(t *testing.T) {
 	if n != 1 {
 		t.Fatalf("writer transaction after the replacement saw %d rows, want 1", n)
 	}
+}
+
+// TestRealTimezonePinnedAllSessions is the P0-2 production-path check:
+// every session the tool hands to real work — scan, control and the
+// destination writer — must run with @@SESSION.time_zone='+00:00',
+// regardless of the server's default zone. parseTime+loc=UTC alone does
+// NOT guarantee this (a TIMESTAMP value is text-formatted by the server
+// in the session zone before the driver sees it), so the pin is
+// asserted on the live sessions, not just in the DSN.
+func TestRealTimezonePinnedAllSessions(t *testing.T) {
+	srcDSN := os.Getenv("MTDIFF_E2E_DSN_SRC")
+	dstDSN := os.Getenv("MTDIFF_E2E_DSN_DST")
+	if srcDSN == "" || dstDSN == "" {
+		t.Skip("MTDIFF_E2E_DSN_SRC/DST not set (run via e2e/run_e2e.sh)")
+	}
+	ctx := context.Background()
+
+	check := func(t *testing.T, label string, cn *sql.Conn) {
+		t.Helper()
+		var tz string
+		if err := cn.QueryRowContext(ctx, "SELECT @@SESSION.time_zone").Scan(&tz); err != nil {
+			t.Fatalf("%s: SELECT time_zone: %v", label, err)
+		}
+		if tz != "+00:00" {
+			t.Fatalf("%s: the session time zone must be pinned to +00:00 (the server default zone would shift TIMESTAMP values), time_zone=%q", label, tz)
+		}
+	}
+
+	src, err := OpenSide(ctx, "src", e2eEndpoint(t, srcDSN), 0, 1, false)
+	if err != nil {
+		t.Fatalf("open src: %v", err)
+	}
+	defer src.Close()
+	sc, err := src.AcquireScan(ctx)
+	if err != nil {
+		t.Fatalf("scan checkout: %v", err)
+	}
+	check(t, "src scan", sc)
+	sc.Close()
+	ctl, err := src.AcquireControl(ctx)
+	if err != nil {
+		t.Fatalf("control checkout: %v", err)
+	}
+	check(t, "src control", ctl)
+	ctl.Close()
+
+	w, err := OpenWriter(ctx, "dst", e2eEndpoint(t, dstDSN), 0)
+	if err != nil {
+		t.Fatalf("open writer: %v", err)
+	}
+	defer w.Close()
+	wc, err := w.Conn(ctx)
+	if err != nil {
+		t.Fatalf("writer checkout: %v", err)
+	}
+	check(t, "dst writer", wc)
+	wc.Close()
 }

@@ -177,6 +177,19 @@ func (c *Comparer) compareTable(ctx context.Context, src, dst *conn.Side, name s
 		res.Warnings = append(res.Warnings,
 			fmt.Sprintf("usable keys differ between the sides (src %s vs dst %s): comparing as keyless whole-table multisets",
 				strings.Join(srcSchema.Key, ","), strings.Join(dstSchema.Key, ",")))
+	} else if len(srcSchema.Key) > 0 {
+		// Same key NAMES on both sides, but the ORDERING SEMANTICS may
+		// still differ (P0-3): a string key orders by its collation
+		// ("Z" < "a" in utf8mb4_bin, the reverse in
+		// utf8mb4_general_ci), and under --no-sync-schema the families
+		// can drift too. Source min/max and chunk bounds rendered
+		// against the destination would address the wrong rows. Same
+		// fallback: order-independent whole-table multisets.
+		if ok, why := conn.KeyOrderCompatible(srcSchema, dstSchema); !ok {
+			keyMismatch = true
+			res.Warnings = append(res.Warnings,
+				fmt.Sprintf("key ordering differs between the endpoints (%s): comparing as keyless whole-table multiset", why))
+		}
 	}
 
 	var chunks []chunk.Chunk

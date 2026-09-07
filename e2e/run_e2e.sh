@@ -143,6 +143,36 @@ expect 0 "JSON text equal after --normalize-json" --src "$SRC" --dst "$DST" --ta
 expect 1 "NULL vs empty string" --src "$SRC" --dst "$DST" --tables t_nulltrap
 expect 1 "enum value differs" --src "$SRC" --dst "$DST" --tables t_enumtrap
 
+say "session time zone pin (P0-2)"
+# The servers' DEFAULT zones are made to differ (src +00:00, dst +08:00):
+# a new session starts in the server's zone unless it pins
+# @@session.time_zone itself. The seeded pair displays IDENTICAL text
+# under those default zones while holding DIFFERENT UTC instants — an
+# unpinned session (the pre-fix mtdiff) would report the table identical.
+qdb src srcdb "SET GLOBAL time_zone = '+00:00'"
+qdb dst dstdb "SET GLOBAL time_zone = '+08:00'"
+s=$(qdb src srcdb "SELECT ts FROM t_timestamp_tz")
+d=$(qdb dst dstdb "SELECT ts FROM t_timestamp_tz")
+[ "$s" = "2024-01-01 08:00:00" ] && [ "$d" = "2024-01-01 08:00:00" ] || \
+  { echo "FAIL: false-identical setup broken (src display=$s dst display=$d)"; exit 1; }
+echo "ok: both sides display $s under their default zones"
+u1=$(qdb src srcdb "SELECT UNIX_TIMESTAMP(ts) FROM t_timestamp_tz")
+u2=$(qdb dst dstdb "SELECT UNIX_TIMESTAMP(ts) FROM t_timestamp_tz")
+[ "$u1" != "$u2" ] || { echo "FAIL: the instants must differ ($u1)"; exit 1; }
+echo "ok: the instants differ (src=$u1 dst=$u2)"
+expect 1 "cross-timezone TIMESTAMP: same display, different instants" --src "$SRC" --dst "$DST" --tables t_timestamp_tz
+# the SAME instant under different default zones still compares equal
+expect 0 "same instant across different default zones (tz_ts)" --src "$SRC" --dst "$DST" --tables tz_ts
+# the sync must converge the INSTANT, not the display string
+expect 1 "tz: sync dry-run plans the difference" sync --src "$SRC" --dst "$DST" --tables t_timestamp_tz
+expect 0 "tz: sync --apply converges the instant" sync --src "$SRC" --dst "$DST" --tables t_timestamp_tz --apply --yes
+u1=$(qdb src srcdb "SELECT UNIX_TIMESTAMP(ts) FROM t_timestamp_tz")
+u2=$(qdb dst dstdb "SELECT UNIX_TIMESTAMP(ts) FROM t_timestamp_tz")
+[ "$u1" = "$u2" ] || { echo "FAIL: post-sync instants differ (src=$u1 dst=$u2)"; exit 1; }
+echo "ok: post-sync instants agree ($u1)"
+# restore the original default zone for the remaining scenarios
+qdb dst dstdb "SET GLOBAL time_zone = '+00:00'"
+
 say "P1 review regressions"
 # t_chunk spans id 1..90001; at --chunk-size 10000 the span is divisible by
 # the chunk count, the shape where the old intBoundaries off-by-one skipped
@@ -166,6 +196,79 @@ expect 1 "nullable-unique-key: NULL row changed" --src "$SRC" --dst "$DST" --tab
 expect 0 "identical fractional-second table" --src "$SRC" --dst "$DST" --tables t_fracsec
 sql dst dstdb m_fracsec_change.sql
 expect 1 "fractional seconds: 0.1 vs 0.01 differ" --src "$SRC" --dst "$DST" --tables t_fracsec
+
+say "round-8 value regressions"
+# P0-1: >64KiB BLOB payloads. The old 2-byte canonical length truncated
+# modulo 65536 and could collide distinct rows; both the default and
+# --secure hash modes must report the divergence.
+expect 1 "large BLOB: >64KiB divergence (default hash)" --src "$SRC" --dst "$DST" --tables t_bigblob
+expect 1 "large BLOB: >64KiB divergence (--secure)" --src "$SRC" --dst "$DST" --tables t_bigblob --secure
+expect 0 "large BLOB: 1MiB identical table" --src "$SRC" --dst "$DST" --tables t_bigblob_ok
+# P0-4: large-magnitude finite floats at a small tolerance. The old
+# quantizer saturated 1e10/2e10 to +Inf and would report them identical.
+expect 1 "large floats: 1e10 vs 2e10 at --tolerance 1e-9" --src "$SRC" --dst "$DST" --tables t_float_big2 --tolerance 1e-9
+# P1-5: MySQL TIME in the driver's actual text types (negative + fractional)
+expect 0 "TIME: identical incl. negative and fractional" --src "$SRC" --dst "$DST" --tables t_time
+sql dst dstdb m_time_change.sql
+expect 1 "TIME: negative value changed" --src "$SRC" --dst "$DST" --tables t_time
+expect 0 "TIME: sync --apply converges" sync --src "$SRC" --dst "$DST" --tables t_time --apply --yes
+# CAST both operands: TIMESTAMPDIFF with a string-literal operand returns
+# NULL (not the difference) for negative results on MySQL 8
+v=$(qdst "SELECT TIMESTAMPDIFF(MICROSECOND, CAST('00:00:00' AS TIME), CAST(v AS TIME)) FROM t_time WHERE id = 3")
+[ "$v" = "-3723000000" ] || { echo "FAIL: converged TIME value (id=3) = $v, want -3723000000"; exit 1; }
+echo "ok: converged TIME value is the negative seed value"
+# P1-6: cross-family numerics — INT 1 vs BIGINT UNSIGNED 1 compare equal
+# (non-strict, announced); strict types reject the pair outright.
+expect 0 "cross-family numeric: INT vs BIGINT UNSIGNED 1 (non-strict)" --src "$SRC" --dst "$DST" --tables t_numfam
+if ! grep -q "numeric types differ" "$OUT"; then
+  echo "FAIL: the cross-family comparison must announce the normalization"; cat "$OUT"; exit 1
+fi
+echo "ok: cross-family normalization announced"
+expect 2 "cross-family numeric rejected by --strict-types" --src "$SRC" --dst "$DST" --tables t_numfam --strict-types
+# P1-7: JSON numbers beyond 2^53 stay distinct under --normalize-json
+# (MySQL stores both exactly; a float64 round trip would merge them)
+expect 1 "JSON: 9007199254740992 vs ...93 under --normalize-json" --src "$SRC" --dst "$DST" --tables t_jsonbig --normalize-json
+expect 0 "JSON: 1 vs 1.0 equal under --normalize-json" --src "$SRC" --dst "$DST" --tables t_jsonbig_ok --normalize-json
+expect 1 "JSON: 1 vs 1.0 differ raw (no --normalize-json)" --src "$SRC" --dst "$DST" --tables t_jsonbig_ok
+# P0-3: a string key with different collations orders rows differently.
+# Identical data still compares equal — via the announced keyless
+# whole-table multiset fallback, never via shared key bounds.
+expect 0 "cross-collation key: identical data via keyless fallback" --src "$SRC" --dst "$DST" --tables t_keycoll
+if ! grep -q "key ordering differs" "$OUT"; then
+  echo "FAIL: the key-ordering fallback must be announced"; cat "$OUT"; exit 1
+fi
+echo "ok: key-ordering fallback announced"
+# ...and a DIFFERENT pair must not get row-level addressing: with
+# --no-sync-schema (no alignment) the table fails closed, the dry run
+# and the apply alike — and the apply writes NOTHING (the FK child's
+# row count proves no wrong out-of-range delete cascaded).
+expect 2 "cross-collation key: --no-sync-schema refuses row-level (dry-run)" sync --src "$SRC" --dst "$DST" --tables t_keyfk --no-sync-schema
+if ! grep -q "key ordering" "$OUT"; then
+  echo "FAIL: the refusal must name the key-ordering cause"; cat "$OUT"; exit 1
+fi
+echo "ok: the refusal names the key-ordering cause"
+expect 2 "cross-collation key: --no-sync-schema --apply writes nothing" sync --src "$SRC" --dst "$DST" --tables t_keyfk --no-sync-schema --apply --yes
+n=$(qdst "SELECT COUNT(*) FROM t_keyfk")
+[ "$n" = "2" ] || { echo "FAIL: the refused apply wrote to the parent (count=$n, want 2)"; exit 1; }
+v=$(qdst "SELECT v FROM t_keyfk WHERE k = 'a'")
+[ "$v" = "99" ] || { echo "FAIL: the refused apply must leave the data untouched (v=$v, want the drifted 99)"; exit 1; }
+n=$(qdst "SELECT COUNT(*) FROM t_keyfk_child")
+[ "$n" = "2" ] || { echo "FAIL: the refused apply cascaded to the FK child (count=$n, want 2)"; exit 1; }
+echo "ok: the refused apply left the parent and the FK child untouched"
+expect 3 "cross-collation key: --no-sync-schema --where is an argument error" sync --src "$SRC" --dst "$DST" --tables t_keyfk --no-sync-schema --where "v >= 0"
+# With the structure sync (the default) the drift is REPAIRED instead:
+# the destination's key collation is aligned with the source's, after
+# which the (identical) data is row-level safe.
+expect 1 "cross-collation key: default sync plans the collation DDL" sync --src "$SRC" --dst "$DST" --tables t_keycoll
+if ! grep -q "COLLATE utf8mb4_bin" "$OUT"; then
+  echo "FAIL: the structure plan must align the key collation"; cat "$OUT"; exit 1
+fi
+echo "ok: the structure plan aligns the key collation"
+expect 0 "cross-collation key: default sync --apply" sync --src "$SRC" --dst "$DST" --tables t_keycoll --apply --yes
+col=$(qdst "SELECT COLLATION_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='dstdb' AND TABLE_NAME='t_keycoll' AND COLUMN_NAME='k'")
+[ "$col" = "utf8mb4_bin" ] || { echo "FAIL: dst key collation after sync: $col, want utf8mb4_bin"; exit 1; }
+echo "ok: dst key collation aligned"
+expect 0 "cross-collation key: diff identical after the alignment" --src "$SRC" --dst "$DST" --tables t_keycoll
 
 say "where / mutations on t_mut"
 sql dst dstdb m_where.sql
@@ -582,8 +685,8 @@ elif [ -x /home/liukl/sdk/go/bin/go ]; then
 fi
 if [ -n "$GOCMD" ]; then
   if MTDIFF_E2E_DSN_SRC="$SRC2" MTDIFF_E2E_DSN_DST="$DST2" \
-    "$GOCMD" test -count=1 -timeout 10m -run 'TestDropRaceRealMySQL|TestScopeEscalationRealMySQL|TestUniqueHolderParallelOneDoesNotDeadlock|TestRealWriterKillReconnectApplyPath|TestRealScanReplacementReinitialized|TestRealControlReplacementReinitialized|TestRealActiveControlKillRecovers|TestRealWriterReplacementReinitialized' ./internal/sync/ ./internal/conn/; then
-    echo "ok: real-MySQL destructive re-gates + parallel=1 holder liveness + connection-replacement policy (drop TOCTOU re-check, scope escalation refusal, pinned-connection holder check, scan/control/writer replacement re-initialization, active-session KILL recovery, writer KILL recovery through the production apply path)"
+    "$GOCMD" test -count=1 -timeout 10m -run 'TestDropRaceRealMySQL|TestScopeEscalationRealMySQL|TestUniqueHolderParallelOneDoesNotDeadlock|TestRealWriterKillReconnectApplyPath|TestRealScanReplacementReinitialized|TestRealControlReplacementReinitialized|TestRealActiveControlKillRecovers|TestRealWriterReplacementReinitialized|TestRealTimezonePinnedAllSessions' ./internal/sync/ ./internal/conn/; then
+    echo "ok: real-MySQL destructive re-gates + parallel=1 holder liveness + connection-replacement policy (drop TOCTOU re-check, scope escalation refusal, pinned-connection holder check, scan/control/writer replacement re-initialization, active-session KILL recovery, writer KILL recovery through the production apply path, single-call KILL recovery, session time-zone pin on every pool)"
   else
     echo "FAIL: real-MySQL re-gate / parallel=1 regression"; exit 1
   fi

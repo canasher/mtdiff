@@ -56,6 +56,10 @@ type fakeServer struct {
 	conns    []*fakeConn
 	fixedID  int64 // the id EVERY physical connection reports
 	refuseRO bool  // reject BOTH read-only tiers (the session is not read-only)
+	// refuseTZ rejects the time-zone pin (the session stays in the
+	// server's default zone). Unlike the read-only tiers this has NO
+	// --allow-unenforced escape: the pin is a correctness requirement
+	refuseTZ bool
 	// killErr is what operations on a KILLED connection return
 	// (default: driver.ErrBadConn, which database/sql auto-releases;
 	// a test may set the driver's plain ErrInvalidConn, which it does
@@ -146,6 +150,11 @@ func (c *fakeConn) ExecContext(ctx context.Context, query string, args []driver.
 	}
 	u := strings.ToUpper(strings.TrimSpace(query))
 	switch {
+	case u == "SET SESSION TIME_ZONE = '+00:00'":
+		if c.srv.refuseTZ {
+			return nil, errors.New("fake: time_zone pin refused (session stays in the server default zone)")
+		}
+		c.setLocked("time_zone", "+00:00")
 	case u == "SET SESSION READ_ONLY = ON":
 		// MySQL proper: read_only is GLOBAL-only; the session SET fails
 		return nil, errors.New("fake: ER_VARIABLE_IS_READONLY (read_only)")
@@ -183,6 +192,8 @@ func (c *fakeConn) QueryContext(ctx context.Context, query string, args []driver
 		return &fakeRows{vals: []driver.Value{"8.0.99-fake"}}, nil
 	case "SELECT @@SESSION.SQL_MODE":
 		return &fakeRows{vals: []driver.Value{c.state["sql_mode"]}}, nil
+	case "SELECT @@SESSION.TIME_ZONE":
+		return &fakeRows{vals: []driver.Value{c.state["time_zone"]}}, nil
 	}
 	return nil, errors.New("fake: unexpected query " + query)
 }
@@ -285,19 +296,13 @@ func TestAcquireScanReappliesPolicyOnRecycledID(t *testing.T) {
 	// open a NEW one, which reports the SAME connection id
 	first.kill()
 
-	// the first checkout may still hand out the dead connection (the
-	// policy's first statement fails on it) — the caller re-acquires,
-	// exactly like the plan's dead-connection path
-	_, err = side.AcquireScan(ctx)
-	if err == nil {
-		// even the lucky handout must have been policy-checked:
-		// a dead connection cannot be one
-		t.Fatal("a checkout of the killed connection must fail (its policy SETs cannot run)")
-	}
-
+	// P2-8: ONE AcquireScan call is the entire recovery — the bounded
+	// checkout replaces the dead session internally (a dead socket
+	// fails the policy's first SET) and hands out the fresh physical
+	// connection with the full policy; no caller-side retry loop
 	c2, err := side.AcquireScan(ctx)
 	if err != nil {
-		t.Fatalf("re-acquire after the restart: %v", err)
+		t.Fatalf("single AcquireScan call after the KILL must recover on a bounded internal replacement: %v", err)
 	}
 	defer c2.Close()
 	if len(srv.conns) != 3 {
@@ -305,8 +310,8 @@ func TestAcquireScanReappliesPolicyOnRecycledID(t *testing.T) {
 	}
 	second := srv.conns[2]
 	// the fresh session started with NO policy in it
-	if second.state["innodb_lock_wait_timeout"] != "5" || second.state["txn_read_only"] != "1" ||
-		!strings.Contains(second.state["sql_mode"], "NO_ZERO_DATE") {
+	if second.state["time_zone"] != "+00:00" || second.state["innodb_lock_wait_timeout"] != "5" ||
+		second.state["txn_read_only"] != "1" || !strings.Contains(second.state["sql_mode"], "NO_ZERO_DATE") {
 		t.Fatalf("the recycled-ID connection was handed out WITHOUT the policy: state=%v", second.state)
 	}
 	if second.connID() != first.connID() {
@@ -332,11 +337,16 @@ func TestAcquireScanReappliesPolicyOnEveryCheckout(t *testing.T) {
 	if first.state["innodb_lock_wait_timeout"] != "5" {
 		t.Fatalf("the first checkout must have set the guardrail, state=%v", first.state)
 	}
+	if first.state["time_zone"] != "+00:00" {
+		t.Fatalf("the first checkout must have pinned the time zone, state=%v", first.state)
+	}
 
-	// an out-of-band reset: the guardrail goes back to the server
-	// default on the same physical session
+	// an out-of-band reset: the guardrail, the read-only tier and the
+	// time zone go back to the server defaults on the same physical
+	// session
 	first.state["innodb_lock_wait_timeout"] = "50"
 	first.state["txn_read_only"] = ""
+	first.state["time_zone"] = "+08:00"
 
 	c2, err := side.AcquireScan(ctx) // pool of one: the same physical connection
 	if err != nil {
@@ -351,6 +361,9 @@ func TestAcquireScanReappliesPolicyOnEveryCheckout(t *testing.T) {
 	}
 	if first.state["txn_read_only"] != "1" {
 		t.Fatalf("the second checkout must re-apply the read-only tier, state=%v", first.state)
+	}
+	if first.state["time_zone"] != "+00:00" {
+		t.Fatalf("the second checkout must RE-PIN the time zone (the session-reset defense), state=%v", first.state)
 	}
 }
 
@@ -378,5 +391,47 @@ func TestAcquireScanRefusesWhenPolicyCannotBeApplied(t *testing.T) {
 	// checkout opens a fresh one, which also fails the policy
 	if _, err := side.AcquireScan(ctx); err == nil {
 		t.Fatal("the replacement connection must fail the policy too (refuseRO is still on)")
+	}
+}
+
+// P0-2: the time-zone pin is a CORRECTNESS requirement and has no
+// --allow-unenforced escape. Even a side opened with
+// allowUnenforcedReadOnly=true (the read-only tiers are only warnings
+// there) must NOT hand out a session whose time_zone the backend
+// refuses to pin: a TIMESTAMP value would then be server-local text and
+// a cross-timezone endpoint pair would compare instants wrong.
+func TestAcquireScanRefusesTimezonePin(t *testing.T) {
+	srv := &fakeServer{fixedID: 7}
+	useFakeDB(t, srv)
+	side, err := OpenSide(context.Background(), "src", fakeEndpoint(), 0, 1, true)
+	if err != nil {
+		t.Fatalf("open side (allowUnenforced): %v", err)
+	}
+	t.Cleanup(func() { side.Close() })
+	ctx := context.Background()
+
+	// a normal checkout pins the zone (and, with allowUnenforced on,
+	// the read-only tiers are only warnings, not refusals)
+	c1, err := side.AcquireScan(ctx)
+	if err != nil {
+		t.Fatalf("checkout with the pin working: %v", err)
+	}
+	c1.Close()
+	if srv.conns[1].state["time_zone"] != "+00:00" {
+		t.Fatalf("the checkout must pin the time zone, state=%v", srv.conns[1].state)
+	}
+
+	// from here on the backend refuses the time-zone pin
+	srv.refuseTZ = true
+	if _, err := side.AcquireScan(ctx); err == nil {
+		t.Fatal("a session whose time_zone cannot be pinned must NOT be handed out (no --allow-unenforced escape for the pin)")
+	}
+	if _, err := side.AcquireControl(ctx); err == nil {
+		t.Fatal("the control checkout must refuse the unpinnable session too")
+	}
+	// the refusal is NOT a dead connection: no replacement spin — the
+	// same live connection keeps failing the policy on every checkout
+	if _, err := side.AcquireScan(ctx); err == nil {
+		t.Fatal("every checkout of the unpinnable connection must be refused (refuseTZ is still on)")
 	}
 }

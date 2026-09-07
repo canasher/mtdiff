@@ -57,8 +57,8 @@ func TestControlReappliesPolicyOnRecycledID(t *testing.T) {
 		t.Fatalf("the pool must have opened a NEW physical control connection, got %d conns", len(srv.conns))
 	}
 	second := srv.conns[2]
-	if second.state["innodb_lock_wait_timeout"] != "5" || second.state["txn_read_only"] != "1" ||
-		!strings.Contains(second.state["sql_mode"], "NO_ZERO_DATE") {
+	if second.state["time_zone"] != "+00:00" || second.state["innodb_lock_wait_timeout"] != "5" ||
+		second.state["txn_read_only"] != "1" || !strings.Contains(second.state["sql_mode"], "NO_ZERO_DATE") {
 		t.Fatalf("the recycled-ID control connection was handed out WITHOUT the policy: state=%v", second.state)
 	}
 	if second.connID() != first.connID() {
@@ -98,10 +98,12 @@ func TestControlReappliesPolicyOnSamePhysicalCheckout(t *testing.T) {
 		t.Fatalf("the first checkout must have set the guardrail, state=%v", first.state)
 	}
 
-	// an out-of-band reset: the guardrail and the read-only tier go
-	// back to the server defaults on the same physical session
+	// an out-of-band reset: the guardrail, the read-only tier and the
+	// time zone go back to the server defaults on the same physical
+	// session
 	first.state["innodb_lock_wait_timeout"] = "50"
 	first.state["txn_read_only"] = ""
+	first.state["time_zone"] = "+08:00"
 
 	q2, err := side.Control(ctx) // single-connection pool: the same physical connection
 	if err != nil {
@@ -116,6 +118,9 @@ func TestControlReappliesPolicyOnSamePhysicalCheckout(t *testing.T) {
 	}
 	if first.state["txn_read_only"] != "1" {
 		t.Fatalf("the second checkout must re-apply the read-only tier, state=%v", first.state)
+	}
+	if first.state["time_zone"] != "+00:00" {
+		t.Fatalf("the second checkout must RE-PIN the time zone (the session-reset defense), state=%v", first.state)
 	}
 }
 

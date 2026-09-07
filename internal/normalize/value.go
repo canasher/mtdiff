@@ -25,11 +25,26 @@ func (n *Normalizer) encodeValue(c conn.Column, v driver.Value) ([]byte, error) 
 		}
 		return strconv.AppendInt(nil, i, 10), nil
 	case conn.FamUINT:
-		u, ok := v.(uint64)
-		if !ok {
+		// The driver delivers a 64-bit UNSIGNED value in THREE shapes
+		// depending on the protocol path: the text protocol yields
+		// uint64; the binary protocol yields int64 while the value still
+		// fits the signed range (<= math.MaxInt64) and a decimal STRING
+		// beyond it (the driver renders those instead of fitting them).
+		// All three are the same value; rendering is decimal text either
+		// way, so cross-family numeric equality (tagNUMERIC) holds.
+		switch u := v.(type) {
+		case int64:
+			return strconv.AppendInt(nil, u, 10), nil
+		case uint64:
+			return strconv.AppendUint(nil, u, 10), nil
+		case string:
+			if !isDecimalUint(u) {
+				return nil, fmt.Errorf("expected uint64, got %T", v)
+			}
+			return []byte(u), nil
+		default:
 			return nil, fmt.Errorf("expected uint64, got %T", v)
 		}
-		return strconv.AppendUint(nil, u, 10), nil
 	case conn.FamDECIMAL:
 		s, ok := asString(v)
 		if !ok {
@@ -68,11 +83,29 @@ func (n *Normalizer) encodeValue(c conn.Column, v driver.Value) ([]byte, error) 
 		}
 		return []byte(t.Format("2006-01-02")), nil
 	case conn.FamTIME:
-		d, ok := v.(time.Duration)
-		if !ok {
-			return nil, fmt.Errorf("expected time.Duration, got %T", v)
+		// The driver delivers a MySQL TIME column as the TEXT grammar
+		// [-]HHH:MM:SS[.ffffff] — a string on the binary protocol, []byte
+		// on the text protocol (it has no time.Time equivalent, so there
+		// is no time.Duration path in production); a duration is accepted
+		// for tests and direct use.
+		switch t := v.(type) {
+		case time.Duration:
+			return []byte(formatMySQLTime(t)), nil
+		case string:
+			d, err := parseMySQLTime(t)
+			if err != nil {
+				return nil, err
+			}
+			return []byte(formatMySQLTime(d)), nil
+		case []byte:
+			d, err := parseMySQLTime(string(t))
+			if err != nil {
+				return nil, err
+			}
+			return []byte(formatMySQLTime(d)), nil
+		default:
+			return nil, fmt.Errorf("expected MySQL TIME text (string/[]byte) or time.Duration, got %T", v)
 		}
-		return []byte(formatMySQLTime(d)), nil
 	case conn.FamDATETIME, conn.FamTIMESTAMP:
 		t, ok := v.(time.Time)
 		if !ok {
@@ -164,24 +197,81 @@ func toleranceRefused(tol float64) error {
 // a finite positive value. A non-finite tol must NOT reach this function:
 // with tol=+Inf it would quantize every distinct value to 0*Inf = NaN and
 // render them all identically.
+//
+// Large-magnitude quantization is exact-or-keep, never saturating: the
+// quantized cell N*tol can OVERFLOW float64 (a value of 1e300 against a
+// tolerance of 1e10), and the old code replaced such values with a
+// Copysign(Inf) sentinel — two distinct LEGITIMATE values (1e10 and 2e10
+// at tolerance 1e-9) both rendered "+Inf" and compared equal: a silent
+// false identical on ordinary finite data. A value whose cell cannot be
+// represented stays at its exact (bit-distinguishing) rendering instead:
+// keeping the exact value can only make MORE values compare different,
+// never fewer — the conservative direction.
 func formatFloat(v, tol float64, prec int) string {
 	if math.IsNaN(v) {
 		return "NaN" // MySQL has no NaN; defensive only
 	}
 	if tol > 0 {
 		q := v / tol
-		if !math.IsInf(q, 0) && math.Abs(q) < 9.2e18 {
-			n64 := int64(math.Round(q))
-			v = float64(n64) * tol
-		} else {
-			// Beyond the representable grid: saturate by sign.
-			v = math.Copysign(math.Inf(1), v)
+		if !math.IsInf(q, 0) && !math.IsNaN(q) {
+			cand := math.Round(q) * tol
+			if !math.IsInf(cand, 0) && !math.IsNaN(cand) {
+				v = cand
+			}
+			// the grid overflows float64 at this magnitude: keep v exact
 		}
 	}
 	if v == 0 {
 		v = 0 // normalize -0
 	}
 	return strconv.FormatFloat(v, 'g', -1, prec)
+}
+
+// parseMySQLTime parses MySQL's TIME text grammar [-]HHH:MM:SS[.ffffff] —
+// what the driver returns for a TIME column (string/[]byte, never a Go
+// duration) — into a duration. The hour field has 1-3 digits (MySQL's range
+// is -838:59:59.999999..838:59:59.999999), minutes and seconds two; the
+// fractional part has 1-6 digits (padded right to microseconds).
+func parseMySQLTime(s string) (time.Duration, error) {
+	neg := strings.HasPrefix(s, "-")
+	if neg {
+		s = s[1:]
+	}
+	var intPart, frac string
+	if i := strings.IndexByte(s, '.'); i >= 0 {
+		intPart, frac = s[:i], s[i+1:]
+		if len(frac) == 0 || len(frac) > 6 {
+			return 0, fmt.Errorf("invalid MySQL TIME value %q: fraction must have 1-6 digits", s)
+		}
+	} else {
+		intPart = s
+	}
+	parts := strings.Split(intPart, ":")
+	if len(parts) != 3 || len(parts[0]) < 1 || len(parts[0]) > 3 ||
+		len(parts[1]) != 2 || len(parts[2]) != 2 {
+		return 0, fmt.Errorf("invalid MySQL TIME value %q: want [-]HHH:MM:SS[.ffffff]", s)
+	}
+	for _, r := range parts[0] + parts[1] + parts[2] + frac {
+		if r < '0' || r > '9' {
+			return 0, fmt.Errorf("invalid MySQL TIME value %q", s)
+		}
+	}
+	h, _ := strconv.Atoi(parts[0])
+	m, _ := strconv.Atoi(parts[1])
+	sec, _ := strconv.Atoi(parts[2])
+	if m > 59 || sec > 59 {
+		return 0, fmt.Errorf("invalid MySQL TIME value %q: minute/second out of range", s)
+	}
+	d := (time.Duration(h)*time.Hour + time.Duration(m)*time.Minute + time.Duration(sec)*time.Second)
+	if frac != "" {
+		f := frac + strings.Repeat("0", 6-len(frac))
+		fv, _ := strconv.Atoi(f)
+		d += time.Duration(fv) * time.Microsecond
+	}
+	if neg {
+		d = -d
+	}
+	return d, nil
 }
 
 // formatMySQLTime renders MySQL TIME (a duration) as H:MM:SS[.f], matching
@@ -243,6 +333,21 @@ func formatBit(b []byte) []byte {
 		return []byte(s)
 	}
 	return []byte("0")
+}
+
+// isDecimalUint reports whether s is a plain unsigned decimal integer
+// (the driver's rendering of a BIGINT UNSIGNED value beyond
+// math.MaxInt64: digits only, no sign, no separators).
+func isDecimalUint(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func asString(v driver.Value) (string, bool) {

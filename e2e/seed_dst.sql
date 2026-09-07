@@ -67,3 +67,68 @@ INSERT INTO t_enum VALUES (1, 'a'), (2, 'b');
 DROP TABLE IF EXISTS t_enumtrap;
 CREATE TABLE t_enumtrap (id INT PRIMARY KEY, e ENUM('a','b'));
 INSERT INTO t_enumtrap VALUES (1, 'b');
+
+-- Round-8 seeds (dst variants).
+
+-- identical TIME data
+DROP TABLE IF EXISTS t_time;
+CREATE TABLE t_time (id INT PRIMARY KEY, v TIME(6));
+INSERT INTO t_time VALUES
+  (1, '00:00:00'), (2, '01:02:03'), (3, '-01:02:03'), (4, '838:59:59'),
+  (5, '-838:59:59'), (6, '00:00:00.1'), (7, '00:00:00.01'),
+  (8, '00:00:00.000001');
+
+-- BIGINT UNSIGNED where the src declares INT (cross-family numeric)
+DROP TABLE IF EXISTS t_numfam;
+CREATE TABLE t_numfam (id INT PRIMARY KEY, v BIGINT UNSIGNED);
+INSERT INTO t_numfam VALUES (1, 1);
+
+-- row 1 diverges: 2e10 vs 1e10 (within no sane tolerance of each other)
+DROP TABLE IF EXISTS t_float_big2;
+CREATE TABLE t_float_big2 (id INT PRIMARY KEY, f DOUBLE);
+INSERT INTO t_float_big2 VALUES (1, 2e10), (2, 1e12);
+
+-- 9007199254740993: beyond 2^53, stored exactly by MySQL
+DROP TABLE IF EXISTS t_jsonbig;
+CREATE TABLE t_jsonbig (id INT PRIMARY KEY, j JSON);
+INSERT INTO t_jsonbig VALUES (1, '{"n":9007199254740993}');
+-- the double 1.0 where the src holds the integer 1: equal only after
+-- normalization
+DROP TABLE IF EXISTS t_jsonbig_ok;
+CREATE TABLE t_jsonbig_ok (id INT PRIMARY KEY, j JSON);
+INSERT INTO t_jsonbig_ok VALUES (1, '{"a":1.0}');
+
+-- row 1's b payload differs in length and content; row 2 (1MiB) identical
+DROP TABLE IF EXISTS t_bigblob;
+CREATE TABLE t_bigblob (id INT PRIMARY KEY, a LONGBLOB, b LONGBLOB);
+INSERT INTO t_bigblob VALUES
+  (1, REPEAT(0x41, 65536), REPEAT(0x42, 65537)),
+  (2, REPEAT(0x43, 1048576), REPEAT(0x44, 1048576));
+DROP TABLE IF EXISTS t_bigblob_ok;
+CREATE TABLE t_bigblob_ok (id INT PRIMARY KEY, a LONGBLOB);
+INSERT INTO t_bigblob_ok VALUES (1, REPEAT(0x45, 1048576));
+
+-- the default (case-insensitive) collation where the src is utf8mb4_bin;
+-- identical data, so the only difference is the key's ordering semantics
+DROP TABLE IF EXISTS t_keycoll;
+CREATE TABLE t_keycoll (k VARCHAR(16) COLLATE utf8mb4_general_ci PRIMARY KEY, v INT);
+INSERT INTO t_keycoll VALUES ('Z', 1), ('a', 2);
+
+-- the parent's data DIFFERS (the 'a' row); the child is identical
+DROP TABLE IF EXISTS t_keyfk_child;
+DROP TABLE IF EXISTS t_keyfk;
+CREATE TABLE t_keyfk (k VARCHAR(16) COLLATE utf8mb4_general_ci PRIMARY KEY, v INT);
+INSERT INTO t_keyfk VALUES ('Z', 1), ('a', 99);
+CREATE TABLE t_keyfk_child (k VARCHAR(16) COLLATE utf8mb4_general_ci NOT NULL,
+  c INT PRIMARY KEY,
+  CONSTRAINT fk_kfc FOREIGN KEY (k) REFERENCES t_keyfk (k) ON DELETE CASCADE);
+INSERT INTO t_keyfk_child VALUES ('Z', 100), ('a', 200);
+
+-- the literal 08:00 under +08:00 is the 00:00 UTC instant: a DIFFERENT
+-- instant from the src's 08:00 UTC, displaying identically under the two
+-- servers' default zones
+DROP TABLE IF EXISTS t_timestamp_tz;
+CREATE TABLE t_timestamp_tz (id INT PRIMARY KEY, ts TIMESTAMP);
+SET time_zone = '+08:00';
+INSERT INTO t_timestamp_tz VALUES (1, '2024-01-01 08:00:00');
+SET time_zone = '+00:00';

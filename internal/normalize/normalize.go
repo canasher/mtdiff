@@ -4,29 +4,47 @@
 //
 // Encoding: each column is encoded as TLV:
 //
-//	NULL:  [0x00]                              (1 byte)
-//	value: [typeTag(1B)][len(2B big-endian)][payload]
+//	NULL:  [0x00]                                        (1 byte)
+//	value: [typeTag(1B)][len(8B big-endian uint64)][payload]
 //
 // NULL uses its own type tag rather than a payload sentinel, so BLOB values
 // containing NUL bytes cannot be confused with NULL. A row is the
 // concatenation of its column encodings.
+//
+// The payload length is 8 bytes, not 2: a 16-bit length truncates modulo
+// 65536 once a payload (a TEXT/BLOB/JSON value — the tool explicitly
+// supports values far beyond 64 KiB) reaches 64 KiB, and two DISTINCT rows
+// then render IDENTICAL bytes (see TestTLCollisionRegression): the
+// injective invariant of the canonical form is the correctness contract,
+// and a silent collision is a silent false identical. An 8-byte length
+// overflows only at 2^64 bytes — unreachable (MySQL's per-column limit is
+// 1 GiB, a row is far below 2^64).
 package normalize
 
 import (
 	"database/sql/driver"
+	"encoding/binary"
 	"fmt"
 
 	"mtdiff/internal/conn"
 )
 
-// type tags
+// type tags.
+//
+// All numeric families (INT, UINT, DECIMAL, FLOAT, DOUBLE) share ONE tag
+// (tagNUMERIC): the schema-compatibility layer already allows these
+// families to be compared across each other ("compared after
+// normalization"), so a cross-family equal value (INT 1 vs DECIMAL 1.00 vs
+// DOUBLE 1.0) must render under the SAME tag — five distinct tags would
+// make them compare unequal forever and the declared numeric compatibility
+// would be fiction. The payload still carries the family's exact
+// semantics (INT/UINT the exact decimal, DECIMAL the exact normalized
+// decimal, FLOAT/DOUBLE the tolerance-aware decimal), so different VALUES
+// across families (INT 2 vs DOUBLE 1.0) stay different; --strict-types
+// rejects the cross-family schema itself before any normalization.
 const (
 	tagNULL      = 0x00
-	tagINT       = 0x01
-	tagUINT      = 0x02
-	tagDECIMAL   = 0x03
-	tagFLOAT     = 0x04
-	tagDOUBLE    = 0x05
+	tagNUMERIC   = 0x01 // INT / UINT / DECIMAL / FLOAT / DOUBLE (payload carries the family's exact semantics)
 	tagDATE      = 0x06
 	tagTIME      = 0x07
 	tagDATETIME  = 0x08
@@ -101,16 +119,11 @@ func (n *Normalizer) encodeColumn(buf []byte, col conn.Column, v driver.Value) (
 
 func (n *Normalizer) tagFor(c conn.Column) byte {
 	switch c.Family {
-	case conn.FamINT:
-		return tagINT
-	case conn.FamUINT:
-		return tagUINT
-	case conn.FamDECIMAL:
-		return tagDECIMAL
-	case conn.FamFLOAT:
-		return tagFLOAT
-	case conn.FamDOUBLE:
-		return tagDOUBLE
+	case conn.FamINT, conn.FamUINT, conn.FamDECIMAL, conn.FamFLOAT, conn.FamDOUBLE:
+		// one tag for every numeric family: cross-family numeric equality
+		// (INT 1 == DECIMAL 1.00 == DOUBLE 1.0) is the declared schema
+		// compatibility, so the tag must not distinguish them
+		return tagNUMERIC
 	case conn.FamDATE:
 		return tagDATE
 	case conn.FamTIME:
@@ -140,7 +153,15 @@ func (n *Normalizer) tagFor(c conn.Column) byte {
 	return tagSTR
 }
 
+// appendTLV appends one column's value encoding: the type tag, the payload
+// length as an 8-byte big-endian uint64, then the payload. The length is
+// 8 bytes (see the package doc): the 2-byte length this used to carry
+// truncates modulo 65536 at 64 KiB, so a 65536-byte payload encodes the
+// SAME header as a 0-byte one and two distinct rows can collide (P0-1).
 func appendTLV(buf []byte, tag byte, payload []byte) []byte {
-	buf = append(buf, tag, byte(len(payload)>>8), byte(len(payload)))
+	buf = append(buf, tag)
+	var lenB [8]byte
+	binary.BigEndian.PutUint64(lenB[:], uint64(len(payload)))
+	buf = append(buf, lenB[:]...)
 	return append(buf, payload...)
 }

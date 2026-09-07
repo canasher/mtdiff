@@ -708,7 +708,7 @@ func (r *Runner) prepare(ctx context.Context, res compare.TableResult) (*prep, e
 		srcS: srcS,
 		dstS: dstS,
 		plan: DecidePlan(res, len(srcS.Key) > 0, len(dstS.Key) > 0, srcS.KeyIsUnique, dstS.KeyIsUnique,
-			strings.Join(srcS.Key, ","), r.o.Cmp.Where, keyAgree(srcS, dstS)),
+			strings.Join(srcS.Key, ","), r.o.Cmp.Where, keyAgree(srcS, dstS), keyOrderCompatible(srcS, dstS)),
 		b: NewBuilder(res.Name, srcS),
 	}
 	p.e = NewEngine(
@@ -856,12 +856,12 @@ func (r *Runner) PlanRowWork(ctx context.Context, p *prep, res compare.TableResu
 	// sides, keys agreeing). It is the one server-side proof a
 	// foreign out-of-range unique holder can be deleted before any
 	// in-range write (see crossChunkCheck / classifyHolder).
-	oorActive := !filtered && len(p.srcS.Key) > 0 && len(p.dstS.Key) > 0 && keyAgree(p.srcS, p.dstS)
+	oorActive := !filtered && len(p.srcS.Key) > 0 && len(p.dstS.Key) > 0 && keyOrderCompatible(p.srcS, p.dstS)
 	// The source's key extremes (--where applied): the cross-chunk
 	// holder check's global range and the out-of-range pass's bounds,
 	// read once.
 	var loV, hiV []driver.Value
-	oorPass := freshSrc > 0 && len(p.srcS.Key) > 0 && len(p.dstS.Key) > 0 && keyAgree(p.srcS, p.dstS)
+	oorPass := freshSrc > 0 && len(p.srcS.Key) > 0 && len(p.dstS.Key) > 0 && keyOrderCompatible(p.srcS, p.dstS)
 	if len(p.e.uc) > 0 || oorPass {
 		var minV, maxV []driver.Value
 		if err := r.Src.WithControl(ctx, func(q conn.Queryer) error {
@@ -1119,6 +1119,16 @@ func keyAgree(a, b *conn.Schema) bool {
 		}
 	}
 	return true
+}
+
+// keyOrderCompatible is keyAgree plus the ORDERING-semantics check
+// (conn.KeyOrderCompatible): the source's key bounds may only be shared
+// against the destination when the key sorts rows the same way on both
+// endpoints (same family per component and, for string keys, the same
+// effective collation).
+func keyOrderCompatible(a, b *conn.Schema) bool {
+	ok, _ := conn.KeyOrderCompatible(a, b)
+	return keyAgree(a, b) && ok
 }
 
 // oorPredicate renders the "key strictly outside [min, max]" predicate for
@@ -1439,7 +1449,7 @@ func (r *Runner) streamOORTail(ctx context.Context, p *prep, base chunk.Pred, ap
 // the one documented residual (the verification reports the table
 // DIFFERENT and a plain, unfiltered comparison shows them).
 func (r *Runner) streamOORDeletes(ctx context.Context, p *prep, minV, maxV []driver.Value, ap *Applier, st *Stats) error {
-	if len(p.dstS.Key) == 0 || minV == nil || maxV == nil || !keyAgree(p.srcS, p.dstS) {
+	if len(p.dstS.Key) == 0 || minV == nil || maxV == nil || !keyOrderCompatible(p.srcS, p.dstS) {
 		return nil
 	}
 	if !allNil(minV) {

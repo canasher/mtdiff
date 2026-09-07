@@ -24,34 +24,31 @@ type Writer struct {
 	db      *sql.DB
 }
 
+// writePolicy is the writer connection's session policy: the time-zone
+// pin (REQUIRED — the same correctness argument as the read pools'
+// applySession: a TIMESTAMP written through a session in the server's
+// default zone is interpreted in that zone, and the sync's
+// "same instant on both sides" guarantee is only as good as the zone
+// both endpoints' sessions actually use) and the guardrails (the writer
+// is deliberately NOT read-only). A non-dead policy failure is an
+// error: the connection is closed and NOT handed out.
+func (w *Writer) writePolicy(ctx context.Context, c *sql.Conn) error {
+	if _, err := c.ExecContext(ctx, "SET SESSION time_zone = '+00:00'"); err != nil {
+		return fmt.Errorf("cannot pin session time_zone to +00:00 (TIMESTAMP values would be written in the server's default zone): %w", err)
+	}
+	if err := applyGuardrails(ctx, c); err != nil {
+		return fmt.Errorf("apply session guardrails: %w", err)
+	}
+	return nil
+}
+
 // connChecked checks out the dedicated write connection in a usable
-// state — the SINGLE initialization rule for the pool, shared by
-// OpenWriter and Conn so the two paths cannot drift:
-//
-//   - the guardrails are re-applied on EVERY checkout (R6-3): a
-//     replacement physical session starts at the SERVER DEFAULTS (lock
-//     wait 50, no zero-date sql_mode flags), only the re-apply puts
-//     them back;
-//   - a checkout that comes back DEAD (a KILLed idle session, a dropped
-//     network) is NOT handed out: it is closed and a fresh checkout is
-//     tried, bounded to THREE attempts total (never a loop). A non-dead
-//     guardrail failure (an unsupported variable is a warning inside
-//     applyGuardrails, not an error) is an error, and three dead
-//     sessions in a row is an error. Only a live, guardrailed session
-//     is handed out.
-//
-// Why three attempts, not two (the "one replacement" minimum): the real
-// driver reports a KILLed IDLE socket in two phases. The FIRST
-// operation on it (the first guardrail SET) returns its plain
-// ErrInvalidConn — the client's write went out, the read got EOF/RST —
-// and database/sql only releases a pinned connection on
-// driver.ErrBadConn, so when the dead connection is closed it goes BACK
-// to the single-slot pool, and the next checkout is the SAME physical
-// connection. Only the driver's NEXT operation on it hits its closed
-// check (driver.ErrBadConn), which is what finally discards it — the
-// third checkout is the first one that is a genuinely NEW physical
-// session. A single replacement would fail exactly in the case this
-// exists for: the pool's only slot was just KILLed.
+// state — it IS the shared checkoutChecked rule (see there for the
+// single-call bounded-replacement contract and the two-phase
+// dead-connection rationale): the writePolicy is re-applied on EVERY
+// checkout, a dead checkout is closed and a fresh one tried (bounded to
+// three attempts, never a loop), a non-dead policy failure is an error,
+// and only a live, policy-initialized session is handed out.
 //
 // The replacement happens BEFORE any transaction starts, which is the
 // only safe place to recover: a dead connection MID-transaction (a DML
@@ -59,37 +56,19 @@ type Writer struct {
 // replaying the transaction would double-write — the applier fails fast
 // instead (see Applier.applyTx).
 func (w *Writer) connChecked(ctx context.Context) (*sql.Conn, error) {
-	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
-		c, err := w.db.Conn(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("%s: acquire write connection: %w", w.Name, err)
-		}
-		if err := applyGuardrails(ctx, c); err != nil {
-			// applyGuardrails fails only on a DEAD session (an
-			// unsupported guardrail is a warning, not an error) —
-			// but check anyway: a non-dead failure must never
-			// trigger a replacement
-			if !DeadConn(err) {
-				c.Close()
-				return nil, fmt.Errorf("%s: guardrails on write connection: %w", w.Name, err)
-			}
-			lastErr = err
-			_ = c.Close()
-			continue
-		}
-		return c, nil
-	}
-	return nil, fmt.Errorf("%s: replace dead write connection (3 dead sessions in a row): %v", w.Name, lastErr)
+	return checkoutChecked(ctx, w.Name, w.db, "write", w.writePolicy)
 }
 
-// OpenWriter opens the single-connection destination write pool. The DSN
-// is built by BuildWriterDSN (parseTime=true&loc=UTC stays mandatory so
-// TIMESTAMP values round-trip identically through time.Time and back).
-// The session gets the same best-effort guardrails as the read pools (lock
+// OpenWriter opens the single-connection destination write pool. The
+// DSN is built by BuildWriterDSN (parseTime=true&loc=UTC stays
+// mandatory so TIMESTAMP values round-trip identically through
+// time.Time and back, and the session time_zone is pinned to +00:00 at
+// connect time — see poolConfig). The session gets the required time-
+// zone pin plus the same best-effort guardrails as the read pools (lock
 // wait timeout, statement timeout, zero-date sql_mode flags) but no
 // read-only enforcement. The first checkout goes through connChecked —
-// the same rule Conn uses — so the two initialization paths cannot drift.
+// the same rule Conn uses — so the two initialization paths cannot
+// drift.
 func OpenWriter(ctx context.Context, name string, ep config.Endpoint, maxAllowedPacket int) (*Writer, error) {
 	db, err := openPool(poolConfig(ep, maxAllowedPacket, 600))
 	if err != nil {
