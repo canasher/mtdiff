@@ -192,7 +192,7 @@ DATETIME 是纯墙钟，两者语义不同，默认直接报错，显式开了�
 - `--fold-case` 忽略大小写；`--no-trim` 不裁空格。
 - JSON 列默认按原始字节比；`--normalize-json` 先做规范化（键排序、数字归一、类型保留：number 归一后仍是 JSON number 而非 string——`{"n":1}` 与 `{"n":"1"}` 判不同）再比。
 - 数值列（INT/UINT/DECIMAL/FLOAT/DOUBLE）跨家族比较走同一套 canonical 十进制文法（`--strict-types` 仍拒收）：同值判等（`BIGINT 1000000` == `DOUBLE 1e6`、`DECIMAL 0.00001` == `DOUBLE 0.00001`），不同值必判不同。
-- ENUM/SET **主键/唯一键**：排序按成员**定义序**（ENUM 按成员下标、SET 按位位置），两侧成员定义不同（如 `ENUM('b','a')` vs `ENUM('a','b')`，排序相反）时 diff 回退无键整表多集合 + 告警，sync 拒绝行级寻址（fail closed）；默认结构同步按源定义重放键列类型后恢复行级。
+- ENUM/SET **主键/唯一键**：排序按成员**定义序**（ENUM 按成员下标、SET 按位位置）。当前实现不假定 `ORDER BY`（成员定义序）与 `WHERE k >= ? AND k <= ?`（成员名 collation 序）一致，所以**即便 src/dst 成员定义完全一致，ENUM/SET 键也不作为 range 切块键使用**：diff 退化为整表无序多集合比较（数据相同仍判等、真实漂移照报不同）；sync 需要数据收敛时采用 **FULL resync（TRUNCATE + reload）**，而不是 range 行级寻址。成员定义漂移时，默认结构同步**先把目的端定义对齐源端，但定义对齐后仍走 FULL resync**（不恢复 range 行级）；`--no-sync-schema` 下定义/序不兼容则 fail closed（拒绝行级寻址、零写入），配 `--where` 报参数错（exit 3）。FULL 的 TRUNCATE 在 dry-run 中明确展示并纳入确认的破坏性范围（`DestructiveScope.FullResync`），apply 时不会偷偷升级。
 
 **表里有超大 BLOB**
 
@@ -320,7 +320,7 @@ TiDB 的自增 ID 是**按批预分配**的：分配器一次拿走一大批 ID�
 会被删掉。行级操作只作用于 src 最小～最大键范围内，sync 会显式扫一遍 dst，把范围外的行逐键删掉（严格比较：等于边界的行不碰；复合键、NULL 值都 NULL 安全，字符键按字符串值比较）。无 `--where` 时表在首轮直接对齐，不再因为几行杂行逼一次全量重灌；带 `--where` 时只删**匹配过滤条件**的范围外行，不匹配条件的会保留（过滤表不能 TRUNCATE）——复验会如实报 1，用无过滤的 diff 能看到它们，需要人工处理。
 
 **Q：一侧有键、另一侧没有（如 dst 丢了主键）的表会怎样？**
-列完全相同时两张表仍可比：diff 自动回退为 keyless 全表多重集比较（报告带一条 warn 说明回退），数据相同仍报一致、真实漂移照旧报不同。sync 默认走结构同步：先补回缺失的主键/唯一索引（`ALTER TABLE`），然后**重读 dst 元数据重新规划**——键修回来了就回到逐行同步，不再无条件全量重灌；配 `--where` 是参数错误（exit 3）。加 `--no-sync-schema` 才恢复旧的"无键 → TRUNCATE 全量重灌"。
+列完全相同时两张表仍可比：diff 自动回退为 keyless 全表多重集比较（报告带一条 warn 说明回退），数据相同仍报一致、真实漂移照旧报不同。sync 默认走结构同步：先补回缺失的主键/唯一索引（`ALTER TABLE`），然后**重读 dst 元数据重新规划**——键修回来了且可 range-addressable 就回到逐行同步（恢复的是 ENUM/SET 键则仍走全量重灌），不再无条件全量重灌；配 `--where` 是参数错误（exit 3）。加 `--no-sync-schema` 才恢复旧的"无键 → TRUNCATE 全量重灌"。
 
 **Q：整库模式（不给 --tables）下，dst 多出来的表、缺的表会怎样？**
 dst 的定位是 src 的**一次性副本**，同步方向固定单向 src → dst。整库模式下期望的表集就是源侧的 BASE TABLE 集（dst 库是空的也能跑）：dst 缺的表先 `CREATE TABLE` 再同步数据（含自增值初始值）；dst 独有的表被 `DROP TABLE`——破坏性语句在确认摘要和 dry-run 报告里单列（`DESTRUCTIVE` 一节）。给了 `--tables` 就严格只动这些表，dst 的其他表永不删除；带 `--where` 时禁止建表 / 整表删除；`--exclude-tables` 里的表既不同步也不删。

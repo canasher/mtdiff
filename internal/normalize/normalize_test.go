@@ -556,6 +556,56 @@ func TestCanonicalNumberGrammar(t *testing.T) {
 	}
 }
 
+// TestCanonicalNumberNegativeExponents pins the bounded rendering of large
+// NEGATIVE exponents (P3): a value like 1e-100000000 must stay the compact
+// scientific "1e-100000000" — never expand into an O(|exponent|) string of
+// zeros — and an exponent that overflows the Go int must fail closed with an
+// error rather than panic, OOM, or mis-normalize.
+func TestCanonicalNumberNegativeExponents(t *testing.T) {
+	// the value renders to EXACTLY this canonical text AND stays compact
+	// (the length is bounded by the significant digits + exponent digits,
+	// not the exponent's magnitude)
+	compact := func(tok, want string) {
+		got, err := canonicalNumber(tok)
+		if err != nil {
+			t.Fatalf("canonicalNumber(%q): %v", tok, err)
+		}
+		if got != want {
+			t.Errorf("canonicalNumber(%q) = %q, want %q", tok, got, want)
+		}
+		if len(got) >= 128 {
+			t.Errorf("canonicalNumber(%q) rendered %d bytes, want < 128: %q", tok, len(got), got)
+		}
+	}
+	// short negative exponents keep their plain form
+	compact("1e-5", "0.00001")
+	compact("0.00001", "0.00001")
+	// beyond the plain limit the value switches to the compact scientific form
+	compact("1e-20", "1e-20")
+	compact("1e-1000", "1e-1000")
+	compact("1e-100000000", "1e-100000000")
+	compact("-1e-100000000", "-1e-100000000")
+	// equal values reduce to one canonical text regardless of the exponent
+	// spelling (10e-100000001 == 1e-100000000)
+	compact("10e-100000001", "1e-100000000")
+	// distinct values at the same extreme magnitude stay distinct
+	x, errA := canonicalNumber("1e-100000000")
+	y, errB := canonicalNumber("2e-100000000")
+	if errA != nil || errB != nil {
+		t.Fatalf("canonicalNumber extreme: %v %v", errA, errB)
+	}
+	if x == y {
+		t.Errorf("distinct extreme values must differ: %q and %q both %q", "1e-100000000", "2e-100000000", x)
+	}
+	// an exponent that does not fit a Go int must fail closed with an error
+	// (not panic, OOM, or a wrong normalization)
+	for _, huge := range []string{"1e999999999999999999999999", "1e-999999999999999999999999"} {
+		if _, err := canonicalNumber(huge); err == nil {
+			t.Errorf("canonicalNumber(%q) must error (exponent overflow), got a value", huge)
+		}
+	}
+}
+
 // TestUINTDriverShapes pins the three driver shapes a 64-bit UNSIGNED value
 // can arrive in (P1-6, found by the e2e): the TEXT protocol yields uint64,
 // the BINARY protocol yields int64 while the value fits the signed range

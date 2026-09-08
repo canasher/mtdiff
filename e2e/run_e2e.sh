@@ -297,9 +297,11 @@ n=$(qdst "SELECT COUNT(*) FROM t_enumkey_drift")
 [ "$n" = "2" ] || { echo "FAIL: the refused apply wrote to the table (count=$n, want 2)"; exit 1; }
 v=$(qdst "SELECT v FROM t_enumkey_drift WHERE k = 'b'")
 [ "$v" = "99" ] || { echo "FAIL: the refused apply must leave the data untouched (v=$v, want the drifted 99)"; exit 1; }
-# the DEFAULT sync repairs instead: the structure DDL re-emits the
-# source's ENUM definition verbatim, after which the (now order-
-# compatible) pair is row-level safe and converges the data.
+# the DEFAULT sync repairs the DEFINITION instead: the structure DDL
+# re-emits the source's ENUM definition verbatim, but the key is STILL
+# not range-addressable (an ENUM/SET key never is, even with identical
+# definitions) — so the data is converged by an order-independent FULL
+# resync (TRUNCATE + reload), not by row-level addressing.
 expect 1 "ENUM key: default sync plans the ENUM definition DDL" sync --src "$SRC" --dst "$DST" --tables t_enumkey_drift
 if ! grep -qi "ENUM" "$OUT"; then
   echo "FAIL: the structure plan must align the ENUM definition"; cat "$OUT"; exit 1
@@ -739,9 +741,21 @@ elif [ -x /home/liukl/sdk/go/bin/go ]; then
   GOCMD=/home/liukl/sdk/go/bin/go
 fi
 if [ -n "$GOCMD" ]; then
+  # The real-MySQL tests run package-by-package, SERIALLY (the sync package
+  # first, then the conn package) — never the two packages at once. They are
+  # keyed only on the database, so two package binaries running in parallel
+  # against the same srcdb2/dstdb2 pair would cross-contaminate: the conn
+  # package's KILL-by-PROCESSLIST (WHERE DB = ? AND COMMAND = 'Sleep') would
+  # KILL the sync package's idle connections, and the sync holder's
+  # connection census (SELECT COUNT(*) FROM information_schema.PROCESSLIST
+  # WHERE DB = ?) would count the conn package's connections too (e.g. "6
+  # connections, want 4"). A finished go test process closes every one of
+  # its connections, so two serial runs can never overlap on a database.
   if MTDIFF_E2E_DSN_SRC="$SRC2" MTDIFF_E2E_DSN_DST="$DST2" \
-    "$GOCMD" test -count=1 -timeout 10m -run 'TestDropRaceRealMySQL|TestScopeEscalationRealMySQL|TestUniqueHolderParallelOneDoesNotDeadlock|TestRealWriterKillReconnectApplyPath|TestRealScanReplacementReinitialized|TestRealControlReplacementReinitialized|TestRealActiveControlKillRecovers|TestRealWriterReplacementReinitialized|TestRealTimezonePinnedAllSessions' ./internal/sync/ ./internal/conn/; then
-    echo "ok: real-MySQL destructive re-gates + parallel=1 holder liveness + connection-replacement policy (drop TOCTOU re-check, scope escalation refusal, pinned-connection holder check, scan/control/writer replacement re-initialization, active-session KILL recovery, writer KILL recovery through the production apply path, single-call KILL recovery, session time-zone pin on every pool)"
+    "$GOCMD" test -count=1 -timeout 10m -run 'TestDropRaceRealMySQL|TestScopeEscalationRealMySQL|TestUniqueHolderParallelOneDoesNotDeadlock|TestRealWriterKillReconnectApplyPath' ./internal/sync/ \
+    && MTDIFF_E2E_DSN_SRC="$SRC2" MTDIFF_E2E_DSN_DST="$DST2" \
+    "$GOCMD" test -count=1 -timeout 10m -run 'TestRealScanReplacementReinitialized|TestRealControlReplacementReinitialized|TestRealActiveControlKillRecovers|TestRealWriterReplacementReinitialized|TestRealTimezonePinnedAllSessions' ./internal/conn/; then
+    echo "ok: real-MySQL destructive re-gates + parallel=1 holder liveness + connection-replacement policy (run SERIALLY — sync package, then conn package — so the KILL-by-PROCESSLIST and the connection census never see the other package's connections: drop TOCTOU re-check, scope escalation refusal, pinned-connection holder check, writer KILL recovery through the production apply path, scan/control/writer replacement re-initialization, active-session KILL recovery, session time-zone pin on every pool)"
   else
     echo "FAIL: real-MySQL re-gate / parallel=1 regression"; exit 1
   fi

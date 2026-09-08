@@ -15,6 +15,15 @@ import (
 // render a few digits longer in its plain form, as it always has.
 const jsonPlainMaxDigits = 20
 
+// maxRenderableExponent: the largest |power-of-ten| we render. Beyond it
+// the value is so far from 1 that no canonical decimal form is useful, and
+// the exponent arithmetic (negation, +len(digits)-1) would approach the Go
+// int limit — so we fail closed (a clear error) instead of risking an
+// overflow that could produce a wrong canonical value. (An exponent that
+// does not even fit a Go int is already rejected by decimalParts'
+// strconv.Atoi above.)
+const maxRenderableExponent = 1 << 60
+
 // decimalParts parses an exact decimal token — a plain decimal
 // ("123.45", "-0.001", "007") or an exponent form ("1e6", "-1.2E-3") —
 // into its canonical (sign, digits, power-of-ten) form: the value is
@@ -37,6 +46,9 @@ func decimalParts(s string) (neg bool, digits string, power int, ok bool) {
 	if i := strings.IndexAny(t, "eE"); i >= 0 {
 		e, err := strconv.Atoi(t[i+1:])
 		if err != nil || t[i+1:] == "" {
+			return false, "", 0, false
+		}
+		if e > maxRenderableExponent || e < -maxRenderableExponent {
 			return false, "", 0, false
 		}
 		exp = e
@@ -97,7 +109,18 @@ func renderCanonicalNumber(neg bool, digits string, power int) string {
 		out = digits + strings.Repeat("0", power)
 	} else if power < 0 {
 		shift := -power
-		if len(digits) <= jsonPlainMaxDigits {
+		// Use the plain "0.xxx" (or "12.3") form ONLY while it stays
+		// short. A large |power| must not expand into an O(|power|) run of
+		// zeros — 1e-100000000 must stay the compact "1e-100000000", never
+		// a ~100 MB "0.000...1". The plain length is len(digits)+1 when the
+		// dot sits inside the digits (shift < len(digits)) and 2+shift when
+		// it does not ("0." + (shift-len) zeros + digits); beyond the
+		// plain limit it falls through to the scientific form below.
+		plainLen := len(digits) + 1
+		if shift >= len(digits) {
+			plainLen = 2 + shift
+		}
+		if plainLen <= jsonPlainMaxDigits {
 			if shift < len(digits) {
 				cut := len(digits) - shift
 				if frac := digits[cut:]; frac != "" {
