@@ -769,6 +769,68 @@ func TestNormalizeJSONPreservesNumberType(t *testing.T) {
 	roundTripTypes(`{"n":1e100000000}`, true)
 }
 
+// TestNormalizeJSONExponentOverflowFailsClosed pins the P2-1 fix: a JSON
+// number whose exponent is outside the bounded canonical-number range must
+// FAIL the whole --normalize-json normalization, not be preserved as-is.
+// Preserving the raw token would both skip its canonicalization (two equal
+// values spelled 1e99… vs 10e98… would compare different) and silently
+// compare non-canonical text — so an unrenderable number must surface as
+// an error at ANY nesting depth, never fall back to raw comparison.
+func TestNormalizeJSONExponentOverflowFailsClosed(t *testing.T) {
+	// out of range => the WHOLE document errors (positive and negative,
+	// and nested: the recursive error must not be swallowed by map/array)
+	for _, doc := range []string{
+		`{"n":1e999999999999999999999999}`,
+		`{"n":1e-999999999999999999999999}`,
+		`{"a":{"b":[1,{"n":1e999999999999999999999999}]}}`,
+	} {
+		if _, err := normalizeJSON([]byte(doc)); err == nil {
+			t.Errorf("normalizeJSON(%s): out-of-range JSON number must fail closed", doc)
+		}
+	}
+
+	// within the supported range => still normalizes, and stays COMPACT
+	// (1e100000000 / 1e-100000000 are far below maxRenderableExponent)
+	compact := func(doc string) {
+		got, err := normalizeJSON([]byte(doc))
+		if err != nil {
+			t.Fatalf("normalizeJSON(%s): in-range number must not error: %v", doc, err)
+		}
+		if len(got) >= 128 {
+			t.Errorf("normalizeJSON(%s): rendered %d bytes (want < 128): %q", doc, len(got), got)
+		}
+	}
+	compact(`{"n":1e100000000}`)
+	compact(`{"n":1e-100000000}`)
+
+	// semantic equality still holds (exact reduction, no float64 collapse)
+	normEq := func(a, b string) (bool, string, string) {
+		x, err := normalizeJSON([]byte(a))
+		if err != nil {
+			t.Fatalf("normalize %s: %v", a, err)
+		}
+		y, err := normalizeJSON([]byte(b))
+		if err != nil {
+			t.Fatalf("normalize %s: %v", b, err)
+		}
+		return bytes.Equal(x, y), string(x), string(y)
+	}
+	// 1 == 1.0 == 1.00 == 1e0 == 10e-1
+	for _, same := range []string{`{"n":1}`, `{"n":1.0}`, `{"n":1.00}`, `{"n":1e0}`, `{"n":10e-1}`} {
+		if eq, x, y := normEq(`{"n":1}`, same); !eq {
+			t.Errorf("equal values must match: %s vs %s", x, y)
+		}
+	}
+	// beyond float64 precision stays distinct
+	if eq, x, _ := normEq(`{"n":9007199254740992}`, `{"n":9007199254740993}`); eq {
+		t.Errorf("float64-collapsing integers must stay distinct: %s", x)
+	}
+	// a JSON number is not a JSON string
+	if eq, x, _ := normEq(`{"n":1}`, `{"n":"1"}`); eq {
+		t.Errorf("a JSON number must differ from a JSON string: %s", x)
+	}
+}
+
 func TestFractionalSecondCollisions(t *testing.T) {
 	cases := map[time.Duration]string{
 		100 * time.Microsecond: "0:00:00.0001",
