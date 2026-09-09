@@ -13,16 +13,25 @@ import (
 // the schemas (key selection, ignored columns, column order) is identical to
 // the comparison's.
 func PrepareSchemas(ctx context.Context, src, dst *conn.Side, table string, key []string, ignore map[string]bool, compat conn.CompatOpts) (*conn.Schema, *conn.Schema, []string, error) {
-	srcSchema, err := conn.IntrospectTable(ctx, src.Ctl(), table)
-	if err != nil {
+	// one control session per side, released before the next acquisition
+	// (the control pool is single-connection)
+	var srcSchema, dstSchema *conn.Schema
+	if err := src.WithControl(ctx, func(q conn.Queryer) error {
+		var err error
+		srcSchema, err = conn.IntrospectTable(ctx, q, table)
+		return err
+	}); err != nil {
 		return nil, nil, nil, fmt.Errorf("src introspection: %w", err)
 	}
-	dstSchema, err := conn.IntrospectTable(ctx, dst.Ctl(), table)
-	if err != nil {
+	if err := dst.WithControl(ctx, func(q conn.Queryer) error {
+		var err error
+		dstSchema, err = conn.IntrospectTable(ctx, q, table)
+		return err
+	}); err != nil {
 		return nil, nil, nil, fmt.Errorf("dst introspection: %w", err)
 	}
-	keyWarns := applyKey(srcSchema, dstSchema, key)
-	srcSchema, dstSchema, err = filterIgnored(srcSchema, dstSchema, ignore)
+	keyWarns := applyKey(srcSchema, dstSchema, key, resolveKeyUniqueness(ctx, src, dst, table, key))
+	srcSchema, dstSchema, err := filterIgnored(srcSchema, dstSchema, ignore)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -31,6 +40,27 @@ func PrepareSchemas(ctx context.Context, src, dst *conn.Side, table string, key 
 		return nil, nil, nil, fmt.Errorf("schema mismatch: %w", err)
 	}
 	return srcSchema, dstSchema, append(keyWarns, warns...), nil
+}
+
+// resolveKeyUniqueness returns the per-side resolver for an explicit
+// --key: it asks each side's index catalog whether the key is a unique row
+// address there (conn.ExplicitKeyIsUnique). Both sides are introspected
+// under the same table name, so the resolver is keyed by side, not by
+// table.
+func resolveKeyUniqueness(ctx context.Context, src, dst *conn.Side, table string, key []string) func(string) (bool, error) {
+	return func(side string) (bool, error) {
+		s := src
+		if side == "dst" {
+			s = dst
+		}
+		var ok bool
+		err := s.WithControl(ctx, func(q conn.Queryer) error {
+			var err error
+			ok, err = conn.ExplicitKeyIsUnique(ctx, q, table, key)
+			return err
+		})
+		return ok, err
+	}
 }
 
 // KeyFamilies returns the column families of the schema's key columns, in key

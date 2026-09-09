@@ -239,12 +239,21 @@ func resolveTables(ctx context.Context, cfg *config.Config, src, dst *conn.Side)
 	if len(cfg.Opts.Tables) > 0 {
 		return cfg.Opts.Tables, nil
 	}
-	srcTables, err := conn.ListTables(ctx, src.Ctl())
-	if err != nil {
+	// one control session per side (policy-applied, dead-connection
+	// recovering), released before the next acquisition
+	var srcTables, dstTables []string
+	if err := src.WithControl(ctx, func(q conn.Queryer) error {
+		var err error
+		srcTables, err = conn.ListTables(ctx, q)
+		return err
+	}); err != nil {
 		return nil, failf(ExitRuntimeErr, "src: %v", err)
 	}
-	dstTables, err := conn.ListTables(ctx, dst.Ctl())
-	if err != nil {
+	if err := dst.WithControl(ctx, func(q conn.Queryer) error {
+		var err error
+		dstTables, err = conn.ListTables(ctx, q)
+		return err
+	}); err != nil {
 		return nil, failf(ExitRuntimeErr, "dst: %v", err)
 	}
 	excl := make(map[string]bool, len(cfg.Opts.ExcludeTables))
@@ -284,7 +293,7 @@ func bindCmpFlags(cmd *cobra.Command, o *diffOpts) {
 	f.IntVar(&o.drillLimit, "drill-limit", 0, "max example rows per differing chunk (default 10)")
 	f.IntVar(&o.maxAllowedPacket, "max-allowed-packet", 0, "max packet size in bytes (default: driver limit)")
 	f.Float64Var(&o.tolerance, "tolerance", 0, "float/double comparison tolerance (0 = exact)")
-	f.BoolVar(&o.snapshot, "snapshot", false, "scan each table under a consistent snapshot (slower, stable under writes)")
+	f.BoolVar(&o.snapshot, "snapshot", false, "read each table side at one point in time: per side, the count, key extremes and all row scans run on one connection in one read transaction (slower, stable under concurrent writes; consistency is per side, not across the pair)")
 	f.BoolVar(&o.drill, "drill", false, "show example differing rows (uses --drill-limit)")
 	f.BoolVar(&o.noTrim, "no-trim", false, "do not trim trailing spaces from strings")
 	f.BoolVar(&o.foldCase, "fold-case", false, "compare strings case-insensitively")

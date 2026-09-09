@@ -45,7 +45,8 @@ type Change struct {
 // default" — see colDiffers.
 //
 // It returns an error when a source definition cannot be reproduced on the
-// destination (an expression default): the caller then fails the table
+// destination (a generated column — the expression is a cross-backend
+// promise; or an expression default): the caller then fails the table
 // instead of guessing.
 func DiffStructure(src, dst *conn.Struct, srcDef, dstDef string) ([]Change, error) {
 	srcCols := make(map[string]bool, len(src.Cols))
@@ -73,6 +74,15 @@ func DiffStructure(src, dst *conn.Struct, srcDef, dstDef string) ([]Change, erro
 			}
 			out = append(out, ch)
 		case colDiffers(sc, dc, srcDef, dstDef):
+			if sc.Generated && (!sc.GenExprReadable || !dc.GenExprReadable) {
+				// a generated column whose expression one side cannot
+				// read: the drift is REAL but unprovable (both sides
+				// unreadable would still be a drift — not an equality),
+				// so refuse with a message that says why, instead of the
+				// generic "cannot reproduce" (the column may in fact be
+				// identical)
+				return nil, fmt.Errorf("generated column %s: generation expression is unreadable on one or both sides; schema equality cannot be proven safely — align the column manually or use --no-sync-schema", sc.Name)
+			}
 			if err := addable(sc); err != nil {
 				return nil, err
 			}
@@ -133,6 +143,17 @@ func colDiffers(sc, dc conn.ColMeta, srcDef, dstDef string) bool {
 		(sc.Family == conn.FamTIMESTAMP && dc.Family == conn.FamDATETIME) {
 		return false
 	}
+	// A column becoming generated (or ceasing to be) is a semantic change
+	// the raw type alone would not reveal: the generated-ness is part of
+	// the definition. The EXPRESSION is part of it too (P1-1): two
+	// generated columns of the same storage that compute different values
+	// are a drift, and a drift with an unreadable side is a safe refusal
+	// (addable) — never a silent match.
+	if sc.Generated != dc.Generated ||
+		(sc.Generated && !strings.EqualFold(sc.GenStorage, dc.GenStorage)) ||
+		(sc.Generated && dc.Generated && genExprDiffers(sc, dc)) {
+		return true
+	}
 	if normalizeIntType(sc.RawType) != normalizeIntType(dc.RawType) {
 		return true
 	}
@@ -150,6 +171,69 @@ func colDiffers(sc, dc conn.ColMeta, srcDef, dstDef string) bool {
 	}
 	if sc.Collation != dc.Collation && !defaultCollationsMatch(sc, dc, srcDef, dstDef) {
 		return true
+	}
+	return false
+}
+
+// genExprDiffers compares two generated columns' generation expressions
+// (P1-1). Normalization is deliberately conservative: it folds
+// surrounding whitespace and outermost paren wrapping, and NOTHING else
+// (no AST re-print, no identifier case-folding, no operator rewriting) —
+// an expression that differs in any other way is a real difference.
+//
+// An expression either side cannot READ (GenExprReadable false — the
+// backend does not expose GENERATION_EXPRESSION) is never comparable:
+// not comparable is not the same as equal, so the pair counts as a
+// drift and the structure sync refuses rather than guessing. This
+// includes BOTH sides unreadable: two empty expressions ("" == "") say
+// "neither side could be read", not "the expressions match" — a src
+// column x AS (a+b) and a dst column x AS (a-b) on backends that both
+// hide the expression are different columns, and treating them as equal
+// would be a false green.
+func genExprDiffers(sc, dc conn.ColMeta) bool {
+	if !sc.GenExprReadable || !dc.GenExprReadable {
+		return true
+	}
+	return normalizeGenerationExpr(sc.GenExpr) != normalizeGenerationExpr(dc.GenExpr)
+}
+
+// normalizeGenerationExpr folds the cosmetic differences a backend may
+// introduce when it re-prints the same expression: surrounding
+// whitespace and whole-string paren wrapping, peeled while the string
+// stays fully wrapped ("((a)+(b))" -> "(a)+(b)", then it stops: the
+// remainder is not one balanced outer pair). NOTHING else is normalized
+// (no AST re-print, no identifier case-folding, no operator rewriting).
+// Expressions that contain a quote are trimmed only — a parenthesis
+// inside a string literal would defeat the balance scan, and
+// under-normalizing is the safe direction (a cosmetic match missed is a
+// drift reported; a different expression declared equal is data
+// corruption).
+func normalizeGenerationExpr(expr string) string {
+	e := strings.TrimSpace(expr)
+	if strings.ContainsAny(e, "'\"") {
+		return e
+	}
+	for strings.HasPrefix(e, "(") && strings.HasSuffix(e, ")") && outerParens(e) {
+		e = strings.TrimSpace(e[1 : len(e)-1])
+	}
+	return e
+}
+
+// outerParens reports whether the whole string is wrapped in ONE balanced
+// pair of parentheses (the opener at index 0 closes at the final
+// position): "(a) + (b)" is, "(a)+b" is not.
+func outerParens(s string) bool {
+	depth := 0
+	for i, r := range s {
+		switch r {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return i == len(s)-1
+			}
+		}
 	}
 	return false
 }
@@ -192,6 +276,15 @@ func defaultCollationsMatch(sc, dc conn.ColMeta, srcDef, dstDef string) bool {
 // colWhy renders a short drift description for the report.
 func colWhy(sc, dc conn.ColMeta) string {
 	switch {
+	case sc.Generated != dc.Generated:
+		return fmt.Sprintf("generated column %v -> %v", dc.Generated, sc.Generated)
+	case sc.Generated && !strings.EqualFold(sc.GenStorage, dc.GenStorage):
+		return fmt.Sprintf("generated storage %s -> %s", dc.GenStorage, sc.GenStorage)
+	case sc.Generated && genExprDiffers(sc, dc):
+		if !sc.GenExprReadable || !dc.GenExprReadable {
+			return "generated expression unreadable on one or both sides; schema equality cannot be proven safely"
+		}
+		return "generated expression differs"
 	case !strings.EqualFold(sc.RawType, dc.RawType):
 		return fmt.Sprintf("type %s -> %s", dc.RawType, sc.RawType)
 	case sc.Nullable != dc.Nullable:
@@ -209,16 +302,44 @@ func colWhy(sc, dc conn.ColMeta) string {
 }
 
 // addable rejects source definitions the destination cannot be given
-// faithfully. An expression default ("(expr)", MySQL 8.0.13+) is stored in
-// information_schema unevaluated; re-emitting it would mean trusting the
-// expression to still exist on the other server, so the table fails the
-// structure sync instead of guessing.
+// faithfully. A generated column is the first case (P0-2): the generation
+// expression is a cross-backend promise (it may reference other columns or
+// server functions that do not exist, or do not behave alike, on the other
+// side), and a re-defined column would silently LOSE the expression — so
+// the structure sync refuses instead of guessing; the operator aligns the
+// schema manually or turns the structure sync off. An expression default
+// ("(expr)", MySQL 8.0.13+) is stored in information_schema unevaluated;
+// re-emitting it would mean trusting the expression to still exist on the
+// other server, so the table fails the structure sync instead of guessing.
 func addable(c conn.ColMeta) error {
+	if c.Generated {
+		storage := c.GenStorage
+		if storage == "" {
+			storage = "GENERATED"
+		}
+		return fmt.Errorf("column %s is a generated column (%s) that the structure sync cannot reproduce on the destination; align the schema manually or use --no-sync-schema",
+			c.Name, storage)
+	}
 	if c.HasDefault && strings.HasPrefix(c.Default, "(") {
 		return fmt.Errorf("column %s has an expression default (%s) that cannot be reproduced on the destination; re-run with --no-sync-schema",
 			c.Name, c.Default)
 	}
 	return nil
+}
+
+// generatedCols lists a structure's generated columns ("" when none). The
+// CREATE path uses it: a table with a generated column cannot be created
+// on the destination faithfully (see addable), so the create plan is
+// refused instead of emitting a structure that silently lacks the
+// expression.
+func generatedCols(s *conn.Struct) []string {
+	var out []string
+	for _, c := range s.Cols {
+		if c.Generated {
+			out = append(out, c.Name)
+		}
+	}
+	return out
 }
 
 // filterStruct removes ignored columns from a structure (and any index that

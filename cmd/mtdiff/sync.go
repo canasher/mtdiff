@@ -17,12 +17,14 @@ import (
 )
 
 type syncOpts struct {
-	cmp          diffOpts // shared comparison flags (own instance, not the global diff)
-	apply        bool
-	yes          bool
-	batchSize    int
-	sampleLimit  int
-	noSyncSchema bool
+	cmp            diffOpts // shared comparison flags (own instance, not the global diff)
+	apply          bool
+	yes            bool
+	batchSize      int
+	sampleLimit    int
+	noSyncSchema   bool
+	structTruncate bool
+	rowRewrite     bool
 }
 
 var (
@@ -45,6 +47,8 @@ func init() {
 	f.IntVar(&syncOpt.batchSize, "batch-size", 0, "rows per multi-row INSERT / commit granularity (default 1000)")
 	f.IntVar(&syncOpt.sampleLimit, "sample-limit", 0, "sample SQL statements shown per table in a dry-run (default 5)")
 	f.BoolVar(&syncOpt.noSyncSchema, "no-sync-schema", false, "do not align the destination table structure before the data sync (default: structure is synced first, shown in the dry run)")
+	f.BoolVar(&syncOpt.structTruncate, "allow-structure-truncate", false, "if the in-place structure ALTER fails, truncate the destination table and re-apply the DDL on it (default: the failure stops the table with its data preserved)")
+	f.BoolVar(&syncOpt.rowRewrite, "allow-row-rewrite", false, "permit the destructive row rewrite (DELETE+INSERT) for a unique-value swap/cycle/holder (default: the table is refused, because the rewrite fires FK/trigger side effects). It authorizes the row rewrite only: a cross-chunk swap becomes a full-resync plan (TRUNCATE + reload), which the apply executes only when the confirmed plan showed that TRUNCATE — a confirmed row-level plan never escalates to it in the same run")
 	rootCmd.AddCommand(syncCmd)
 }
 
@@ -66,10 +70,19 @@ func applySyncOpts(cmd *cobra.Command, o *syncOpts, c *config.Config) error {
 		if o.sampleLimit < 0 {
 			return fmt.Errorf("--sample-limit must be >= 0 (got %d)", o.sampleLimit)
 		}
-		c.Opts.SampleLimit = o.sampleLimit
+		// explicit: 0 is legal (show no samples) and must survive
+		// ApplyDefaults
+		v := o.sampleLimit
+		c.Opts.SampleLimit = &v
 	}
 	if cmd.Flags().Changed("no-sync-schema") {
 		c.Opts.NoSyncSchema = o.noSyncSchema
+	}
+	if cmd.Flags().Changed("allow-structure-truncate") {
+		c.Opts.AllowStructureTruncate = o.structTruncate
+	}
+	if cmd.Flags().Changed("allow-row-rewrite") {
+		c.Opts.AllowRowRewrite = o.rowRewrite
 	}
 	return nil
 }
@@ -157,12 +170,14 @@ func syncRunE(cmd *cobra.Command, _ []string) error {
 	}
 
 	runner := msync.NewRunner(src, dst, msync.Options{
-		Cmp:         buildComparerOpts(cfg),
-		Batch:       cfg.Opts.BatchSize,
-		SampleLimit: cfg.Opts.SampleLimit,
-		MaxPacket:   cfg.Opts.MaxAllowedPacket,
-		SyncSchema:  !cfg.Opts.NoSyncSchema,
-		Progress:    progressLog, // forwarded to the comparer (pre-pass + verification) by NewRunner
+		Cmp:                    buildComparerOpts(cfg),
+		Batch:                  cfg.Opts.BatchSize,
+		SampleLimit:            cfg.SampleLimitOr(5),
+		MaxPacket:              cfg.Opts.MaxAllowedPacket,
+		SyncSchema:             !cfg.Opts.NoSyncSchema,
+		AllowStructureTruncate: cfg.Opts.AllowStructureTruncate,
+		AllowRowRewrite:        cfg.Opts.AllowRowRewrite,
+		Progress:               progressLog, // forwarded to the comparer (pre-pass + verification) by NewRunner
 	})
 	results, err := runner.PrePass(ctx, tables)
 	if err != nil {
@@ -192,14 +207,17 @@ func syncRunE(cmd *cobra.Command, _ []string) error {
 		return syncDryRunExit(syncResults)
 	}
 
-	// Apply: decide the plan for everything first (the plans drive the
-	// confirmation summary), then confirm before any write connection
-	// exists. Only the decision is computed here (no row re-scan):
-	// ApplyTable re-plans and rescans right before writing, so planning
-	// the ops now would scan the differing chunks twice for nothing.
+	// Apply: plan everything first (the plans drive the confirmation
+	// summary), then confirm before any write connection exists. The
+	// plan here is the PREFLIGHT, not a decision shortcut: it runs the
+	// same row planning the apply re-runs, so the destructive scope the
+	// user confirms (a full resync with its TRUNCATE, a row rewrite) is
+	// computed from a real plan. ApplyTable re-plans right before
+	// writing and may only stay within the confirmed scope — the
+	// preflight's extra scan is deliberate (safety over speed).
 	dataPlans := make([]msync.TableSync, len(results))
 	for i, r := range results {
-		dataPlans[i] = runner.PlanSummary(ctx, r)
+		dataPlans[i] = runner.PlanTable(ctx, r)
 	}
 	allPlans := append(append([]msync.TableSync{}, dataPlans...), dropPlans...)
 	// a plan that is an argument error (e.g. keyless + --where) stops the
@@ -213,7 +231,7 @@ func syncRunE(cmd *cobra.Command, _ []string) error {
 		printSyncReport(allPlans, false)
 		return nil
 	}
-	proceed, err := confirmApply(syncOpt.apply, syncOpt.yes, syncSummary(allPlans))
+	proceed, err := confirmApply(syncOpt.apply, syncOpt.yes, syncSummary(allPlans, cfg.Opts.AllowStructureTruncate))
 	if err != nil {
 		return err
 	}
@@ -240,7 +258,9 @@ func syncRunE(cmd *cobra.Command, _ []string) error {
 			syncResults = append(syncResults, dataPlans[i])
 			continue
 		}
-		ts := runner.ApplyTable(ctx, r, ap)
+		// dataPlans[i] is the CONFIRMED plan (preflight): the apply may
+		// shrink it but not expand its destructive scope
+		ts := runner.ApplyTable(ctx, r, ap, dataPlans[i])
 		syncResults = append(syncResults, ts)
 		if ts.Status == "APPLIED" {
 			synced = append(synced, ts.Name)
@@ -299,12 +319,19 @@ func resolveSyncTables(ctx context.Context, cfg *config.Config, src, dst *conn.S
 	if len(cfg.Opts.Tables) > 0 {
 		return cfg.Opts.Tables, nil, nil
 	}
-	srcTables, err := conn.ListBaseTables(ctx, src.Ctl())
-	if err != nil {
+	var srcTables, dstTables []string
+	if err := src.WithControl(ctx, func(q conn.Queryer) error {
+		var err error
+		srcTables, err = conn.ListBaseTables(ctx, q)
+		return err
+	}); err != nil {
 		return nil, nil, failf(ExitRuntimeErr, "src: %v", err)
 	}
-	dstTables, err := conn.ListBaseTables(ctx, dst.Ctl())
-	if err != nil {
+	if err := dst.WithControl(ctx, func(q conn.Queryer) error {
+		var err error
+		dstTables, err = conn.ListBaseTables(ctx, q)
+		return err
+	}); err != nil {
 		return nil, nil, failf(ExitRuntimeErr, "dst: %v", err)
 	}
 	tables, extra = syncTableSets(srcTables, dstTables, cfg.Opts.ExcludeTables, cfg.Opts.Where == "")
@@ -383,10 +410,20 @@ func allSkip(plans []msync.TableSync) bool {
 // sync would do, and the destructive statements (DROP TABLE, DROP
 // COLUMN, DROP INDEX, DROP PRIMARY KEY) listed separately — they are the
 // irreversible ones and must not be hidden behind "N statements will be
-// executed".
-func syncSummary(plans []msync.TableSync) string {
+// executed". The destructive row rewrites (DELETE+INSERT to free a
+// unique slot) get their own section: they touch rows the user did not
+// ask to change, and they run only because this very summary showed
+// them (P0-3).
+//
+// allowStructureTruncate is the RESOLVED value (CLI flag over YAML
+// config over default) — the same value the runner uses to decide. The
+// summary must never read the CLI global: a YAML
+// allow_structure_truncate: true with the flag unset must warn here,
+// or the user would confirm a run whose apply may TRUNCATE a table
+// without the summary ever saying so.
+func syncSummary(plans []msync.TableSync, allowStructureTruncate bool) string {
 	var full, row, skip, create, drop, state, stateNote, fail int
-	var names, destructive []string
+	var names, destructive, rewrites []string
 	for _, p := range plans {
 		switch p.Mode {
 		case "SKIP":
@@ -401,6 +438,9 @@ func syncSummary(plans []msync.TableSync) string {
 		case "ROWLEVEL":
 			row++
 			names = append(names, p.Name)
+			if p.Rewrites > 0 {
+				rewrites = append(rewrites, fmt.Sprintf("%s (%d row group(s))", p.Name, p.Rewrites))
+			}
 		case "CREATE":
 			create++
 			names = append(names, p.Name+" (create table)")
@@ -432,9 +472,18 @@ func syncSummary(plans []msync.TableSync) string {
 	if len(names) > 0 {
 		summary += ": " + strings.Join(names, ", ")
 	}
+	if allowStructureTruncate {
+		summary += "\nNOTE: allow_structure_truncate is set (flag or config) — if an in-place structure ALTER fails, the destination table is TRUNCATED and the DDL re-applied on the empty table"
+	}
 	if len(destructive) > 0 {
 		summary += fmt.Sprintf("\nDESTRUCTIVE: %d irreversible statement(s) will be executed:", len(destructive))
 		for _, s := range destructive {
+			summary += "\n  " + s
+		}
+	}
+	if len(rewrites) > 0 {
+		summary += fmt.Sprintf("\nDESTRUCTIVE ROW REWRITE: %d table(s) will DELETE and re-INSERT whole row groups to free unique slots (FK/trigger side effects fire on rows the sync did not otherwise touch):", len(rewrites))
+		for _, s := range rewrites {
 			summary += "\n  " + s
 		}
 	}

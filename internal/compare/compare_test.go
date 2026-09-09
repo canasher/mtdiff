@@ -2,6 +2,7 @@ package compare
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -201,37 +202,72 @@ func TestMultisetDiffKinds(t *testing.T) {
 	}
 }
 
-// TestApplyKey covers the explicit --key override and the nullable-key
-// warning (P1-2): an explicit key on a column that accepts NULL must
-// surface as a warning.
+// TestApplyKey covers the explicit --key override, the nullable-key
+// warning, and the explicit-key uniqueness resolution (P0-1/P1-1): a
+// resolver that proves the key unique (a real PK / NOT NULL UNIQUE
+// index) flips KeyIsUnique on that side only, a resolver that denies it
+// warns and keeps the key non-unique, and a failing resolver degrades to
+// non-unique with a warning (conservative: an unproven key must never be
+// treated as a row address).
 func TestApplyKey(t *testing.T) {
 	// no explicit key: schemas untouched, no warnings
 	src, dst := schema("t", "a", "b"), schema("t", "a", "b")
-	if warns := applyKey(src, dst, nil); len(warns) != 0 || src.KeySource != "" || dst.KeySource != "" {
+	if warns := applyKey(src, dst, nil, nil); len(warns) != 0 || src.KeySource != "" || dst.KeySource != "" {
 		t.Errorf("no key must leave schemas untouched: %v / %q", warns, src.KeySource)
 	}
 
-	// explicit key on a nullable column: both sides switched, one warning
+	// explicit key on a nullable column (no resolver: uniqueness unproven):
+	// both sides switched, non-unique, one nullable warning
 	src = schemaWithNullable("t", "k", "v")
 	dst = schema("t", "k", "v")
-	warns := applyKey(src, dst, []string{"k"})
+	warns := applyKey(src, dst, []string{"k"}, nil)
 	if src.KeySource != "explicit" || dst.KeySource != "explicit" {
 		t.Errorf("key source must be explicit: %q / %q", src.KeySource, dst.KeySource)
 	}
 	if src.KeyIsUnique || dst.KeyIsUnique {
-		t.Error("explicit key must not claim uniqueness")
+		t.Error("an unproven explicit key must not claim uniqueness")
 	}
 	if len(warns) != 1 || !strings.Contains(warns[0], "column k is nullable") {
 		t.Errorf("nullable key column must warn once, got %v", warns)
 	}
 
-	// explicit key on NOT NULL columns: override, no warnings
+	// explicit key on NOT NULL columns, proven unique on both sides
+	// (P1-1: an explicit --key naming a real PK is recognized): no
+	// warnings, KeyIsUnique on both sides
 	src, dst = schema("t", "k", "v"), schema("t", "k", "v")
-	if warns := applyKey(src, dst, []string{"k"}); len(warns) != 0 {
-		t.Errorf("NOT NULL key must not warn: %v", warns)
+	warns = applyKey(src, dst, []string{"k"}, func(string) (bool, error) { return true, nil })
+	if len(warns) != 0 {
+		t.Errorf("proven-unique NOT NULL key must not warn: %v", warns)
+	}
+	if !src.KeyIsUnique || !dst.KeyIsUnique {
+		t.Error("a proven-unique explicit key must be unique on both sides")
 	}
 	if src.Key[0] != "k" || dst.Key[0] != "k" {
 		t.Errorf("key must be overridden on both sides: %v / %v", src.Key, dst.Key)
+	}
+
+	// proven unique on one side only: that side is unique, the other is
+	// non-unique with a warning
+	src, dst = schema("t", "k", "v"), schema("t", "k", "v")
+	warns = applyKey(src, dst, []string{"k"}, func(side string) (bool, error) {
+		return side == "src", nil
+	})
+	if !src.KeyIsUnique || dst.KeyIsUnique {
+		t.Errorf("uniqueness is per side: src=%v dst=%v", src.KeyIsUnique, dst.KeyIsUnique)
+	}
+	if len(warns) != 1 || !strings.Contains(warns[0], "not a PRIMARY KEY or NOT NULL UNIQUE index on the dst side") {
+		t.Errorf("the non-unique side must warn, got %v", warns)
+	}
+
+	// a resolver that fails: the key is treated as NON-unique with a
+	// warning (conservative default, never an assumption)
+	src, dst = schema("t", "k", "v"), schema("t", "k", "v")
+	warns = applyKey(src, dst, []string{"k"}, func(string) (bool, error) { return false, errors.New("catalog down") })
+	if src.KeyIsUnique || dst.KeyIsUnique {
+		t.Error("an unresolvable explicit key must stay non-unique")
+	}
+	if len(warns) != 2 || !strings.Contains(warns[0], "could not be resolved") {
+		t.Errorf("an unresolvable explicit key must warn per side, got %v", warns)
 	}
 }
 
@@ -358,4 +394,45 @@ func TestFoldDigests(t *testing.T) {
 	if res.Status != "DIFFERENT" || byID != nil {
 		t.Errorf("unmatched digest sets must be DIFFERENT with nil lookup: %+v", res)
 	}
+}
+
+// The differing-chunk list must come out in CHUNK-ID ORDER no matter how
+// the digest maps happen to iterate: the sync plan derives its APPLY
+// ORDER from this list, and the cross-chunk unique-holder verdict is only
+// sound when chunks apply sequentially in KEY order. A random order would
+// apply the writer of a small-chunk unique value move before the chunk
+// that frees its slot, and the unique index rejects the write (the flake
+// behind TestUniqueHolderParallelOneDoesNotDeadlock). The digests live in
+// maps, whose iteration order is randomized per run — so the fold is
+// repeated many times against the same maps.
+func TestFoldDigestsDiffChunksSorted(t *testing.T) {
+	const n = 8
+	chunks := make([]chunk.Chunk, n)
+	src := make(map[int]mhash.ChunkDigest, n)
+	dst := make(map[int]mhash.ChunkDigest, n)
+	for i := 0; i < n; i++ {
+		chunks[i] = chunk.Chunk{ID: i}
+		src[i] = chunkDigest(true, i, 5)
+		dst[i] = chunkDigest(true, i, 6) // every chunk differs
+	}
+	for i := 0; i < 200; i++ {
+		res := TableResult{Name: "t", Status: "OK"}
+		foldDigests(&res, chunks, src, dst, 5*n, 6*n, true, false)
+		if res.Status != "DIFFERENT" || len(res.DiffChunks) != n {
+			t.Fatalf("iteration %d: want DIFFERENT with %d diffs, got %s / %d", i, n, res.Status, len(res.DiffChunks))
+		}
+		for j := 1; j < len(res.DiffChunks); j++ {
+			if res.DiffChunks[j-1].ID >= res.DiffChunks[j].ID {
+				t.Fatalf("iteration %d: the diff list must be in ascending chunk order, got %v", i, idsOf(res.DiffChunks))
+			}
+		}
+	}
+}
+
+func idsOf(ds []ChunkDiff) []int {
+	out := make([]int, len(ds))
+	for i, d := range ds {
+		out[i] = d.ID
+	}
+	return out
 }

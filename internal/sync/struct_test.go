@@ -272,6 +272,194 @@ func TestDiffStructureExpressionDefaultRefused(t *testing.T) {
 	}
 }
 
+// genCol is a generated-column ColMeta (the EXTRA-detected flag plus its
+// storage type).
+func genCol(name, typ, fam, storage string) conn.ColMeta {
+	c := metaCol(name, typ, fam, false)
+	c.Generated, c.GenStorage = true, storage
+	return c
+}
+
+// genColExpr builds a generated column whose expression was read from
+// the backend (readable true) or not (readable false — the backend
+// does not expose GENERATION_EXPRESSION, GenExpr stays "").
+func genColExpr(name, typ, fam, storage, expr string, readable bool) conn.ColMeta {
+	c := genCol(name, typ, fam, storage)
+	c.GenExpr, c.GenExprReadable = expr, readable
+	return c
+}
+
+// TestDiffStructureGeneratedColumnRefused pins P0-2: the structure sync
+// refuses to (re-)define a generated column — the expression is a
+// cross-backend promise, and re-defining would silently drop it — while
+// an identical generated column is left alone and a destination-only one
+// is simply dropped.
+func TestDiffStructureGeneratedColumnRefused(t *testing.T) {
+	// A source generated column the destination lacks: refused, not
+	// emitted (an ADD COLUMN would silently lose the expression).
+	src := &conn.Struct{Cols: []conn.ColMeta{
+		metaCol("id", "int", conn.FamINT, false),
+		genCol("total", "decimal(12,2)", conn.FamDECIMAL, "STORED"),
+	}}
+	dst := &conn.Struct{Cols: []conn.ColMeta{metaCol("id", "int", conn.FamINT, false)}}
+	changes, err := DiffStructure(src, dst, "", "")
+	if err == nil || changes != nil {
+		t.Fatalf("missing generated column: changes=%v err=%v, want the refusal", changes, err)
+	}
+	if !strings.Contains(err.Error(), "generated column") || !strings.Contains(err.Error(), "--no-sync-schema") {
+		t.Fatalf("refusal message = %q", err)
+	}
+
+	// A DRIFTED generated column (its definition moved) is refused the
+	// same way: a MODIFY would re-define it as a plain column.
+	srcDrift := &conn.Struct{Cols: []conn.ColMeta{
+		metaCol("id", "int", conn.FamINT, false),
+		genCol("total", "decimal(14,2)", conn.FamDECIMAL, "STORED"),
+	}}
+	dstDrift := &conn.Struct{Cols: []conn.ColMeta{
+		metaCol("id", "int", conn.FamINT, false),
+		genCol("total", "decimal(12,2)", conn.FamDECIMAL, "STORED"),
+	}}
+	if _, err := DiffStructure(srcDrift, dstDrift, "", ""); err == nil {
+		t.Fatal("drifted generated column must be refused")
+	}
+
+	// A storage-type drift (STORED vs VIRTUAL) is a drift on its own and
+	// is refused as well.
+	srcStore := &conn.Struct{Cols: []conn.ColMeta{
+		metaCol("id", "int", conn.FamINT, false),
+		genCol("total", "decimal(12,2)", conn.FamDECIMAL, "STORED"),
+	}}
+	dstVirt := &conn.Struct{Cols: []conn.ColMeta{
+		metaCol("id", "int", conn.FamINT, false),
+		genCol("total", "decimal(12,2)", conn.FamDECIMAL, "VIRTUAL"),
+	}}
+	if _, err := DiffStructure(srcStore, dstVirt, "", ""); err == nil {
+		t.Fatal("a generated-column storage drift must be refused")
+	}
+
+	// An IDENTICAL generated column on both sides, with the expression
+	// READ on both sides, is not a change: the expression is neither
+	// re-emitted nor refused.
+	dstSame := &conn.Struct{Cols: []conn.ColMeta{
+		metaCol("id", "int", conn.FamINT, false),
+		genColExpr("total", "decimal(12,2)", conn.FamDECIMAL, "STORED", "(`a`) + (`b`)", true),
+	}}
+	srcSame := &conn.Struct{Cols: []conn.ColMeta{
+		metaCol("id", "int", conn.FamINT, false),
+		genColExpr("total", "decimal(12,2)", conn.FamDECIMAL, "STORED", "(`a`) + (`b`)", true),
+	}}
+	if changes, err := DiffStructure(srcSame, dstSame, "", ""); err != nil || len(changes) != 0 {
+		t.Fatalf("identical readable generated column: changes=%v err=%v", changes, err)
+	}
+
+	// A destination-ONLY generated column is dropped (dropping works on
+	// generated columns), not refused.
+	srcPlain := &conn.Struct{Cols: []conn.ColMeta{metaCol("id", "int", conn.FamINT, false)}}
+	dstGen := &conn.Struct{Cols: []conn.ColMeta{
+		metaCol("id", "int", conn.FamINT, false),
+		genCol("total", "decimal(12,2)", conn.FamDECIMAL, "STORED"),
+	}}
+	changes, err = DiffStructure(srcPlain, dstGen, "", "")
+	if err != nil {
+		t.Fatalf("dropping a destination-only generated column: %v", err)
+	}
+	if len(changes) != 1 || changes[0].Kind != ChangeDropColumn || changes[0].Col.Name != "total" {
+		t.Fatalf("want the single DROP COLUMN, got %v", changes)
+	}
+
+	// A column the source reverted to PLAIN is re-defined: the source
+	// definition is reproducible, so the change (which removes the
+	// expression) is planned, not refused.
+	srcPlain2 := &conn.Struct{Cols: []conn.ColMeta{
+		metaCol("id", "int", conn.FamINT, false),
+		metaCol("total", "decimal(12,2)", conn.FamDECIMAL, false),
+	}}
+	changes, err = DiffStructure(srcPlain2, dstGen, "", "")
+	if err != nil {
+		t.Fatalf("un-generating a column: %v", err)
+	}
+	if len(changes) != 1 || changes[0].Kind != ChangeModifyColumn || changes[0].Col.Name != "total" {
+		t.Fatalf("want the single MODIFY COLUMN, got %v", changes)
+	}
+
+	if g := generatedCols(src); len(g) != 1 || g[0] != "total" {
+		t.Fatalf("generatedCols = %v, want [total]", g)
+	}
+	if g := generatedCols(srcPlain); len(g) != 0 {
+		t.Fatalf("generatedCols(plain) = %v, want none", g)
+	}
+}
+
+// TestDiffStructureGeneratedExprCompare pins P1-1: the generation
+// EXPRESSION is part of the definition. Same expression (modulo
+// cosmetic re-printing) -> no drift; a different expression, a VIRTUAL
+// vs STORED swap, or one side unreadable -> drift, and the structure
+// sync REFUSES (explicit error) instead of rebuilding.
+func TestDiffStructureGeneratedExprCompare(t *testing.T) {
+	base := metaCol("id", "int", conn.FamINT, false)
+	one := func(expr string, readable bool) *conn.Struct {
+		return &conn.Struct{Cols: []conn.ColMeta{base, genColExpr("total", "decimal(12,2)", conn.FamDECIMAL, "STORED", expr, readable)}}
+	}
+
+	// 1. the same expression, cosmetically re-printed (whitespace,
+	// outer paren wrapping): no drift, no refusal.
+	if changes, err := DiffStructure(one("  ((`a`) + (`b`))  ", true), one("(`a`) + (`b`)", true), "", ""); err != nil || len(changes) != 0 {
+		t.Fatalf("cosmetically equal expressions: changes=%v err=%v, want none", changes, err)
+	}
+
+	// 2. a genuinely different expression: drift, refused.
+	if _, err := DiffStructure(one("`a` + `b`", true), one("`a` * `b`", true), "", ""); err == nil {
+		t.Fatal("different generation expressions must be refused")
+	}
+
+	// 3. VIRTUAL vs STORED: drift, refused (a re-definition would
+	// change storage semantics).
+	virt := &conn.Struct{Cols: []conn.ColMeta{base, genColExpr("total", "decimal(12,2)", conn.FamDECIMAL, "VIRTUAL", "(`a`) + (`b`)", true)}}
+	stor := &conn.Struct{Cols: []conn.ColMeta{base, genColExpr("total", "decimal(12,2)", conn.FamDECIMAL, "STORED", "(`a`) + (`b`)", true)}}
+	if _, err := DiffStructure(virt, stor, "", ""); err == nil {
+		t.Fatal("a VIRTUAL/STORED storage swap must be refused")
+	}
+
+	// 4. one side unreadable (the backend does not expose
+	// GENERATION_EXPRESSION): never assumed equal to a readable one —
+	// drift, refused (the safe direction).
+	if _, err := DiffStructure(one("", false), one("(`a`) + (`b`)", true), "", ""); err == nil {
+		t.Fatal("an unreadable-vs-readable expression pair must be refused, not matched")
+	}
+
+	// 5. both unreadable: nothing to compare. The old behavior treated
+	// "" == "" as equal (a FALSE GREEN: src x AS (a+b) vs dst
+	// x AS (a-b) on backends that both hide the expression would
+	// pass). Now the pair is a drift refused with a message that says
+	// the equality cannot be proven.
+	if _, err := DiffStructure(one("", false), one("", false), "", ""); err == nil ||
+		!strings.Contains(err.Error(), "unreadable") || !strings.Contains(err.Error(), "cannot be proven safely") {
+		t.Fatalf("two unreadable expressions: err=%v, want the conservative refusal", err)
+	}
+}
+
+// TestNormalizeGenerationExpr pins the conservative normalization: trim
+// plus whole-string paren peeling, nothing else. A quote anywhere
+// disables the peeling (a literal parenthesis would defeat the balance
+// scan); under-normalizing is the safe direction.
+func TestNormalizeGenerationExpr(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"  a + b  ", "a + b"},
+		{"(a) + (b)", "(a) + (b)"},
+		{"  ((a)+(b))  ", "(a)+(b)"},
+		{"(a)+b", "(a)+b"},                             // not fully wrapped: untouched beyond trim
+		{"((a))", "a"},                                 // fully wrapped: peeled to the core
+		{`concat('(', x, ')')`, `concat('(', x, ')')`}, // quotes: no peeling
+		{"", ""},
+	}
+	for _, c := range cases {
+		if got := normalizeGenerationExpr(c.in); got != c.want {
+			t.Errorf("normalizeGenerationExpr(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
 func TestFilterStruct(t *testing.T) {
 	s := &conn.Struct{
 		Table: "t",

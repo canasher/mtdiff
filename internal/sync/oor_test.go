@@ -2,37 +2,53 @@ package sync
 
 import (
 	"database/sql/driver"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
-	"mtdiff/internal/chunk"
 	"mtdiff/internal/conn"
 )
 
-func TestKeyLits(t *testing.T) {
-	lits := keyLits([]string{conn.FamINT, conn.FamUINT, conn.FamSTR, conn.FamBYTES, conn.FamDECIMAL, conn.FamBIT, conn.FamTIME})
+// TestLiteralFor pins the DISPLAY rendering of a raw driver value per
+// column family. The executable write path no longer renders values into
+// SQL text at all (parameterized, P0-3); this path only feeds the
+// human-readable report samples and rowBytes budgeting.
+func TestLiteralFor(t *testing.T) {
 	cases := []struct {
-		lit  chunk.LiteralFunc
+		fam  string
 		v    driver.Value
 		want string
 	}{
-		{lits[0], int64(42), "42"},
-		{lits[1], uint64(7), "7"},
+		{conn.FamINT, int64(42), "42"},
+		{conn.FamUINT, uint64(7), "7"},
 		// character values arrive as []byte and must be quoted, not hexed
-		{lits[2], []byte("a'b"), `'a''b'`},
+		{conn.FamSTR, []byte("a'b"), `'a''b'`},
 		// genuine binary stays a hex blob
-		{lits[3], []byte{0x01, 0x02}, "X'0102'"},
+		{conn.FamBYTES, []byte{0x01, 0x02}, "X'0102'"},
 		// decimal / time arrive as []byte too: quoted, not hexed
-		{lits[4], []byte("1.50"), `'1.50'`},
-		{lits[5], []byte{0b11000000}, `b'11000000'`},
-		{lits[6], []byte("12:34:56"), `'12:34:56'`},
+		{conn.FamDECIMAL, []byte("1.50"), `'1.50'`},
+		{conn.FamBIT, []byte{0b11000000}, `b'11000000'`},
+		{conn.FamTIME, []byte("12:34:56"), `'12:34:56'`},
 	}
 	for i, c := range cases {
-		if got := c.lit(c.v); got != c.want {
-			t.Errorf("case %d: got %s, want %s", i, got, c.want)
+		if got := literalFor(c.fam, c.v); got != c.want {
+			t.Errorf("case %d (%s): got %s, want %s", i, c.fam, got, c.want)
 		}
 	}
+}
+
+// sameBoundArgs reports whether the bound arguments equal want, in order.
+func sameBoundArgs(got []any, want ...any) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range want {
+		if !reflect.DeepEqual(got[i], want[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 func intSchema(key ...string) *conn.Schema {
@@ -50,14 +66,17 @@ func TestOorPredicate(t *testing.T) {
 		srcS, dst *conn.Schema
 		minV, max []driver.Value
 		want      string
+		wantArgs  []any
 		ok        bool
 	}{
 		{
 			name: "single int column",
 			srcS: intSchema("id"), dst: intSchema("id"),
 			minV: []driver.Value{int64(1)}, max: []driver.Value{int64(100)},
-			want: "(`id` IS NULL OR `id` < 1) OR `id` > 100",
-			ok:   true,
+			want: "(`id` IS NULL OR `id` < ?) OR `id` > ?",
+			// P0-1: the bound values travel as data, never in the SQL text
+			wantArgs: []any{int64(1), int64(100)},
+			ok:       true,
 		},
 		{
 			name: "all-NULL minimum: only the upper tail can match",
@@ -70,43 +89,70 @@ func TestOorPredicate(t *testing.T) {
 			name: "composite key",
 			srcS: intSchema("a", "b"), dst: intSchema("a", "b"),
 			minV: []driver.Value{int64(1), int64(2)}, max: []driver.Value{int64(9), int64(9)},
-			want: "((`a` IS NULL OR `a` < 1) OR (`a` = 1 AND (`b` IS NULL OR `b` < 2))) OR (`a` > 9 OR (`a` = 9 AND `b` > 9))",
-			ok:   true,
+			want:     "((`a` IS NULL OR `a` < ?) OR (`a` = ? AND (`b` IS NULL OR `b` < ?))) OR (`a` > ? OR (`a` = ? AND `b` > ?))",
+			wantArgs: []any{int64(1), int64(1), int64(2), int64(9), int64(9), int64(9)},
+			ok:       true,
+		},
+		{
+			name: "string key: values never rendered into SQL",
+			srcS: &conn.Schema{
+				Table: "t",
+				Cols:  []conn.Column{{Name: "k", Family: conn.FamSTR, RawType: "varchar(128)"}},
+				Key:   []string{"k"},
+			},
+			dst: &conn.Schema{
+				Table: "d",
+				Cols:  []conn.Column{{Name: "k", Family: conn.FamSTR, RawType: "varchar(128)"}},
+				Key:   []string{"k"},
+			},
+			minV: []driver.Value{`a\b'中文`}, max: []driver.Value{`z\\末`},
+			want:     "(`k` IS NULL OR `k` < ?) OR `k` > ?",
+			wantArgs: []any{`a\b'中文`, `z\\末`},
+			ok:       true,
 		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			p := &prep{srcS: c.srcS, dstS: c.dst}
 			got, ok := r.oorPredicate(p, c.minV, c.max)
-			if ok != c.ok || got != c.want {
-				t.Errorf("got (%q, %v), want (%q, %v)", got, ok, c.want, c.ok)
+			if ok != c.ok || got.SQL != c.want {
+				t.Errorf("got (%q args %v, %v), want (%q args %v, %v)",
+					got.SQL, got.Args, ok, c.want, c.wantArgs, c.ok)
+			}
+			if c.wantArgs != nil && !sameBoundArgs(got.Args, c.wantArgs...) {
+				t.Errorf("args = %v, want %v", got.Args, c.wantArgs)
 			}
 		})
 	}
 }
 
-// TestOorPredicateFamilyLiterals pins the family-aware rendering: a
-// decimal key must be compared as a quoted string, not a hex blob.
-func TestOorPredicateFamilyLiterals(t *testing.T) {
+// TestOorPredicateBoundData pins the parameterized bound handling: a
+// decimal key (which arrives as []byte) and a string key are compared via
+// bound arguments — the raw bytes never enter the SQL text, so the
+// predicate is byte-exact under any sql_mode (NO_BACKSLASH_ESCAPES).
+func TestOorPredicateBoundData(t *testing.T) {
 	r := &Runner{}
-	srcS := &conn.Schema{
-		Table: "t",
-		Cols:  []conn.Column{{Name: "k", Family: conn.FamDECIMAL, RawType: "decimal(10,2)"}},
-		Key:   []string{"k"},
+	mk := func(fam, raw, table string) *conn.Schema {
+		return &conn.Schema{
+			Table: table,
+			Cols:  []conn.Column{{Name: "k", Family: fam, RawType: raw}},
+			Key:   []string{"k"},
+		}
 	}
-	dstS := &conn.Schema{
-		Table: "d",
-		Cols:  []conn.Column{{Name: "k", Family: conn.FamDECIMAL, RawType: "decimal(10,2)"}},
-		Key:   []string{"k"},
-	}
-	got, ok := r.oorPredicate(&prep{srcS: srcS, dstS: dstS},
+	got, ok := r.oorPredicate(&prep{srcS: mk(conn.FamDECIMAL, "decimal(10,2)", "t"), dstS: mk(conn.FamDECIMAL, "decimal(10,2)", "d")},
 		[]driver.Value{[]byte("5.00")}, []driver.Value{[]byte("9.99")})
 	if !ok {
 		t.Fatal("ok = false, want true")
 	}
-	want := "(`k` IS NULL OR `k` < '5.00') OR `k` > '9.99'"
-	if got != want {
-		t.Errorf("got %q, want %q", got, want)
+	want := "(`k` IS NULL OR `k` < ?) OR `k` > ?"
+	if got.SQL != want {
+		t.Errorf("got %q, want %q", got.SQL, want)
+	}
+	if !sameBoundArgs(got.Args, []byte("5.00"), []byte("9.99")) {
+		t.Errorf("args = %v, want the raw decimal bytes bound", got.Args)
+	}
+	if strings.Contains(got.SQL, "5.00") || strings.Contains(got.SQL, "9.99") {
+		t.Errorf("bound values must not be rendered into the SQL text: %q", got.SQL)
 	}
 }
 

@@ -123,6 +123,9 @@ sql src srcdb seed_common.sql
 sql src srcdb seed_src.sql
 sql dst dstdb seed_common.sql
 sql dst dstdb seed_dst.sql
+# t_strkey seeds itself with NO_BACKSLASH_ESCAPES (literal backslash keys)
+sql src srcdb seed_str.sql
+sql dst dstdb seed_str.sql
 
 say "consistency"
 expect 0 "identical clean tables" \
@@ -139,6 +142,36 @@ expect 1 "JSON text differs raw" --src "$SRC" --dst "$DST" --tables t_json
 expect 0 "JSON text equal after --normalize-json" --src "$SRC" --dst "$DST" --tables t_json --normalize-json
 expect 1 "NULL vs empty string" --src "$SRC" --dst "$DST" --tables t_nulltrap
 expect 1 "enum value differs" --src "$SRC" --dst "$DST" --tables t_enumtrap
+
+say "session time zone pin (P0-2)"
+# The servers' DEFAULT zones are made to differ (src +00:00, dst +08:00):
+# a new session starts in the server's zone unless it pins
+# @@session.time_zone itself. The seeded pair displays IDENTICAL text
+# under those default zones while holding DIFFERENT UTC instants — an
+# unpinned session (the pre-fix mtdiff) would report the table identical.
+qdb src srcdb "SET GLOBAL time_zone = '+00:00'"
+qdb dst dstdb "SET GLOBAL time_zone = '+08:00'"
+s=$(qdb src srcdb "SELECT ts FROM t_timestamp_tz")
+d=$(qdb dst dstdb "SELECT ts FROM t_timestamp_tz")
+[ "$s" = "2024-01-01 08:00:00" ] && [ "$d" = "2024-01-01 08:00:00" ] || \
+  { echo "FAIL: false-identical setup broken (src display=$s dst display=$d)"; exit 1; }
+echo "ok: both sides display $s under their default zones"
+u1=$(qdb src srcdb "SELECT UNIX_TIMESTAMP(ts) FROM t_timestamp_tz")
+u2=$(qdb dst dstdb "SELECT UNIX_TIMESTAMP(ts) FROM t_timestamp_tz")
+[ "$u1" != "$u2" ] || { echo "FAIL: the instants must differ ($u1)"; exit 1; }
+echo "ok: the instants differ (src=$u1 dst=$u2)"
+expect 1 "cross-timezone TIMESTAMP: same display, different instants" --src "$SRC" --dst "$DST" --tables t_timestamp_tz
+# the SAME instant under different default zones still compares equal
+expect 0 "same instant across different default zones (tz_ts)" --src "$SRC" --dst "$DST" --tables tz_ts
+# the sync must converge the INSTANT, not the display string
+expect 1 "tz: sync dry-run plans the difference" sync --src "$SRC" --dst "$DST" --tables t_timestamp_tz
+expect 0 "tz: sync --apply converges the instant" sync --src "$SRC" --dst "$DST" --tables t_timestamp_tz --apply --yes
+u1=$(qdb src srcdb "SELECT UNIX_TIMESTAMP(ts) FROM t_timestamp_tz")
+u2=$(qdb dst dstdb "SELECT UNIX_TIMESTAMP(ts) FROM t_timestamp_tz")
+[ "$u1" = "$u2" ] || { echo "FAIL: post-sync instants differ (src=$u1 dst=$u2)"; exit 1; }
+echo "ok: post-sync instants agree ($u1)"
+# restore the original default zone for the remaining scenarios
+qdb dst dstdb "SET GLOBAL time_zone = '+00:00'"
 
 say "P1 review regressions"
 # t_chunk spans id 1..90001; at --chunk-size 10000 the span is divisible by
@@ -163,6 +196,136 @@ expect 1 "nullable-unique-key: NULL row changed" --src "$SRC" --dst "$DST" --tab
 expect 0 "identical fractional-second table" --src "$SRC" --dst "$DST" --tables t_fracsec
 sql dst dstdb m_fracsec_change.sql
 expect 1 "fractional seconds: 0.1 vs 0.01 differ" --src "$SRC" --dst "$DST" --tables t_fracsec
+
+say "round-8 value regressions"
+# P0-1: >64KiB BLOB payloads. The old 2-byte canonical length truncated
+# modulo 65536 and could collide distinct rows; both the default and
+# --secure hash modes must report the divergence.
+expect 1 "large BLOB: >64KiB divergence (default hash)" --src "$SRC" --dst "$DST" --tables t_bigblob
+expect 1 "large BLOB: >64KiB divergence (--secure)" --src "$SRC" --dst "$DST" --tables t_bigblob --secure
+expect 0 "large BLOB: 1MiB identical table" --src "$SRC" --dst "$DST" --tables t_bigblob_ok
+# P0-4: large-magnitude finite floats at a small tolerance. The old
+# quantizer saturated 1e10/2e10 to +Inf and would report them identical.
+expect 1 "large floats: 1e10 vs 2e10 at --tolerance 1e-9" --src "$SRC" --dst "$DST" --tables t_float_big2 --tolerance 1e-9
+# P1-5: MySQL TIME in the driver's actual text types (negative + fractional)
+expect 0 "TIME: identical incl. negative and fractional" --src "$SRC" --dst "$DST" --tables t_time
+sql dst dstdb m_time_change.sql
+expect 1 "TIME: negative value changed" --src "$SRC" --dst "$DST" --tables t_time
+expect 0 "TIME: sync --apply converges" sync --src "$SRC" --dst "$DST" --tables t_time --apply --yes
+# CAST both operands: TIMESTAMPDIFF with a string-literal operand returns
+# NULL (not the difference) for negative results on MySQL 8
+v=$(qdst "SELECT TIMESTAMPDIFF(MICROSECOND, CAST('00:00:00' AS TIME), CAST(v AS TIME)) FROM t_time WHERE id = 3")
+[ "$v" = "-3723000000" ] || { echo "FAIL: converged TIME value (id=3) = $v, want -3723000000"; exit 1; }
+echo "ok: converged TIME value is the negative seed value"
+# P1-6: cross-family numerics — INT 1 vs BIGINT UNSIGNED 1 compare equal
+# (non-strict, announced); strict types reject the pair outright.
+expect 0 "cross-family numeric: INT vs BIGINT UNSIGNED 1 (non-strict)" --src "$SRC" --dst "$DST" --tables t_numfam
+if ! grep -q "numeric types differ" "$OUT"; then
+  echo "FAIL: the cross-family comparison must announce the normalization"; cat "$OUT"; exit 1
+fi
+echo "ok: cross-family normalization announced"
+expect 2 "cross-family numeric rejected by --strict-types" --src "$SRC" --dst "$DST" --tables t_numfam --strict-types
+# P1-7: JSON numbers beyond 2^53 stay distinct under --normalize-json
+# (MySQL stores both exactly; a float64 round trip would merge them)
+expect 1 "JSON: 9007199254740992 vs ...93 under --normalize-json" --src "$SRC" --dst "$DST" --tables t_jsonbig --normalize-json
+expect 0 "JSON: 1 vs 1.0 equal under --normalize-json" --src "$SRC" --dst "$DST" --tables t_jsonbig_ok --normalize-json
+expect 1 "JSON: 1 vs 1.0 differ raw (no --normalize-json)" --src "$SRC" --dst "$DST" --tables t_jsonbig_ok
+# P0-3: a string key with different collations orders rows differently.
+# Identical data still compares equal — via the announced keyless
+# whole-table multiset fallback, never via shared key bounds.
+expect 0 "cross-collation key: identical data via keyless fallback" --src "$SRC" --dst "$DST" --tables t_keycoll
+if ! grep -q "not range-addressable" "$OUT"; then
+  echo "FAIL: the key-ordering fallback must be announced"; cat "$OUT"; exit 1
+fi
+echo "ok: key-ordering fallback announced"
+# ...and a DIFFERENT pair must not get row-level addressing: with
+# --no-sync-schema (no alignment) the table fails closed, the dry run
+# and the apply alike — and the apply writes NOTHING (the FK child's
+# row count proves no wrong out-of-range delete cascaded).
+expect 2 "cross-collation key: --no-sync-schema refuses row-level (dry-run)" sync --src "$SRC" --dst "$DST" --tables t_keyfk --no-sync-schema
+if ! grep -q "key ordering" "$OUT"; then
+  echo "FAIL: the refusal must name the key-ordering cause"; cat "$OUT"; exit 1
+fi
+echo "ok: the refusal names the key-ordering cause"
+expect 2 "cross-collation key: --no-sync-schema --apply writes nothing" sync --src "$SRC" --dst "$DST" --tables t_keyfk --no-sync-schema --apply --yes
+n=$(qdst "SELECT COUNT(*) FROM t_keyfk")
+[ "$n" = "2" ] || { echo "FAIL: the refused apply wrote to the parent (count=$n, want 2)"; exit 1; }
+v=$(qdst "SELECT v FROM t_keyfk WHERE k = 'a'")
+[ "$v" = "99" ] || { echo "FAIL: the refused apply must leave the data untouched (v=$v, want the drifted 99)"; exit 1; }
+n=$(qdst "SELECT COUNT(*) FROM t_keyfk_child")
+[ "$n" = "2" ] || { echo "FAIL: the refused apply cascaded to the FK child (count=$n, want 2)"; exit 1; }
+echo "ok: the refused apply left the parent and the FK child untouched"
+expect 3 "cross-collation key: --no-sync-schema --where is an argument error" sync --src "$SRC" --dst "$DST" --tables t_keyfk --no-sync-schema --where "v >= 0"
+# With the structure sync (the default) the drift is REPAIRED instead:
+# the destination's key collation is aligned with the source's, after
+# which the (identical) data is row-level safe.
+expect 1 "cross-collation key: default sync plans the collation DDL" sync --src "$SRC" --dst "$DST" --tables t_keycoll
+if ! grep -q "COLLATE utf8mb4_bin" "$OUT"; then
+  echo "FAIL: the structure plan must align the key collation"; cat "$OUT"; exit 1
+fi
+echo "ok: the structure plan aligns the key collation"
+expect 0 "cross-collation key: default sync --apply" sync --src "$SRC" --dst "$DST" --tables t_keycoll --apply --yes
+col=$(qdst "SELECT COLLATION_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='dstdb' AND TABLE_NAME='t_keycoll' AND COLUMN_NAME='k'")
+[ "$col" = "utf8mb4_bin" ] || { echo "FAIL: dst key collation after sync: $col, want utf8mb4_bin"; exit 1; }
+echo "ok: dst key collation aligned"
+expect 0 "cross-collation key: diff identical after the alignment" --src "$SRC" --dst "$DST" --tables t_keycoll
+
+say "round-9 value regressions"
+# P0-1: a JSON number is not a JSON string — the type must SURVIVE
+# --normalize-json (the old canonicalizer rendered a number as a quoted
+# string: {"n":1} and {"n":"1"} both normalized to {"n":"1"}).
+expect 1 "JSON: number 1 vs string '1' (raw)" --src "$SRC" --dst "$DST" --tables t_json_type
+expect 1 "JSON: number 1 vs string '1' under --normalize-json" --src "$SRC" --dst "$DST" --tables t_json_type --normalize-json
+expect 0 "JSON: number 1 vs number 1.0 under --normalize-json" --src "$SRC" --dst "$DST" --tables t_json_type_ok --normalize-json
+expect 1 "JSON: number 1 vs number 1.0 differ raw" --src "$SRC" --dst "$DST" --tables t_json_type_ok
+# P0-2: an ENUM key whose members are DEFINED in the opposite order:
+# identical data, REVERSED ordering semantics — the diff must not share
+# the key bounds (announced keyless fallback), and a --no-sync-schema
+# sync over a divergent table must fail closed with zero writes.
+expect 0 "ENUM key (reversed members): identical data via keyless fallback" --src "$SRC" --dst "$DST" --tables t_enumkey
+if ! grep -q "not range-addressable" "$OUT"; then
+  echo "FAIL: the ENUM key-ordering fallback must be announced"; cat "$OUT"; exit 1
+fi
+echo "ok: ENUM key-ordering fallback announced"
+expect 2 "ENUM key (reversed members): --no-sync-schema refuses row-level (dry-run)" sync --src "$SRC" --dst "$DST" --tables t_enumkey_drift --no-sync-schema
+if ! grep -q "key ordering" "$OUT"; then
+  echo "FAIL: the refusal must name the key-ordering cause"; cat "$OUT"; exit 1
+fi
+echo "ok: the refusal names the key-ordering cause"
+expect 2 "ENUM key (reversed members): --no-sync-schema --apply writes nothing" sync --src "$SRC" --dst "$DST" --tables t_enumkey_drift --no-sync-schema --apply --yes
+n=$(qdst "SELECT COUNT(*) FROM t_enumkey_drift")
+[ "$n" = "2" ] || { echo "FAIL: the refused apply wrote to the table (count=$n, want 2)"; exit 1; }
+v=$(qdst "SELECT v FROM t_enumkey_drift WHERE k = 'b'")
+[ "$v" = "99" ] || { echo "FAIL: the refused apply must leave the data untouched (v=$v, want the drifted 99)"; exit 1; }
+# the DEFAULT sync repairs the DEFINITION instead: the structure DDL
+# re-emits the source's ENUM definition verbatim, but the key is STILL
+# not range-addressable (an ENUM/SET key never is, even with identical
+# definitions) — so the data is converged by an order-independent FULL
+# resync (TRUNCATE + reload), not by row-level addressing.
+expect 1 "ENUM key: default sync plans the ENUM definition DDL" sync --src "$SRC" --dst "$DST" --tables t_enumkey_drift
+if ! grep -qi "ENUM" "$OUT"; then
+  echo "FAIL: the structure plan must align the ENUM definition"; cat "$OUT"; exit 1
+fi
+echo "ok: the structure plan aligns the ENUM definition"
+expect 0 "ENUM key: default sync --apply" sync --src "$SRC" --dst "$DST" --tables t_enumkey_drift --apply --yes
+kcol=$(qdst "SELECT COLUMN_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='dstdb' AND TABLE_NAME='t_enumkey_drift' AND COLUMN_NAME='k'")
+[ "$kcol" = "enum('b','a')" ] || { echo "FAIL: dst key type after sync: $kcol, want enum('b','a')"; exit 1; }
+echo "ok: dst ENUM definition aligned"
+v=$(qdst "SELECT v FROM t_enumkey_drift WHERE k = 'b'")
+[ "$v" = "2" ] || { echo "FAIL: the converged value (v=$v, want 2)"; exit 1; }
+echo "ok: the data converged after the alignment"
+expect 0 "ENUM key: diff identical after the alignment" --src "$SRC" --dst "$DST" --tables t_enumkey_drift
+# P1-3: the shared canonical numeric payload — the same value across
+# numeric families (BIGINT vs DOUBLE, DECIMAL vs DOUBLE) compares equal
+# non-strict (announced), and --strict-types still rejects the pair.
+expect 0 "cross-family numeric: BIGINT vs DOUBLE 1000000 (non-strict)" --src "$SRC" --dst "$DST" --tables t_numfam_large
+if ! grep -q "numeric types differ" "$OUT"; then
+  echo "FAIL: the cross-family comparison must announce the normalization"; cat "$OUT"; exit 1
+fi
+echo "ok: cross-family normalization announced"
+expect 2 "cross-family numeric: BIGINT vs DOUBLE rejected by --strict-types" --src "$SRC" --dst "$DST" --tables t_numfam_large --strict-types
+expect 0 "cross-family numeric: DECIMAL(20,10) 0.0000100000 vs DOUBLE 0.00001 (non-strict)" --src "$SRC" --dst "$DST" --tables t_numfam_dec
+expect 2 "cross-family numeric: DECIMAL vs DOUBLE rejected by --strict-types" --src "$SRC" --dst "$DST" --tables t_numfam_dec --strict-types
 
 say "where / mutations on t_mut"
 sql dst dstdb m_where.sql
@@ -268,15 +431,16 @@ expect 1 "diff still differs after dry-run (zero writes)" --src "$SRC" --dst "$D
 # apply: row-level (same row counts) -> verified -> plain diff is clean.
 expect 0 "sync --apply --yes: row-level updates" sync --src "$SRC" --dst "$DST" --tables t_mut --apply --yes
 expect 0 "diff identical after row-level sync" --src "$SRC" --dst "$DST" --tables t_mut
-# dst has MORE rows than src (1498 vs 999): the extra rows are addressed
-# by their key and deleted one by one — the row counts never force a full
-# resync (no TRUNCATE).
+# dst has MORE rows than src (1500 vs 1000): the extra 500 rows all sit
+# OUTSIDE the source's key range, so they converge via the streaming
+# out-of-range delete (COUNT + keyset-paginated batches, never a full key
+# scan) — the row counts never force a full resync (no TRUNCATE).
 sql dst dstdb m_sync_more.sql
 expect 1 "sync dry-run: dst has more rows -> deletes planned" sync --src "$SRC" --dst "$DST" --tables t_mut
-if ! grep -q 'DELETE FROM `t_mut`' "$OUT"; then
-  echo "FAIL: dry-run showed no DELETE sample"; cat "$OUT"; exit 1
+if ! grep -q 'STREAM DELETE' "$OUT"; then
+  echo "FAIL: dry-run showed no STREAM DELETE plan for the out-of-range rows"; cat "$OUT"; exit 1
 fi
-echo "ok: dry-run shows the DELETE sample"
+echo "ok: dry-run streams the out-of-range deletes (counted, not scanned)"
 if grep -q 'TRUNCATE' "$OUT"; then
   echo "FAIL: extra rows escalated to a full resync"; cat "$OUT"; exit 1
 fi
@@ -305,14 +469,16 @@ expect 3 "keyless + --where: cannot sync" sync --src "$SRC" --dst "$DST" --table
 # --where with zero source matches: the source re-plan yields no chunks, so
 # the destination's matching rows are planned from the destination side and
 # deleted outright (a filtered table cannot be truncated — this is the only
-# path to convergence). m_sync_more left 500 rows with id 5001..5499 on the
+# path to convergence). m_sync_more left 500 rows with id 5001..5500 on the
 # dst, none of which exist on the src.
 sql dst dstdb m_sync_more.sql
 expect 1 "where dry-run: empty source match set planned" sync --src "$SRC" --dst "$DST" --tables t_mut --where "id >= 5001"
-if ! grep -q 'DELETE FROM `t_mut`' "$OUT"; then
-  echo "FAIL: where dry-run showed no DELETE sample"; cat "$OUT"; exit 1
+# the empty-source match set is STREAMED (COUNT + bounded key samples +
+# chunk-sized batched deletes), never scanned whole: the plan must say so
+if ! grep -q 'STREAM DELETE' "$OUT"; then
+  echo "FAIL: where dry-run showed no STREAM DELETE plan"; cat "$OUT"; exit 1
 fi
-echo "ok: where dry-run shows DELETE sample"
+echo "ok: where dry-run shows the STREAM DELETE plan (no full key scan)"
 expect 0 "sync --where: empty source match set -> deletes" sync --src "$SRC" --dst "$DST" --tables t_mut --where "id >= 5001" --apply --yes
 expect 0 "diff identical after where-delete sync" --src "$SRC" --dst "$DST" --tables t_mut --where "id >= 5001"
 # non-TTY --apply without --yes: no terminal to confirm in -> arg error.
@@ -336,15 +502,22 @@ sql dst dstdb m_mut_reseed.sql
 expect 0 "sync: identical table, nothing to do" sync --src "$SRC" --dst "$DST" --tables t_mut
 
 say "out-of-range sync"
-# (a) t_oor: dst loses 4 rows, 2 are changed, and 4 keys outside the
-# source's range (id 0 below, 101..103 above) are added — equal counts, so
-# row-level. The out-of-range rows converge only via the out-of-range scan.
+# (a) t_oor: dst loses 4 in-range rows (inserts), 2 are changed, and 4 keys
+# outside the source's range (id 0 below, 101..103 above) are added — equal
+# counts, so row-level. The out-of-range rows converge only via the
+# streaming out-of-range delete.
 sql dst dstdb m_oor_oor.sql
 expect 1 "oor dry-run: deletes planned" sync --src "$SRC" --dst "$DST" --tables t_oor
-if ! grep -q 'DELETE FROM `t_oor`' "$OUT"; then
-  echo "FAIL: oor dry-run showed no DELETE sample"; cat "$OUT"; exit 1
+if ! grep -q 'STREAM DELETE' "$OUT"; then
+  echo "FAIL: oor dry-run showed no STREAM DELETE plan"; cat "$OUT"; exit 1
 fi
-echo "ok: oor dry-run shows DELETE sample"
+echo "ok: oor dry-run plans the stream delete"
+# the out-of-range rows are counted (not scanned) and stream-deleted in
+# keyset-paginated batches BEFORE any in-range write
+if ! grep -q 'out-of-range' "$OUT"; then
+  echo "FAIL: oor dry-run showed no out-of-range stream-delete plan"; cat "$OUT"; exit 1
+fi
+echo "ok: oor dry-run plans the out-of-range stream delete"
 if grep -q 'TRUNCATE' "$OUT"; then
   echo "FAIL: equal-count oor table was planned as a full resync"; cat "$OUT"; exit 1
 fi
@@ -415,12 +588,14 @@ oor=$(qdst "SELECT COUNT(*) FROM t_mut WHERE id = 1002")
 echo "ok: non-matching residual (1002) left in place"
 # (f) t_mut (no --where, equal counts): first-round convergence without a
 # full resync — the pre-fix behavior escalated to TRUNCATE + resync here.
+# The 3 missing in-range rows are inserts; the 3 out-of-range rows are
+# streamed deletes.
 sql dst dstdb m_oor_converge.sql
 expect 1 "converge dry-run: row-level deletes planned" sync --src "$SRC" --dst "$DST" --tables t_mut
-if ! grep -q 'DELETE FROM `t_mut`' "$OUT"; then
-  echo "FAIL: converge dry-run showed no DELETE sample"; cat "$OUT"; exit 1
+if ! grep -q 'STREAM DELETE' "$OUT"; then
+  echo "FAIL: converge dry-run showed no STREAM DELETE plan"; cat "$OUT"; exit 1
 fi
-echo "ok: converge dry-run shows DELETE sample"
+echo "ok: converge dry-run plans the stream delete"
 if grep -q 'TRUNCATE' "$OUT"; then
   echo "FAIL: equal-count table escalated to a full resync"; cat "$OUT"; exit 1
 fi
@@ -547,6 +722,46 @@ qdb src srcdb2 "SELECT 1" >/dev/null 2>&1 || \
 $COMPOSE -f e2e/docker-compose.yml exec -T -e MYSQL_PWD=rootpw mysql-dst \
   mysql -uroot -e "DROP DATABASE IF EXISTS dstdb2; CREATE DATABASE dstdb2"
 sql src srcdb2 seed_src2.sql
+# (0) real-MySQL regression for the destructive re-gates and the
+# parallel=1 liveness edge: the DROP TOCTOU re-check (a source table
+# appearing after the confirmed plan refuses the drop), the
+# destructive-scope re-gate (an apply-time escalation to the full
+# resync that the confirmed plan never showed stops the table, zero
+# writes), and the unique-holder check at parallel=1 (the plan pins the
+# pool's ONLY scan connection per side; the check must reuse it, and a
+# watchdog catches the pre-fix self-deadlock). Go tests against this
+# same pair; they own three throwaway tables (t_droprace, t_xid,
+# t_hold1) and drop them again, so the scenarios below are unaffected.
+# Skips cleanly when the host has no Go toolchain (the container hosts
+# of this suite do not always have one).
+GOCMD=""
+if command -v go >/dev/null 2>&1; then
+  GOCMD=go
+elif [ -x /home/liukl/sdk/go/bin/go ]; then
+  GOCMD=/home/liukl/sdk/go/bin/go
+fi
+if [ -n "$GOCMD" ]; then
+  # The real-MySQL tests run package-by-package, SERIALLY (the sync package
+  # first, then the conn package) — never the two packages at once. They are
+  # keyed only on the database, so two package binaries running in parallel
+  # against the same srcdb2/dstdb2 pair would cross-contaminate: the conn
+  # package's KILL-by-PROCESSLIST (WHERE DB = ? AND COMMAND = 'Sleep') would
+  # KILL the sync package's idle connections, and the sync holder's
+  # connection census (SELECT COUNT(*) FROM information_schema.PROCESSLIST
+  # WHERE DB = ?) would count the conn package's connections too (e.g. "6
+  # connections, want 4"). A finished go test process closes every one of
+  # its connections, so two serial runs can never overlap on a database.
+  if MTDIFF_E2E_DSN_SRC="$SRC2" MTDIFF_E2E_DSN_DST="$DST2" \
+    "$GOCMD" test -count=1 -timeout 10m -run 'TestDropRaceRealMySQL|TestScopeEscalationRealMySQL|TestUniqueHolderParallelOneDoesNotDeadlock|TestRealWriterKillReconnectApplyPath' ./internal/sync/ \
+    && MTDIFF_E2E_DSN_SRC="$SRC2" MTDIFF_E2E_DSN_DST="$DST2" \
+    "$GOCMD" test -count=1 -timeout 10m -run 'TestRealScanReplacementReinitialized|TestRealControlReplacementReinitialized|TestRealActiveControlKillRecovers|TestRealWriterReplacementReinitialized|TestRealTimezonePinnedAllSessions' ./internal/conn/; then
+    echo "ok: real-MySQL destructive re-gates + parallel=1 holder liveness + connection-replacement policy (run SERIALLY — sync package, then conn package — so the KILL-by-PROCESSLIST and the connection census never see the other package's connections: drop TOCTOU re-check, scope escalation refusal, pinned-connection holder check, writer KILL recovery through the production apply path, scan/control/writer replacement re-initialization, active-session KILL recovery, session time-zone pin on every pool)"
+  else
+    echo "FAIL: real-MySQL re-gate / parallel=1 regression"; exit 1
+  fi
+else
+  echo "note: no go toolchain on the host; skipping the real-MySQL re-gate regression"
+fi
 # (a) empty dst database: the dry-run plans a CREATE for every source
 # table (t_new included) and writes nothing.
 expect 1 "empty dst: dry-run plans the creates" sync --src "$SRC2" --dst "$DST2"
@@ -671,14 +886,15 @@ expect 0 "excluded table: whole-database run is clean" sync --src "$SRC2" --dst 
 n=$(qdb dst dstdb2 "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA='dstdb2' AND TABLE_NAME='t_extra'")
 [ "$n" = "1" ] || { echo "FAIL: --exclude-tables dropped the excluded table (count=$n)"; exit 1; }
 echo "ok: --exclude-tables spares the extra table"
-# (h) a stray row on a keyed table (3 vs 4): one row-level DELETE, never a
+# (h) a stray row on a keyed table (3 vs 4), OUTSIDE the source's key
+# range: it converges via the streaming out-of-range delete — never a
 # full resync.
 sql dst dstdb2 m_dst2_plain_stray.sql
 expect 1 "stray row: DELETE planned (dry-run)" sync --src "$SRC2" --dst "$DST2" --tables t_plain
-if ! grep -q 'DELETE FROM `t_plain`' "$OUT"; then
-  echo "FAIL: no DELETE sample for the stray row"; cat "$OUT"; exit 1
+if ! grep -q 'STREAM DELETE' "$OUT"; then
+  echo "FAIL: no STREAM DELETE plan for the stray row"; cat "$OUT"; exit 1
 fi
-echo "ok: dry-run shows the DELETE sample"
+echo "ok: dry-run streams the stray-row delete"
 if grep -q 'TRUNCATE' "$OUT"; then
   echo "FAIL: a stray row escalated to a full resync"; cat "$OUT"; exit 1
 fi
@@ -703,6 +919,515 @@ echo "ok: --no-sync-schema explains why the table is not created"
 # ...and the plain default (structure sync on, no --where) creates it.
 expect 0 "missing table: created by the default sync" sync --src "$SRC2" --dst "$DST2" --tables t_new --apply --yes
 expect 0 "diff identical after re-create" --src "$SRC2" --dst "$DST2" --tables t_new
+
+say "explicit --key uniqueness (P0-1 / P1-1)"
+# t_wk.k has only a plain (non-unique) index. With --where, a row-level
+# sync would delete whole key groups on the rows the filter excluded:
+# an argument error, in the dry run and under --apply alike, before any
+# write connection exists.
+sql dst dstdb m_wk_change.sql
+expect 3 "non-unique --key + --where: arg error (dry-run)" sync --src "$SRC" --dst "$DST" --tables t_wk --key k --where "id < 5"
+if ! grep -q 'not PRIMARY KEY or NOT NULL UNIQUE' "$OUT"; then
+  echo "FAIL: missing the uniqueness rejection"; cat "$OUT"; exit 1
+fi
+echo "ok: the rejection names the requirement"
+expect 3 "non-unique --key + --where: arg error (--apply)" sync --src "$SRC" --dst "$DST" --tables t_wk --key k --where "id < 5" --apply --yes
+n=$(qdst "SELECT COUNT(*) FROM t_wk WHERE k = 99")
+[ "$n" = "1" ] || { echo "FAIL: the rejected sync wrote to the dst (k=99 count=$n, want 1)"; exit 1; }
+echo "ok: the rejected sync wrote nothing"
+# t_swap.v is NOT NULL UNIQUE: an explicit --key on it is recognized as
+# unique. With the key value stable and the other column changed, a
+# recognized-unique key converges with a plain row-level UPDATE — group
+# replace (non-unique semantics) would delete + re-insert instead.
+sql dst dstdb m_swap_change.sql
+expect 1 "unique --key: row-level UPDATE planned" sync --src "$SRC" --dst "$DST" --tables t_swap --key v
+if ! grep -q 'UPDATE `t_swap`' "$OUT"; then
+  echo "FAIL: the unique --key must yield a plain update (group replace would delete+insert)"; cat "$OUT"; exit 1
+fi
+if grep -q 'TRUNCATE' "$OUT"; then
+  echo "FAIL: the unique --key escalated to a full resync"; cat "$OUT"; exit 1
+fi
+echo "ok: the unique --key yields row-level updates"
+expect 0 "unique --key --apply: converged" sync --src "$SRC" --dst "$DST" --tables t_swap --key v --apply --yes
+# Address change: when the unique key's OWN value changes, the row address
+# moved — delete + insert is the only correct shape (never an UPDATE).
+# The 'Z' row is OUTSIDE the source's key span (src has 'A','B'), so its
+# delete is STREAMED (counted, never scanned) and the plan states it
+# commits BEFORE the in-range writes — otherwise the insert would
+# duplicate the PK the out-of-range row still holds (regression:
+# duplicate entry for PRIMARY at apply time).
+sql dst dstdb m_swap_addr.sql
+expect 1 "unique --key, changed key value: delete+insert" sync --src "$SRC" --dst "$DST" --tables t_swap --key v
+if ! grep -q 'INSERT INTO `t_swap`' "$OUT"; then
+  echo "FAIL: a changed unique key value must convert to delete+insert"; cat "$OUT"; exit 1
+fi
+if ! grep -q 'STREAM DELETE.*committed before' "$OUT"; then
+  echo "FAIL: the out-of-range stream delete must precede the insert"; cat "$OUT"; exit 1
+fi
+echo "ok: the changed key value is delete+insert, stream delete first (no TRUNCATE)"
+expect 0 "unique --key, changed key value --apply" sync --src "$SRC" --dst "$DST" --tables t_swap --key v --apply --yes
+expect 0 "unique --key + --where: allowed (identical)" --src "$SRC" --dst "$DST" --tables t_swap --key v --where "id < 5"
+
+say "unique value swap: default refusal, opt-in rewrite (P0-2)"
+sql dst dstdb m_swap.sql
+# Default: the destructive DELETE+INSERT rewrite is DISABLED (it fires
+# FK ON DELETE CASCADE, triggers and audit logs for rows the user never
+# asked to change): the table is refused, in the dry run and under
+# --apply alike, with zero writes.
+expect 2 "swap dry-run: REFUSED (rewrite disabled by default)" sync --src "$SRC" --dst "$DST" --tables t_swap
+if ! grep -q -- '--allow-row-rewrite' "$OUT"; then
+  echo "FAIL: the refusal must name the opt-in flag"; cat "$OUT"; exit 1
+fi
+echo "ok: the refusal names the opt-in flag"
+expect 2 "swap --apply: REFUSED before any write" sync --src "$SRC" --dst "$DST" --tables t_swap --apply --yes
+v=$(qdst "SELECT v FROM t_swap WHERE id = 1")
+[ "$v" = "A" ] || { echo "FAIL: the refused swap wrote to the dst (id=1 v=$v, want the drifted A)"; exit 1; }
+echo "ok: the refused swap left the dst untouched"
+# With the flag: the destructive rewrite is permitted and converges.
+expect 0 "swap --allow-row-rewrite --apply: rewritten" sync --src "$SRC" --dst "$DST" --tables t_swap --allow-row-rewrite --apply --yes
+expect 0 "swap identical after the rewrite" --src "$SRC" --dst "$DST" --tables t_swap
+v=$(qdst "SELECT v FROM t_swap WHERE id = 1")
+[ "$v" = "B" ] || { echo "FAIL: swapped value not restored (id=1 v=$v, want B)"; exit 1; }
+echo "ok: the destructive rewrite converged the swap"
+
+say "unique value cycle: default refusal (P0-2)"
+sql dst dstdb m_u3_cycle.sql
+expect 2 "cycle dry-run: REFUSED (no row order applies a cycle)" sync --src "$SRC" --dst "$DST" --tables t_u3
+if ! grep -q -- '--allow-row-rewrite' "$OUT"; then
+  echo "FAIL: the cycle refusal must name the opt-in flag"; cat "$OUT"; exit 1
+fi
+v=$(qdst "SELECT u FROM t_u3 WHERE id = 1")
+[ "$v" = "B" ] || { echo "FAIL: the refused cycle wrote to the dst (id=1 u=$v, want the drifted B)"; exit 1; }
+echo "ok: the refused cycle left the dst untouched"
+expect 0 "cycle --allow-row-rewrite --apply: rewritten" sync --src "$SRC" --dst "$DST" --tables t_u3 --allow-row-rewrite --apply --yes
+expect 0 "cycle identical after the rewrite" --src "$SRC" --dst "$DST" --tables t_u3
+v=$(qdst "SELECT u FROM t_u3 WHERE id = 1")
+[ "$v" = "A" ] || { echo "FAIL: cycled value not restored (id=1 u=$v, want A)"; exit 1; }
+echo "ok: the destructive rewrite converged the cycle"
+
+say "FK ON DELETE CASCADE: the default refusal never cascades (P0-2)"
+sql dst dstdb m_fk_swap.sql
+expect 2 "fk swap dry-run: REFUSED" sync --src "$SRC" --dst "$DST" --tables t_fk
+expect 2 "fk swap --apply: REFUSED" sync --src "$SRC" --dst "$DST" --tables t_fk --apply --yes
+n=$(qdst "SELECT COUNT(*) FROM t_fkc")
+[ "$n" = "2" ] || { echo "FAIL: the child rows are gone after the refusal (count=$n, want 2) — the default must never rewrite"; exit 1; }
+echo "ok: the child rows survived the refusal (no cascade)"
+# With the flag the rewrite is permitted — and the cascade follows
+# (the documented risk the default exists to prevent).
+expect 0 "fk swap --allow-row-rewrite --apply" sync --src "$SRC" --dst "$DST" --tables t_fk --allow-row-rewrite --apply --yes
+v=$(qdst "SELECT code FROM t_fk WHERE id = 1")
+[ "$v" = "A" ] || { echo "FAIL: the parent did not converge (id=1 code=$v, want A)"; exit 1; }
+n=$(qdst "SELECT COUNT(*) FROM t_fkc")
+[ "$n" = "0" ] || { echo "FAIL: the rewrite's cascades are not visible (child count=$n, want 0)"; exit 1; }
+echo "ok: the opt-in rewrite cascaded the child deletes (the documented risk)"
+
+say "generated columns: compared, never written (P0-2)"
+sql dst dstdb m_gen_change.sql
+expect 1 "gen: val drift detected (doubled re-derives)" --src "$SRC" --dst "$DST" --tables t_gen
+expect 1 "gen dry-run: UPDATE planned" sync --src "$SRC" --dst "$DST" --tables t_gen
+if ! grep -q 'UPDATE `t_gen`' "$OUT"; then
+  echo "FAIL: no UPDATE sample for the generated-column table"; cat "$OUT"; exit 1
+fi
+echo "ok: dry-run shows the UPDATE sample"
+if grep '^UPDATE' "$OUT" | grep -q 'doubled'; then
+  echo "FAIL: the generated column must never be written"; cat "$OUT"; exit 1
+fi
+echo "ok: the generated column is out of the write path"
+expect 0 "gen --apply --yes: val converged, doubled re-derived" sync --src "$SRC" --dst "$DST" --tables t_gen --apply --yes
+expect 0 "gen identical after sync" --src "$SRC" --dst "$DST" --tables t_gen
+d=$(qdst "SELECT doubled FROM t_gen WHERE id = 1")
+# Sync restores the SOURCE row (val=10): the generated column must have
+# re-derived from the restored base value (doubled=20), i.e. the whole
+# row now matches src exactly — and it got there without mtdiff ever
+# writing `doubled` (the sample above is asserted free of it).
+[ "$d" = "20" ] || { echo "FAIL: the generated column did not re-derive (doubled=$d, want 20)"; exit 1; }
+v=$(qdst "SELECT val FROM t_gen WHERE id = 1")
+[ "$v" = "10" ] || { echo "FAIL: val not restored to the source value (val=$v, want 10)"; exit 1; }
+echo "ok: the row matches src exactly (val=10, doubled re-derived to 20)"
+# structure drift: the dst lost the generated column. The structure sync
+# must REFUSE the table (the expression cannot be reproduced) and write
+# nothing — in the dry run and under --apply alike.
+sql dst dstdb m_gen_drift.sql
+expect 2 "gen drift (col dropped): sync refuses (dry-run)" sync --src "$SRC" --dst "$DST" --tables t_gen
+if ! grep -q 'generated column' "$OUT"; then
+  echo "FAIL: missing the generated-column refusal"; cat "$OUT"; exit 1
+fi
+if ! grep -q -- '--no-sync-schema' "$OUT"; then
+  echo "FAIL: missing the --no-sync-schema hint"; cat "$OUT"; exit 1
+fi
+echo "ok: the refusal names the column and the escape hatch"
+expect 2 "gen drift: --apply refuses before any write" sync --src "$SRC" --dst "$DST" --tables t_gen --apply --yes
+# After the convergence apply above, the dst row matches the source
+# (val=10); the drift script only dropped the column. A refusing sync
+# must leave even that alone — val still at the source value.
+v=$(qdst "SELECT val FROM t_gen WHERE id = 1")
+[ "$v" = "10" ] || { echo "FAIL: the refused sync wrote to the dst (val=$v, want 10)"; exit 1; }
+echo "ok: the refused sync left the data untouched"
+
+say "generated column expressions are compared (P1-1)"
+# Same expression on both sides: no structure drift, no refusal.
+sql dst dstdb m_genx_same.sql
+expect 0 "genx identical expression: no drift" --src "$SRC" --dst "$DST" --tables t_genx
+# A different expression: detected drift, refused (an auto rebuild of a
+# generated column would change what it computes).
+sql dst dstdb m_genx_diff.sql
+expect 2 "genx different expression: drift, refused" sync --src "$SRC" --dst "$DST" --tables t_genx --apply --yes
+if ! grep -q 'generated column' "$OUT"; then
+  echo "FAIL: missing the generated-column refusal"; cat "$OUT"; exit 1
+fi
+echo "ok: the expression drift is detected and refused"
+# A storage-type drift (the same expression, VIRTUAL vs STORED):
+# likewise a drift, refused.
+sql dst dstdb m_genv_diff.sql
+expect 2 "genv VIRTUAL vs STORED: drift, refused" sync --src "$SRC" --dst "$DST" --tables t_genv --apply --yes
+if ! grep -q 'generated' "$OUT"; then
+  echo "FAIL: missing the generated-column refusal"; cat "$OUT"; exit 1
+fi
+echo "ok: the storage drift is detected and refused"
+
+say "structure ALTER failure keeps the data (P1-3)"
+sql dst dstdb m_structfail_drift.sql
+expect 1 "structfail dry-run: in-place ALTER planned" sync --src "$SRC" --dst "$DST" --tables t_structfail
+if ! grep -q 'ALTER TABLE `t_structfail`' "$OUT"; then
+  echo "FAIL: no structure DDL for the drifted table"; cat "$OUT"; exit 1
+fi
+if grep -q 'TRUNCATE' "$OUT"; then
+  echo "FAIL: the default structure sync must not truncate"; cat "$OUT"; exit 1
+fi
+echo "ok: the dry run plans the in-place ALTER (no TRUNCATE)"
+expect 2 "structfail --apply: the ALTER fails, data preserved" sync --src "$SRC" --dst "$DST" --tables t_structfail --apply --yes
+if ! grep -q -- '--allow-structure-truncate' "$OUT"; then
+  echo "FAIL: the failure must point at the opt-in flag"; cat "$OUT"; exit 1
+fi
+n=$(qdst "SELECT COUNT(*) FROM t_structfail WHERE amt = 12345.67")
+[ "$n" = "1" ] || { echo "FAIL: the failed in-place ALTER lost the data (count=$n, want 1)"; exit 1; }
+echo "ok: the wide value survived the failed in-place ALTER"
+expect 0 "structfail --allow-structure-truncate: reloaded" sync --src "$SRC" --dst "$DST" --tables t_structfail --allow-structure-truncate --apply --yes
+expect 0 "structfail identical after reload" --src "$SRC" --dst "$DST" --tables t_structfail
+n=$(qdst "SELECT COUNT(*) FROM t_structfail WHERE amt > 99.99")
+[ "$n" = "0" ] || { echo "FAIL: the wide value survived the reload (count=$n, want 0)"; exit 1; }
+echo "ok: the table was reloaded from the src (opt-in truncate)"
+
+say "multi-statement DDL: partial failure, re-plan, no stale replay (P1-2)"
+sql dst dstdb m_mddl_drift.sql
+expect 1 "mddl dry-run: structure drift, two DDLs planned" sync --src "$SRC" --dst "$DST" --tables t_mddl
+n=$(grep -c 'ALTER TABLE `t_mddl`' "$OUT")
+[ "$n" = "2" ] || { echo "FAIL: want exactly 2 DDL statements (add column + deferred unique index), got $n"; cat "$OUT"; exit 1; }
+if grep -q 'TRUNCATE' "$OUT"; then
+  echo "FAIL: the default structure sync must not truncate"; cat "$OUT"; exit 1
+fi
+echo "ok: the plan is two statements (the index follows the column it references)"
+# Statement 2 (ADD UNIQUE on the duplicate codes) fails; statement 1
+# (ADD COLUMN) already applied: the data is preserved, the error names
+# the partial application, and nothing is re-applied on a re-run.
+expect 2 "mddl --apply: statement 2 fails, data preserved" sync --src "$SRC" --dst "$DST" --tables t_mddl --apply --yes
+if ! grep -q 'prior DDL statements may already have been applied' "$OUT"; then
+  echo "FAIL: the failure must name the possible partial application"; cat "$OUT"; exit 1
+fi
+n=$(qdst "SELECT COUNT(*) FROM t_mddl")
+[ "$n" = "4" ] || { echo "FAIL: the failed DDL lost the data (count=$n, want 4)"; exit 1; }
+c=$(qdst "SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = 'dstdb' AND TABLE_NAME = 't_mddl' AND COLUMN_NAME = 'x'")
+[ "$c" = "1" ] || { echo "FAIL: statement 1 (ADD COLUMN x) must have applied (x count=$c, want 1)"; exit 1; }
+echo "ok: the partial application is named and the data is preserved"
+# Re-run (default): it re-plans from the CURRENT schema — the column now
+# exists, so only the still-missing index is planned (a stale replay
+# would re-add the column and fail with a duplicate-column error).
+expect 2 "mddl re-run: re-planned, the remaining DDL still fails" sync --src "$SRC" --dst "$DST" --tables t_mddl --apply --yes
+n=$(qdst "SELECT COUNT(*) FROM t_mddl")
+[ "$n" = "4" ] || { echo "FAIL: the re-run lost the data (count=$n, want 4)"; exit 1; }
+c=$(qdst "SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = 'dstdb' AND TABLE_NAME = 't_mddl' AND COLUMN_NAME = 'x'")
+[ "$c" = "1" ] || { echo "FAIL: the re-run must not replay the applied DDL (x count=$c, want 1)"; exit 1; }
+echo "ok: the re-run re-plans (no stale replay) and still fails on the duplicates"
+# With the flag: truncate, re-plan from the fresh introspection (only the
+# missing unique index remains), apply it, full reload.
+expect 0 "mddl --allow-structure-truncate: truncated, re-planned, reloaded" sync --src "$SRC" --dst "$DST" --tables t_mddl --allow-structure-truncate --apply --yes
+expect 0 "mddl identical after the reload" --src "$SRC" --dst "$DST" --tables t_mddl
+n=$(qdst "SELECT COUNT(*) FROM t_mddl")
+[ "$n" = "3" ] || { echo "FAIL: the reload did not restore the source rows (count=$n, want 3)"; exit 1; }
+n=$(qdst "SELECT COUNT(DISTINCT code) FROM t_mddl")
+[ "$n" = "3" ] || { echo "FAIL: the duplicates survived the reload (distinct codes=$n, want 3)"; exit 1; }
+echo "ok: the re-planned DDL applied and the table reloaded from the src"
+
+say "write-path escaping under NO_BACKSLASH_ESCAPES (P0-3)"
+# Flip the dst server into NO_BACKSLASH_ESCAPES: every session mtdiff
+# opens (including its write connection) inherits the mode, so a
+# client-side interpolated literal would store the backslash values
+# mangled. The parameterized write path must round-trip them byte-exact.
+qdb dst dstdb "SET GLOBAL sql_mode = CONCAT(@@GLOBAL.sql_mode, ',NO_BACKSLASH_ESCAPES')"
+sql dst dstdb m_esc_change.sql
+expect 1 "esc dry-run: updates planned" sync --src "$SRC" --dst "$DST" --tables t_esc
+expect 1 "diff still differs after esc dry-run (zero writes)" --src "$SRC" --dst "$DST" --tables t_esc
+expect 0 "esc --apply --yes: backslash rows converge" sync --src "$SRC" --dst "$DST" --tables t_esc --apply --yes
+# byte-exact: the full HEX of both sides must match row for row.
+sh=$(qdb src srcdb "SELECT id, HEX(val) FROM t_esc ORDER BY id")
+dh=$(qdb dst dstdb "SELECT id, HEX(val) FROM t_esc ORDER BY id")
+if [ "$sh" != "$dh" ]; then
+  echo "FAIL: t_esc bytes differ after the sync (src: $sh; dst: $dh)"; exit 1
+fi
+echo "ok: the backslash/quote values round-tripped byte-exact under NO_BACKSLASH_ESCAPES"
+qdb dst dstdb "SET GLOBAL sql_mode = REPLACE(@@GLOBAL.sql_mode, ',NO_BACKSLASH_ESCAPES', '')"
+
+say "string primary keys: parameterized read predicates (P0-1)"
+# The dst server runs NO_BACKSLASH_ESCAPES globally: the read-side key
+# bounds (chunk plan, chunk scans, out-of-range deletes) must address
+# backslash/quote/CJK keys byte-exact — bound values travel as
+# parameters, never as interpolated literals. 12 rows, chunk size 10:
+# the string-keyed sampler must span the table in multiple chunks.
+qdb dst dstdb "SET GLOBAL sql_mode = CONCAT(@@GLOBAL.sql_mode, ',NO_BACKSLASH_ESCAPES')"
+expect 0 "strkey identical (multi-chunk string keys)" --src "$SRC" --dst "$DST" --tables t_strkey --chunk-size 10
+sql dst dstdb m_strkey_change.sql
+expect 1 "strkey: the drifted values differ" --src "$SRC" --dst "$DST" --tables t_strkey --chunk-size 10
+expect 0 "strkey --apply: converged" sync --src "$SRC" --dst "$DST" --tables t_strkey --chunk-size 10 --apply --yes
+sh=$(qdb src srcdb "SELECT k, HEX(k), HEX(v) FROM t_strkey ORDER BY k")
+dh=$(qdb dst dstdb "SELECT k, HEX(k), HEX(v) FROM t_strkey ORDER BY k")
+if [ "$sh" != "$dh" ]; then
+  echo "FAIL: t_strkey bytes differ after the sync (src: $sh; dst: $dh)"; exit 1
+fi
+echo "ok: the string keys and values round-tripped byte-exact"
+# An out-of-range row (its key sorts above the source's maximum): the
+# string-keyed out-of-range delete must remove it.
+sql dst dstdb m_strkey_oor.sql
+expect 1 "strkey: the out-of-range row differs" --src "$SRC" --dst "$DST" --tables t_strkey --chunk-size 10
+expect 0 "strkey --apply: the out-of-range row is deleted" sync --src "$SRC" --dst "$DST" --tables t_strkey --chunk-size 10 --apply --yes
+n=$(qdst "SELECT COUNT(*) FROM t_strkey WHERE k = '末\末'")
+[ "$n" = "0" ] || { echo "FAIL: the out-of-range row survived (count=$n, want 0)"; exit 1; }
+sh=$(qdb src srcdb "SELECT k, HEX(k), HEX(v) FROM t_strkey ORDER BY k")
+dh=$(qdb dst dstdb "SELECT k, HEX(k), HEX(v) FROM t_strkey ORDER BY k")
+if [ "$sh" != "$dh" ]; then
+  echo "FAIL: t_strkey bytes differ after the OOR delete (src: $sh; dst: $dh)"; exit 1
+fi
+echo "ok: the out-of-range string key was deleted, the table is byte-exact"
+qdb dst dstdb "SET GLOBAL sql_mode = REPLACE(@@GLOBAL.sql_mode, ',NO_BACKSLASH_ESCAPES', '')"
+
+say "unique constraints are tuples, not members (P1-5)"
+# Composite UNIQUE(a,b): a repeated a (different b) is NOT a conflict —
+# plain updates, no destructive rewrite.
+sql dst dstdb m_comp_change.sql
+expect 1 "comp: the plain drift is detected" sync --src "$SRC" --dst "$DST" --tables t_comp
+if ! grep -q 'UPDATE `t_comp`' "$OUT"; then
+  echo "FAIL: a non-conflicting composite drift must be a plain update"; cat "$OUT"; exit 1
+fi
+if grep -q 'DELETE FROM `t_comp`' "$OUT"; then
+  echo "FAIL: a repeated composite MEMBER must not trigger the rewrite"; cat "$OUT"; exit 1
+fi
+echo "ok: the repeated composite member stays a plain update"
+expect 0 "comp --apply: converged without a rewrite" sync --src "$SRC" --dst "$DST" --tables t_comp --apply --yes
+expect 0 "comp identical after sync" --src "$SRC" --dst "$DST" --tables t_comp
+# A whole-tuple swap: a true unique-tuple conflict — refused by default,
+# converged with the opt-in flag.
+sql dst dstdb m_comp_swap.sql
+expect 2 "comp tuple swap: REFUSED by default" sync --src "$SRC" --dst "$DST" --tables t_comp
+expect 0 "comp tuple swap --allow-row-rewrite --apply" sync --src "$SRC" --dst "$DST" --tables t_comp --allow-row-rewrite --apply --yes
+expect 0 "comp identical after the rewrite" --src "$SRC" --dst "$DST" --tables t_comp
+echo "ok: the tuple swap is refused by default, converged with the flag"
+# Two separate constraints: an email equal to another row's phone must
+# not cross-collide.
+sql dst dstdb m_two_change.sql
+expect 1 "two: the cross-constraint drift is detected" sync --src "$SRC" --dst "$DST" --tables t_two
+if grep -q 'DELETE FROM `t_two`' "$OUT"; then
+  echo "FAIL: different constraints must not cross-collide (a rewrite was planned)"; cat "$OUT"; exit 1
+fi
+expect 0 "two --apply: converged without a rewrite" sync --src "$SRC" --dst "$DST" --tables t_two --apply --yes
+expect 0 "two identical after sync" --src "$SRC" --dst "$DST" --tables t_two
+echo "ok: the cross-constraint value is no false conflict"
+# A NULLABLE unique column: NULL tuples never occupy a slot.
+sql dst dstdb m_nu_change.sql
+expect 1 "nu: the NULL move is detected" sync --src "$SRC" --dst "$DST" --tables t_nu
+if grep -q 'DELETE FROM `t_nu`' "$OUT"; then
+  echo "FAIL: repeated NULLs in a nullable unique column must not conflict"; cat "$OUT"; exit 1
+fi
+expect 0 "nu --apply: converged without a rewrite" sync --src "$SRC" --dst "$DST" --tables t_nu --apply --yes
+expect 0 "nu identical after sync" --src "$SRC" --dst "$DST" --tables t_nu
+echo "ok: the NULL move stays a plain update"
+
+say "cross-chunk unique swap: refusal, then full resync (P1-6)"
+sql dst dstdb m_xchunk_swap.sql
+# Default: a swap that crosses chunk commits cannot be ordered — refused.
+expect 2 "xchunk cross-chunk swap: REFUSED by default" sync --src "$SRC" --dst "$DST" --tables t_xchunk --chunk-size 10
+if ! grep -q -- '--allow-row-rewrite' "$OUT"; then
+  echo "FAIL: the cross-chunk refusal must name the opt-in flag"; cat "$OUT"; exit 1
+fi
+v=$(qdst "SELECT u FROM t_xchunk WHERE id = 1")
+[ "$v" = "v12" ] || { echo "FAIL: the refused swap wrote to the dst (id=1 u=$v, want the drifted v12)"; exit 1; }
+echo "ok: the cross-chunk swap is refused, the dst untouched"
+# With the flag: row-level writes cannot order it — the plan escalates
+# to the order-independent FULL resync (TRUNCATE + reload).
+expect 1 "xchunk --allow-row-rewrite: the full resync is planned" sync --src "$SRC" --dst "$DST" --tables t_xchunk --chunk-size 10 --allow-row-rewrite
+if ! grep -q 'TRUNCATE' "$OUT"; then
+  echo "FAIL: the escalated plan must be a full resync"; cat "$OUT"; exit 1
+fi
+echo "ok: the escalation is a full resync"
+expect 0 "xchunk --allow-row-rewrite --apply: reloaded" sync --src "$SRC" --dst "$DST" --tables t_xchunk --chunk-size 10 --allow-row-rewrite --apply --yes
+expect 0 "xchunk identical after the resync" --src "$SRC" --dst "$DST" --tables t_xchunk --chunk-size 10
+v=$(qdst "SELECT u FROM t_xchunk WHERE id = 1")
+[ "$v" = "v1" ] || { echo "FAIL: the resync did not restore the value (id=1 u=$v, want v1)"; exit 1; }
+echo "ok: the full resync converged the cross-chunk swap"
+
+say "wide table: the INSERT batch shrinks below the bind budget (P2-3)"
+sql dst dstdb m_wide_change.sql
+expect 1 "wide: the drift is detected" sync --src "$SRC" --dst "$DST" --tables t_wide
+expect 0 "wide --apply: converged" sync --src "$SRC" --dst "$DST" --tables t_wide --apply --yes
+expect 0 "wide identical after sync" --src "$SRC" --dst "$DST" --tables t_wide
+echo "ok: the 120-column table converged (batch capped below 60000 params)"
+
+say "sparse --where: split points from the filtered rows (P2-2)"
+sql dst dstdb m_where_change.sql
+expect 1 "wheresparse: the filtered row differs" sync --src "$SRC" --dst "$DST" --tables t_wheresparse --where "g < 1" --chunk-size 1000
+expect 0 "wheresparse --apply: converged" sync --src "$SRC" --dst "$DST" --tables t_wheresparse --where "g < 1" --chunk-size 1000 --apply --yes
+expect 0 "wheresparse identical after sync" --src "$SRC" --dst "$DST" --tables t_wheresparse --where "g < 1" --chunk-size 1000
+v=$(qdst "SELECT v FROM t_wheresparse WHERE k = 'k00100'")
+[ "$v" = "w100" ] || { echo "FAIL: the filtered row did not converge (id=100 v=$v, want w100)"; exit 1; }
+echo "ok: the sparse filter converged (split points from the filtered rows)"
+
+say "--snapshot under a READ-COMMITTED global: strict, not downgraded (P1-4)"
+qdb dst dstdb "SET GLOBAL transaction_isolation = 'READ-COMMITTED'"
+sql dst dstdb m_snap_drift.sql
+set +e
+timeout 300 "$MTDIFF" --src "$SRC" --dst "$DST" --tables t_snap --snapshot > "$OUT" 2>&1
+rc=$?
+set -e
+if [ "$rc" -ne 1 ]; then
+  echo "FAIL: --snapshot under READ-COMMITTED exited $rc (want a clean 1, not an error)"; cat "$OUT"; exit 1
+fi
+echo "ok: --snapshot ran strictly under a READ-COMMITTED global (clean diff)"
+sql dst dstdb m_snap_reset.sql
+expect 0 "snapshot under READ-COMMITTED: identical after reset" --src "$SRC" --dst "$DST" --tables t_snap --snapshot
+qdb dst dstdb "SET GLOBAL transaction_isolation = 'REPEATABLE-READ'"
+
+say "snapshot mode under concurrent writes (P1-5)"
+sql dst dstdb m_snap_drift.sql
+# churn the dst from a background client while the snapshot diff runs:
+# the run must finish cleanly (0/1), never with a runtime error.
+(
+  i=0
+  while [ "$i" -lt 30 ]; do
+    qdb dst dstdb "UPDATE t_snap SET v = 'x1' WHERE id = 1" >/dev/null 2>&1 || true
+    i=$((i+1))
+    sleep 0.2
+  done
+) &
+churn=$!
+set +e
+timeout 300 "$MTDIFF" --src "$SRC" --dst "$DST" --tables t_snap --snapshot > "$OUT" 2>&1
+rc=$?
+set -e
+wait "$churn"
+if [ "$rc" -ne 0 ] && [ "$rc" -ne 1 ]; then
+  echo "FAIL: --snapshot diff under churn exit $rc (want 0 or 1)"; cat "$OUT"; exit 1
+fi
+echo "ok: --snapshot diff survived the concurrent writes (exit $rc)"
+sql dst dstdb m_snap_reset.sql
+expect 0 "snapshot: identical after reset" --src "$SRC" --dst "$DST" --tables t_snap --snapshot
+
+say "read connections stay read-only under load (P1-2)"
+# MySQL cannot read another session's variables, so the policy is verified
+# from the src server's general log (TABLE output): every connection that
+# read t_large must show its read-only session setup (applySession's
+# SET SESSION TRANSACTION READ ONLY, the tier that lands on MySQL 8) in
+# the log. Two visibility rules shape the "read" pattern:
+#  - chunk scans are PARAMETERIZED (P0-1): they run as COM_STMT_PREPARE/
+#    EXECUTE, which the general log records as command types Prepare/
+#    Execute but WITHOUT the statement text — so a scan worker is
+#    identified by its prepared-statement VOLUME (each of the 4 workers
+#    runs ~250 chunk pairs; the control connection runs <20), not by text.
+#  - the non-parameterized reads (COUNT / key extremes / drill-downs)
+#    still land as classic Query rows with matchable text.
+# The log is snapshotted into a temp table and the general log switched
+# off BEFORE the analysis queries run, so the analysis cannot match
+# itself (its own text contains the patterns).
+qdb src srcdb "DROP TABLE IF EXISTS mysql.mtdiff_probe_gl; SET GLOBAL general_log = OFF; SET GLOBAL log_output = 'TABLE'; TRUNCATE TABLE mysql.general_log; SET GLOBAL general_log = ON"
+set +e
+timeout 600 "$MTDIFF" --src "$SRC" --dst "$DST" --tables t_large --parallel 4 --chunk-size 100 > "$OUT" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 0 ] || { echo "FAIL: the probe diff itself exited $rc"; cat "$OUT"; exit 1; }
+grep -q "comparing 1000 chunks" "$OUT" || { echo "FAIL: the probe diff did not report its 1000 chunk scans"; cat "$OUT"; exit 1; }
+qdb src srcdb "CREATE TABLE mysql.mtdiff_probe_gl AS SELECT * FROM mysql.general_log; SET GLOBAL general_log = OFF; SET GLOBAL log_output = 'FILE'"
+scan_threads=$(qdb src srcdb "SELECT COUNT(*) FROM (SELECT thread_id FROM mysql.mtdiff_probe_gl WHERE command_type = 'Query' AND argument LIKE '%FROM \`t_large\`%' UNION SELECT thread_id FROM mysql.mtdiff_probe_gl WHERE command_type IN ('Prepare','Execute') GROUP BY thread_id HAVING COUNT(*) >= 50) sc")
+unenforced=$(qdb src srcdb "SELECT COUNT(*) FROM (SELECT DISTINCT thread_id AS tid FROM (SELECT thread_id FROM mysql.mtdiff_probe_gl WHERE command_type = 'Query' AND argument LIKE '%FROM \`t_large\`%' UNION SELECT thread_id FROM mysql.mtdiff_probe_gl WHERE command_type IN ('Prepare','Execute') GROUP BY thread_id HAVING COUNT(*) >= 50) x) sc LEFT JOIN (SELECT DISTINCT thread_id AS tid FROM mysql.mtdiff_probe_gl WHERE argument LIKE '%TRANSACTION READ ONLY%' OR argument LIKE 'SET SESSION read_only%') po ON po.tid = sc.tid WHERE po.tid IS NULL")
+qdb src srcdb "DROP TABLE mysql.mtdiff_probe_gl"
+case "$scan_threads" in ''|*[!0-9]*) scan_threads=0;; esac
+case "$unenforced" in ''|*[!0-9]*) unenforced=1;; esac
+if [ "$scan_threads" -lt 2 ]; then
+  echo "FAIL: only $scan_threads connection(s) read t_large (want >= 2)"; exit 1
+fi
+if [ "$unenforced" -ne 0 ]; then
+  echo "FAIL: $unenforced reading connection(s) never set the read-only session policy"; exit 1
+fi
+echo "ok: all $scan_threads reading connections set the read-only session policy"
+
+say "BIGINT extremes: overflow-safe chunking"
+# The key span (MinInt64..MaxInt64) is wider than MaxInt64 values: the
+# arithmetic split must refuse and the sampler must partition the range
+# instead; the extreme rows must still be diffed and converged.
+expect 0 "bigint extremes identical" --src "$SRC" --dst "$DST" --tables t_bigint
+sql dst dstdb m_bigint_max.sql
+expect 1 "bigint extremes: the max row changed" --src "$SRC" --dst "$DST" --tables t_bigint
+expect 0 "bigint extremes: sync restores the max row" sync --src "$SRC" --dst "$DST" --tables t_bigint --apply --yes
+expect 0 "bigint extremes identical after sync" --src "$SRC" --dst "$DST" --tables t_bigint
+
+say "--sample-limit 0 shows no sample SQL (P2-1)"
+sql dst dstdb m_mut_reseed.sql
+sql dst dstdb m_update.sql
+set +e
+timeout 600 "$MTDIFF" sync --src "$SRC" --dst "$DST" --tables t_mut --sample-limit 0 > "$OUT" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 1 ] || { echo "FAIL: the sample-limit 0 dry-run exited $rc (want 1)"; cat "$OUT"; exit 1; }
+if grep -q 'UPDATE `t_mut`' "$OUT"; then
+  echo "FAIL: --sample-limit 0 still showed sample SQL"; cat "$OUT"; exit 1
+fi
+echo "ok: --sample-limit 0 keeps the plan, drops the samples"
+
+say "special-credential round trip: YAML env -> DSN -> server auth (R6-2)"
+# The whole chain must be byte-exact for credentials that break naive
+# DSN grammars: a password with ':' '/' '?' '@' and a DB name with '/'.
+# The server-level SELECT 1 proves the account exists; the binary diff
+# proves YAML ${ENV} substitution -> mysql.Config -> the driver's wire
+# authentication all carry the value byte for byte.
+SPASS='p@ss:word/a?b'
+for side in src dst; do
+  $COMPOSE -f e2e/docker-compose.yml exec -T -e MYSQL_PWD=rootpw "mysql-$side" mysql -uroot -e \
+    "DROP USER IF EXISTS 'mtdiff_special'@'%'; CREATE USER 'mtdiff_special'@'%' IDENTIFIED BY '$SPASS'; GRANT SELECT ON *.* TO 'mtdiff_special'@'%';" >/dev/null
+  out=$($COMPOSE -f e2e/docker-compose.yml exec -T -e MYSQL_PWD="$SPASS" "mysql-$side" mysql -umtdiff_special -N -B -e 'SELECT 1' 2>&1)
+  [ "$out" = "1" ] || { echo "FAIL: special user cannot authenticate on $side ($out)"; exit 1; }
+done
+echo "ok: special user (p@ss:word/a?b) authenticates via the mysql client on both sides"
+export MTDIFF_SPECIAL_PASSWORD="$SPASS"
+export MTDIFF_SPECIAL_PAR=4
+SPECIAL_CFG=/tmp/mtdiff-special.yaml
+cat > "$SPECIAL_CFG" <<'EOF'
+src:
+  host: 127.0.0.1
+  port: 13306
+  user: mtdiff_special
+  password: ${MTDIFF_SPECIAL_PASSWORD}
+  database: srcdb
+dst:
+  host: 127.0.0.1
+  port: 13307
+  user: mtdiff_special
+  password: ${MTDIFF_SPECIAL_PASSWORD}
+  database: dstdb
+options:
+  parallel: ${MTDIFF_SPECIAL_PAR}
+EOF
+# a throwaway keyed table, identical on both sides (t_nullkey is
+# deliberately drifted by an earlier section and could not be used)
+CREDSEED="DROP TABLE IF EXISTS t_cred; CREATE TABLE t_cred (id INT PRIMARY KEY, v VARCHAR(32) NOT NULL); INSERT INTO t_cred VALUES (1,'a'),(2,'b'),(3,'c');"
+$COMPOSE -f e2e/docker-compose.yml exec -T -e MYSQL_PWD=rootpw mysql-src mysql -uroot -D srcdb -e "$CREDSEED" >/dev/null
+$COMPOSE -f e2e/docker-compose.yml exec -T -e MYSQL_PWD=rootpw mysql-dst mysql -uroot -D dstdb -e "$CREDSEED" >/dev/null
+# a lone ${ENV} on the TYPED int field parallel (R6-4): 4, not "4"
+expect 0 "special-credential YAML diff (env password, typed env parallel)" --config "$SPECIAL_CFG" --tables t_cred
+if grep -q 'p@ss:word' "$OUT"; then
+  echo "FAIL: the special password leaked into the output"; cat "$OUT"; exit 1
+fi
+echo "ok: special password never appears in the output (masked)"
+# the same credentials through the CLI shorthand DSN (the other DSN
+# grammar entry point): the same special characters, byte for byte
+expect 0 "special-credential DSN shorthand diff" \
+  --src "mtdiff_special:$SPASS@127.0.0.1:13306/srcdb" \
+  --dst "mtdiff_special:$SPASS@127.0.0.1:13307/dstdb" --tables t_cred
 
 E2E_OK=1
 say "ALL E2E SCENARIOS PASSED"

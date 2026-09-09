@@ -3,9 +3,14 @@
 package config
 
 import (
+	"bytes"
 	"fmt"
+	"io"
+	"math"
 	"os"
 	"regexp"
+	"strconv"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -56,9 +61,28 @@ type Options struct {
 	// other statements.
 	AllowUnenforcedReadOnly bool `yaml:"allow_unenforced_readonly"`
 	// Sync options (used by the sync subcommand).
-	BatchSize    int  `yaml:"batch_size"`     // rows per multi-row INSERT / commit granularity
-	SampleLimit  int  `yaml:"sample_limit"`   // sample SQL statements shown per table in a dry-run
+	BatchSize int `yaml:"batch_size"` // rows per multi-row INSERT / commit granularity
+	// SampleLimit is a pointer so an explicit 0 ("show no samples") is
+	// distinguishable from unset (nil, receives the default of 5): the
+	// CLI's --sample-limit 0 and a YAML sample_limit: 0 must both survive
+	// ApplyDefaults, while an absent value takes the default.
+	SampleLimit  *int `yaml:"sample_limit"`
 	NoSyncSchema bool `yaml:"no_sync_schema"` // skip the structure pre-step (default: align the destination structure first)
+	// AllowStructureTruncate: when the in-place structure ALTER fails,
+	// truncate the destination and re-apply the DDL (the pre-P1-3
+	// behavior as a fallback). Default false: the failure stops the table
+	// with its data preserved.
+	AllowStructureTruncate bool `yaml:"allow_structure_truncate"`
+	// AllowRowRewrite: permit the destructive row rewrite for a
+	// unique-value conflict (swap/cycle/holder) — DELETE+INSERT of the
+	// affected rows. It authorizes the row rewrite ONLY: a cross-chunk
+	// swap becomes a full-resync plan (TRUNCATE + reload), executed only
+	// when the confirmed plan showed that TRUNCATE (a confirmed
+	// row-level plan never escalates to it in the same run). Default
+	// false: the table is REFUSED instead, because the rewrite fires FK
+	// ON DELETE CASCADE, triggers and audit logs for rows the user never
+	// asked to change.
+	AllowRowRewrite bool `yaml:"allow_row_rewrite"`
 }
 
 // Config is the fully-resolved configuration.
@@ -70,25 +94,204 @@ type Config struct {
 
 var envRe = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
 
-// LoadFile loads a YAML config file. ${ENV} references in string values are
-// replaced with the environment variable's value (empty if unset).
+// LoadFile loads a YAML config file. ${ENV} references in string values
+// are replaced with the environment variable's value (see Parse for the
+// safe, structure-aware expansion).
+//
+// Parsing is STRICT: unknown fields are an error (KnownFields), at every
+// level — top-level, endpoint, options. mtdiff can execute DROP TABLE,
+// TRUNCATE and destructive rewrites, so a misspelled option (e.g.
+// exclude_table instead of exclude_tables) must fail closed at parse
+// time, not be silently dropped and let the mis-scoped table enter the
+// sync/drop set. A file with more than one YAML document is refused
+// outright: this config is a single document, and reading only the first
+// would hide a second half the operator believes is in effect.
 func LoadFile(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	var c Config
-	if err := yaml.Unmarshal(expandEnv(data), &c); err != nil {
+	c, err := Parse(data)
+	if err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	return c, nil
+}
+
+// Parse decodes one YAML document into a Config, strictly.
+//
+// ${ENV} references in string values are replaced with the environment
+// variable's value — but the substitution happens AFTER the document's
+// structure is parsed: the YAML node tree is walked and only VALUE
+// scalars are expanded (mapping keys are structure, never expansion
+// targets). The expanded tree is re-encoded and decoded with
+// KnownFields. Raw-text substitution is deliberately NOT used: an
+// environment value containing newlines, colons or quotes must land in
+// ONE value, byte for byte — it can never inject a second document, a
+// new mapping key or a flipped safety flag (a password of "abc
+// \n options:\n allow_structure_truncate: true" is a value, not a new
+// options block). A reference to an UNSET variable is an error naming
+// the variable (fail closed): substituting a silent empty string would
+// turn a typo into an incomprehensible server-side auth failure.
+//
+// A LONE placeholder on a typed field — the whole value is exactly one
+// ${ENV} reference, and the field's Go type is int/bool/float (port,
+// parallel, chunk_size, tolerance, snapshot, allow_structure_truncate,
+// …; see typedEnvFields) — has the substituted text parsed as that
+// type, so `parallel: ${P}` with P=8 decodes as the int 8. The
+// coercion is per isolated scalar only: it can never read or create
+// structure (a value of "true\nother_key: x" for a bool field is an
+// error, not a new key), a placeholder that is part of a larger value
+// stays a string, and a QUOTED placeholder stays a string (an explicit
+// quote is a deliberate string). A substituted value that does not
+// parse for the field's type is a configuration error (fail closed).
+//
+// Unknown fields at any level are an error, and a second document is
+// refused: this config is a single document, and reading only the first
+// would hide a second half the operator believes is in effect.
+func Parse(data []byte) (*Config, error) {
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	var root yaml.Node
+	if err := dec.Decode(&root); err != nil {
+		return nil, err
+	}
+	// a second document in the same stream is refused outright (checked
+	// on the ORIGINAL stream, before the expanded tree is re-encoded)
+	var second yaml.Node
+	if err := dec.Decode(&second); err != io.EOF {
+		return nil, fmt.Errorf("multiple YAML documents: this configuration is a single document (the first document parsed, the rest ignored — refused rather than silently half-applied)")
+	}
+	if err := expandEnvValue(&root, ""); err != nil {
+		return nil, err
+	}
+	expanded, err := yaml.Marshal(&root)
+	if err != nil {
+		return nil, err
+	}
+	strict := yaml.NewDecoder(bytes.NewReader(expanded))
+	strict.KnownFields(true)
+	var c Config
+	if err := strict.Decode(&c); err != nil {
+		return nil, err
 	}
 	return &c, nil
 }
 
-func expandEnv(data []byte) []byte {
-	return envRe.ReplaceAllFunc(data, func(m []byte) []byte {
-		name := m[2 : len(m)-1]
-		return []byte(os.Getenv(string(name)))
-	})
+// typedEnvFields names the config fields whose LONE-placeholder value
+// is parsed as the field's Go type after substitution (see Parse): a
+// placeholder that is the whole value of `parallel` decodes as the int
+// it replaces, one for `snapshot` as a bool, one for `tolerance` as a
+// float. Untyped fields (host, user, password, …) keep their value as
+// a string, byte for byte.
+var typedEnvFields = map[string]string{
+	"port": "int", "parallel": "int", "chunk_size": "int",
+	"drill_limit": "int", "max_allowed_packet": "int", "batch_size": "int",
+	"sample_limit": "int",
+	"tolerance":    "float",
+	"snapshot":     "bool", "drill": "bool", "no_trim": "bool",
+	"fold_case": "bool", "normalize_json": "bool", "allow_tz_swap": "bool",
+	"strict_types": "bool", "secure": "bool",
+	"allow_unenforced_readonly": "bool", "no_sync_schema": "bool",
+	"allow_structure_truncate": "bool", "allow_row_rewrite": "bool",
+}
+
+// expandEnvValue walks an already-parsed YAML tree and replaces ${NAME}
+// references in VALUE scalars only — never in mapping keys (a key is
+// structure: an environment value must be able to rename no field).
+// The parsed style of every node is preserved, so a value that was
+// quoted stays a string, and the re-encoding quotes substituted content
+// whenever the new content would otherwise be ambiguous (a value
+// containing a colon or a newline cannot become a new mapping).
+// parentKey carries the enclosing mapping's key into the value scalar,
+// so a lone placeholder can be parsed as the field's Go type (see
+// typedEnvFields); sequence items have no field key.
+func expandEnvValue(n *yaml.Node, parentKey string) error {
+	switch n.Kind {
+	case yaml.DocumentNode:
+		for _, item := range n.Content {
+			if err := expandEnvValue(item, ""); err != nil {
+				return err
+			}
+		}
+	case yaml.MappingNode:
+		// pairs (key, value): the value sits at the ODD index; the
+		// key is structure, never an expansion target
+		for i := 0; i+1 < len(n.Content); i += 2 {
+			if err := expandEnvValue(n.Content[i+1], n.Content[i].Value); err != nil {
+				return err
+			}
+		}
+	case yaml.SequenceNode:
+		for _, item := range n.Content {
+			if err := expandEnvValue(item, ""); err != nil {
+				return err
+			}
+		}
+	case yaml.ScalarNode:
+		return expandEnvScalar(n, parentKey)
+	}
+	return nil
+}
+
+// expandEnvScalar replaces every ${NAME} reference in one scalar's
+// value. A reference to an UNSET variable is a configuration error
+// naming the variable (fail closed). The substituted text is final —
+// it is not re-scanned, so a value containing a literal "${OTHER}" is
+// not expanded a second time.
+//
+// When the WHOLE value is exactly one placeholder (no other text
+// around it) and the scalar is plain (not quoted — a quote is a
+// deliberate string) and the field is typed (typedEnvFields), the
+// substituted text is parsed as the field's Go type and the node's tag
+// is set to match: `parallel: ${P}` with P=8 becomes the int 8, not
+// the string "8" (which the strict decode would refuse). The parsing
+// is of the ISOLATED scalar only — it cannot see or create structure
+// (a multi-line value for a bool field simply fails to parse), and a
+// value that does not parse is a configuration error naming the
+// variable and the field.
+func expandEnvScalar(n *yaml.Node, key string) error {
+	matches := envRe.FindAllStringIndex(n.Value, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	original := n.Value
+	var b strings.Builder
+	last := 0
+	for _, m := range matches {
+		b.WriteString(n.Value[last:m[0]])
+		name := n.Value[m[0]+2 : m[1]-1]
+		v, ok := os.LookupEnv(name)
+		if !ok {
+			return fmt.Errorf("environment variable %q (referenced in value %q) is not set: refusing to substitute an empty value", name, n.Value)
+		}
+		b.WriteString(v)
+		last = m[1]
+	}
+	b.WriteString(n.Value[last:])
+	n.Value = b.String()
+
+	lone := len(matches) == 1 && matches[0][0] == 0 && matches[0][1] == len(original)
+	if typ, typed := typedEnvFields[key]; typed && lone && n.Style == 0 && (n.Tag == "" || n.Tag == "!!str") {
+		name := original[2 : len(original)-1]
+		switch typ {
+		case "int":
+			if _, err := strconv.ParseInt(n.Value, 10, 64); err != nil {
+				return fmt.Errorf("environment variable %s (value %q) is not a valid integer for field %q", name, n.Value, key)
+			}
+			n.Tag = "!!int"
+		case "float":
+			if _, err := strconv.ParseFloat(n.Value, 64); err != nil {
+				return fmt.Errorf("environment variable %s (value %q) is not a valid number for field %q", name, n.Value, key)
+			}
+			n.Tag = "!!float"
+		case "bool":
+			if _, err := strconv.ParseBool(n.Value); err != nil {
+				return fmt.Errorf("environment variable %s (value %q) is not a valid boolean for field %q", name, n.Value, key)
+			}
+			n.Tag = "!!bool"
+		}
+	}
+	return nil
 }
 
 // PromptFunc asks the user for a secret (e.g. a password) on a terminal.
@@ -157,16 +360,36 @@ func (c *Config) Validate() error {
 	if c.Opts.DrillLimit < 0 {
 		return fmt.Errorf("drill_limit must be >= 0, got %d", c.Opts.DrillLimit)
 	}
-	if c.Opts.Tolerance < 0 {
-		return fmt.Errorf("tolerance must be >= 0, got %v", c.Opts.Tolerance)
+	// Tolerance is allowed to be 0 or a finite positive value — nothing
+	// else. A NON-FINITE tolerance is not a nonsense setting, it is a
+	// silent false identical: the normalizer quantizes by v/tol, and
+	// with tol=+Inf every finite value gives v/Inf = 0, and 0*Inf =
+	// NaN — so ALL distinct float values normalize to the rendering
+	// "NaN" and compare equal, and a divergent table reports CONVERGED
+	// (tol=NaN poisons the same way). Reject NaN/±Inf (and negative
+	// finite values) here, at the config entry, fail closed: the CLI
+	// flag and the YAML decode both land in this check. The normalizer
+	// refuses non-finite tolerances on its own as the second line of
+	// defense (normalize.encodeValue).
+	if math.IsNaN(c.Opts.Tolerance) || math.IsInf(c.Opts.Tolerance, 0) || c.Opts.Tolerance < 0 {
+		return fmt.Errorf("tolerance must be 0 or a finite positive value, got %v (a non-finite tolerance would normalize every float to the same rendering and hide all differences)", c.Opts.Tolerance)
 	}
 	if c.Opts.BatchSize < 0 {
 		return fmt.Errorf("batch_size must be >= 0, got %d", c.Opts.BatchSize)
 	}
-	if c.Opts.SampleLimit < 0 {
-		return fmt.Errorf("sample_limit must be >= 0, got %d", c.Opts.SampleLimit)
+	if c.Opts.SampleLimit != nil && *c.Opts.SampleLimit < 0 {
+		return fmt.Errorf("sample_limit must be >= 0, got %d", *c.Opts.SampleLimit)
 	}
 	return nil
+}
+
+// SampleLimitOr dereferences SampleLimit, filling unset (nil) values with
+// the default. An explicit 0 is preserved (it means "show no samples").
+func (c *Config) SampleLimitOr(def int) int {
+	if c.Opts.SampleLimit == nil {
+		return def
+	}
+	return *c.Opts.SampleLimit
 }
 
 // ApplyDefaults fills unset positive options with their defaults.
@@ -189,7 +412,8 @@ func (c *Config) ApplyDefaults() {
 	if c.Opts.BatchSize <= 0 {
 		c.Opts.BatchSize = 1000
 	}
-	if c.Opts.SampleLimit <= 0 {
-		c.Opts.SampleLimit = 5
+	if c.Opts.SampleLimit == nil {
+		v := 5
+		c.Opts.SampleLimit = &v // explicit 0 (show none) is preserved
 	}
 }

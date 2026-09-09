@@ -1,8 +1,11 @@
 name: ci
 
 on:
+  # security-fixes carries the review-fix rounds: it has no PR yet (no API
+  # credentials to open one), so its pushes run the full CI themselves.
+  # Once it is merged to main, remove it from this list.
   push:
-    branches: [main]
+    branches: [main, security-fixes]
   pull_request:
 
 jobs:
@@ -17,10 +20,22 @@ jobs:
         run: make lint
       - name: Test
         run: make test
+      - name: Race
+        # the unit suite under the race detector, as a SEPARATE step
+        # from Test: a race failure must be locatable without
+        # re-running the plain suite (and vice versa)
+        run: go test -race ./...
+      - name: make push regression
+        # temporary repo + bare origin: staged-only commit, final push,
+        # metacharacter messages land literally, untracked files stay local
+        run: bash scripts/test_make_push.sh
       - name: Cross-compile check
         run: GOOS=windows GOARCH=amd64 go build -o /dev/null .
 
-  e2e:
+  # Docker-based suites: each script brings up its own containers via docker
+  # compose (ubuntu-latest ships docker + the compose plugin) and tears them
+  # down on exit, so the jobs need no service containers of their own.
+  mysql8-e2e:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -32,3 +47,31 @@ jobs:
       # run_e2e.sh brings up its own mysql containers via docker compose
       - name: E2E
         run: bash e2e/run_e2e.sh
+
+  mysql57-compat:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+      - name: Build
+        run: make build
+      # run_compat.sh 57 brings up its own MySQL 5.7 pair (project compat57)
+      - name: MySQL 5.7 compat
+        run: bash e2e/compat/run_compat.sh 57
+
+  tidb-compat:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+      - name: Build
+        run: make build
+      # run_compat.sh tidb: MySQL 8.0 source + single-node TiDB destination
+      # (project compat-tidb; distinct from compat57, so the two compat
+      # suites can run in parallel)
+      - name: TiDB compat
+        run: bash e2e/compat/run_compat.sh tidb
